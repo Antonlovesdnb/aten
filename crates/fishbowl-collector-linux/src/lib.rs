@@ -392,6 +392,13 @@ where
     let pid = raw.pid as i32;
     let filename = nul_str(&raw.filename);
 
+    // Temporary diagnostic: print credential-like paths even when they don't
+    // pass the full classify. Helps catch path-encoding issues at the
+    // kernel→userspace boundary.
+    if filename.contains(".aws") || filename.contains(".ssh") || filename.contains("credential") {
+        eprintln!("credacc seen pid={pid} filename={filename}");
+    }
+
     // Order matters here. 99%+ of all opens on a Linux box are not credential
     // paths, and `credentials::classify` is a handful of substring checks on
     // a ≤256-byte string — sub-microsecond. Doing it FIRST lets us drop the
