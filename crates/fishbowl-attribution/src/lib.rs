@@ -77,30 +77,37 @@ impl AttributionEngine {
     /// `CredentialAccess`, `NetworkEgress`, and `FileWrite` as those probes
     /// come online.
     pub fn attribute(&mut self, event: &mut Event) {
-        let Some(session) = &self.session else {
-            return;
+        // Snapshot the bits of session state we need for the binding decision
+        // up front so we don't hold a borrow on `self.session` while we mutate
+        // `self.pid_bindings`. Cheap clones (a Uuid string and an Option<cwd>).
+        let (session_id, session_cwd) = match &self.session {
+            Some(s) => (s.session_id.clone(), s.cwd.clone()),
+            None => return,
         };
 
-        // Bind the agent_root_pid to this session if cwds match. Cache.
         let agent_root_pid = match &event.kind {
             EventKind::ProcessExec(p) => p.process.agent_root_pid,
             _ => None,
         };
 
-        let session_id = match agent_root_pid {
-            Some(pid) => self.resolve_session_for_pid(pid, session).cloned(),
+        let bound_session = match agent_root_pid {
+            Some(pid) => self.resolve_session_for_pid(pid, &session_id, session_cwd.as_deref()),
             None => None,
         };
 
-        if let Some(sid) = &session_id {
-            event.session_id = Some(sid.clone());
-        } else {
+        let Some(sid) = bound_session else {
             // Without a session binding, attribution stays empty — we still
             // emit the event so the join can happen later in the SIEM.
             return;
-        }
+        };
+        event.session_id = Some(sid);
 
-        // Per-event-type primary identifier and attribution fields to populate.
+        // Now we can re-borrow `self.session` immutably for the rest of the
+        // attribution work; the binding-cache mutation is done.
+        let Some(session) = &self.session else {
+            return;
+        };
+
         let event_ns = session::parse_rfc3339_ns(&event.timestamp).unwrap_or(i64::MAX);
         let tc = session.attribute_at(event_ns);
 
@@ -126,29 +133,31 @@ impl AttributionEngine {
         }
     }
 
-    fn resolve_session_for_pid<'a>(
-        &'a mut self,
+    fn resolve_session_for_pid(
+        &mut self,
         agent_root_pid: i32,
-        session: &SessionState,
-    ) -> Option<&'a String> {
-        if self.pid_bindings.contains_key(&agent_root_pid) {
-            return self.pid_bindings.get(&agent_root_pid);
+        session_id: &str,
+        session_cwd: Option<&str>,
+    ) -> Option<String> {
+        if let Some(sid) = self.pid_bindings.get(&agent_root_pid) {
+            return Some(sid.clone());
         }
-        // Match by cwd. Read /proc/<pid>/cwd; if equal to session.cwd, bind.
-        let proc_cwd = match std::fs::read_link(format!("/proc/{agent_root_pid}/cwd")) {
-            Ok(p) => p.to_string_lossy().into_owned(),
-            Err(_) => return None,
-        };
-        let session_cwd = session.cwd.as_deref().unwrap_or("");
+        let session_cwd = session_cwd?;
+        if session_cwd.is_empty() {
+            return None;
+        }
+        let proc_cwd = std::fs::read_link(format!("/proc/{agent_root_pid}/cwd"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())?;
         // Match either exact or one is a path prefix of the other to absorb
-        // symlink resolution variance. Use simple string compare for v0.x.
-        if !session_cwd.is_empty()
-            && (proc_cwd == session_cwd
-                || proc_cwd.starts_with(session_cwd)
-                || session_cwd.starts_with(&proc_cwd))
+        // symlink resolution variance. Simple string compare for v0.x.
+        if proc_cwd == session_cwd
+            || proc_cwd.starts_with(session_cwd)
+            || session_cwd.starts_with(&proc_cwd)
         {
-            self.pid_bindings.insert(agent_root_pid, session.session_id.clone());
-            self.pid_bindings.get(&agent_root_pid)
+            self.pid_bindings
+                .insert(agent_root_pid, session_id.to_string());
+            Some(session_id.to_string())
         } else {
             None
         }
