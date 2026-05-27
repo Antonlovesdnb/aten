@@ -58,17 +58,14 @@ impl SessionState {
 
     fn fold_events(&mut self, events: &[Event]) {
         for ev in events {
-            match &ev.kind {
-                EventKind::ToolCall(tc) => {
-                    let ts_ns = parse_rfc3339_ns(&ev.timestamp).unwrap_or(i64::MAX);
-                    self.tool_calls.push(ToolCallEntry {
-                        id: tc.tool_call_id.clone(),
-                        name: tc.tool_name.clone(),
-                        input_text: tc.tool_input.to_string(),
-                        timestamp_ns: ts_ns,
-                    });
-                }
-                _ => {}
+            if let EventKind::ToolCall(tc) = &ev.kind {
+                let ts_ns = parse_rfc3339_ns(&ev.timestamp).unwrap_or(i64::MAX);
+                self.tool_calls.push(ToolCallEntry {
+                    id: tc.tool_call_id.clone(),
+                    name: tc.tool_name.clone(),
+                    input_text: tc.tool_input.to_string(),
+                    timestamp_ns: ts_ns,
+                });
             }
         }
         // Build a fresh identifier index from all events the session has seen.
@@ -124,7 +121,7 @@ pub struct OriginsFound {
 
 pub fn parse_rfc3339_ns(s: &str) -> Option<i64> {
     let dt: DateTime<Utc> = s.parse().ok()?;
-    Some(dt.timestamp_nanos_opt()?)
+    dt.timestamp_nanos_opt()
 }
 
 /// Read every JSONL transcript file beneath `root` and group their events by
@@ -177,12 +174,14 @@ mod tests {
 
     #[test]
     fn attribute_at_picks_most_recent_le() {
-        let mut s = SessionState::default();
-        s.tool_calls = vec![
-            ToolCallEntry { id: "t1".into(), name: "Bash".into(), input_text: "".into(), timestamp_ns: 100 },
-            ToolCallEntry { id: "t2".into(), name: "Bash".into(), input_text: "".into(), timestamp_ns: 200 },
-            ToolCallEntry { id: "t3".into(), name: "Bash".into(), input_text: "".into(), timestamp_ns: 300 },
-        ];
+        let s = SessionState {
+            tool_calls: vec![
+                ToolCallEntry { id: "t1".into(), name: "Bash".into(), input_text: "".into(), timestamp_ns: 100 },
+                ToolCallEntry { id: "t2".into(), name: "Bash".into(), input_text: "".into(), timestamp_ns: 200 },
+                ToolCallEntry { id: "t3".into(), name: "Bash".into(), input_text: "".into(), timestamp_ns: 300 },
+            ],
+            ..Default::default()
+        };
         assert_eq!(s.attribute_at(150).map(|t| t.id.as_str()), Some("t1"));
         assert_eq!(s.attribute_at(200).map(|t| t.id.as_str()), Some("t2"));
         assert_eq!(s.attribute_at(250).map(|t| t.id.as_str()), Some("t2"));
