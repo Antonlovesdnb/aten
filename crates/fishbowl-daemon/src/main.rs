@@ -59,6 +59,26 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Run the full daemon: eBPF collector + transcript reader + attribution.
+    /// Linux only for v0.x. Requires root or CAP_BPF+CAP_PERFMON.
+    #[cfg(target_os = "linux")]
+    Daemon {
+        /// Path to a Claude Code session transcript JSONL. The daemon binds
+        /// kernel-side events to this session by matching the agent root
+        /// process's cwd against the transcript's recorded cwd.
+        #[arg(long)]
+        transcript: PathBuf,
+        /// Process `comm` names to enroll as agent roots. Comma-separated.
+        /// Default: claude,cursor,codex.
+        #[arg(long, value_delimiter = ',')]
+        agents: Option<Vec<String>>,
+        /// Stop after this many seconds.
+        #[arg(long)]
+        duration_secs: Option<u64>,
+        /// Append emitted events as JSONL to this file. Default: stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -82,6 +102,13 @@ fn main() -> Result<()> {
             duration_secs,
             out,
         } => run_collect_linux(agents, duration_secs, out)?,
+        #[cfg(target_os = "linux")]
+        Command::Daemon {
+            transcript,
+            agents,
+            duration_secs,
+            out,
+        } => run_daemon(transcript, agents, duration_secs, out)?,
     }
     Ok(())
 }
@@ -162,6 +189,108 @@ fn read_machine_id() -> Option<String> {
     std::fs::read_to_string("/etc/machine-id")
         .ok()
         .map(|s| s.trim().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn run_daemon(
+    transcript: PathBuf,
+    agents: Option<Vec<String>>,
+    duration_secs: Option<u64>,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    use std::cell::RefCell;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use fishbowl_attribution::{AttributionEngine, EngineConfig};
+
+    let cfg = fishbowl_collector_linux::CollectorConfig {
+        enrolled_agents: agents.unwrap_or_else(|| {
+            vec!["claude".into(), "cursor".into(), "codex".into()]
+        }),
+        host_id: read_machine_id(),
+    };
+
+    // Build the attribution engine and seed it from the transcript.
+    let engine = AttributionEngine::new(EngineConfig {
+        transcript_path: transcript.clone(),
+    });
+    let engine = RefCell::new(engine);
+    engine.borrow_mut().refresh()?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    install_signal_handlers(&stop);
+    if let Some(secs) = duration_secs {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+
+    let sink: Box<dyn Write + Send> = match out {
+        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    let sink = std::sync::Mutex::new(sink);
+
+    let refresh_every = Duration::from_millis(500);
+    let last_refresh = std::cell::Cell::new(Instant::now());
+
+    eprintln!(
+        "fishbowl daemon starting (agents = {:?}, transcript = {})",
+        cfg.enrolled_agents,
+        transcript.display()
+    );
+
+    fishbowl_collector_linux::run_with_tick(
+        cfg,
+        stop,
+        |mut event| {
+            engine.borrow_mut().attribute(&mut event);
+            let mut s = sink.lock().expect("sink lock");
+            if let Ok(line) = serde_json::to_string(&event) {
+                let _ = writeln!(s, "{line}");
+                let _ = s.flush();
+            }
+        },
+        || {
+            if last_refresh.get().elapsed() >= refresh_every {
+                if let Err(e) = engine.borrow_mut().refresh() {
+                    eprintln!("transcript refresh failed: {e}");
+                }
+                last_refresh.set(Instant::now());
+            }
+        },
+    )?;
+
+    eprintln!("fishbowl daemon stopped");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_signal_handlers(stop: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = stop.clone();
+    static mut STOP_PTR: *const AtomicBool = std::ptr::null();
+    unsafe {
+        STOP_PTR = std::sync::Arc::as_ptr(&stop);
+        extern "C" fn handler(_sig: libc::c_int) {
+            unsafe {
+                if !STOP_PTR.is_null() {
+                    (*STOP_PTR).store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+    }
+    // Leak the Arc clone on purpose: the signal handler holds a raw pointer
+    // into it for the lifetime of the process. Without the leak the Arc could
+    // drop and free its inner allocation while the handler is registered.
+    std::mem::forget(stop);
 }
 
 fn detect_platform() -> Platform {

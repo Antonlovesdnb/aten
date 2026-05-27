@@ -1,24 +1,16 @@
 [package]
-name = "fishbowl-daemon"
+name = "fishbowl-attribution"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "fishbowl-v2 daemon CLI"
-
-[[bin]]
-name = "fishbowl"
-path = "src/main.rs"
+description = "Attribution engine stitching transcript events to kernel events"
 
 [dependencies]
 fishbowl-schema = { workspace = true }
 fishbowl-transcript = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-clap = { workspace = true }
 anyhow = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-fishbowl-collector-linux = { workspace = true }
-fishbowl-attribution = { workspace = true }
-libc = "0.2"
+thiserror = { workspace = true }
+chrono = { workspace = true }

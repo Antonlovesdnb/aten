@@ -97,6 +97,22 @@ pub fn run<F>(config: CollectorConfig, stop: Arc<AtomicBool>, emit: F) -> Result
 where
     F: FnMut(Event),
 {
+    run_with_tick(config, stop, emit, || {})
+}
+
+/// Same as `run`, plus a `tick` callback invoked once per poll cycle (~200ms).
+/// The daemon uses this to refresh transcript-side state between batches of
+/// kernel events without needing a second thread.
+pub fn run_with_tick<F, T>(
+    config: CollectorConfig,
+    stop: Arc<AtomicBool>,
+    emit: F,
+    mut tick: T,
+) -> Result<()>
+where
+    F: FnMut(Event),
+    T: FnMut(),
+{
     let skel_builder = ExecveSkelBuilder::default();
     // libbpf-rs 0.24 requires the caller to own an `OpenObject` slot for the
     // skeleton's lifetime — we keep it on the stack via MaybeUninit.
@@ -150,6 +166,7 @@ where
         if let Some(err) = had_error.take() {
             return Err(err);
         }
+        tick();
     }
 
     Ok(())
