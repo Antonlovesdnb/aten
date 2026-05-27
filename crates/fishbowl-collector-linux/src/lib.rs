@@ -393,11 +393,17 @@ where
     let filename = nul_str(&raw.filename);
 
     // Filter 1: is the opening process in the enrolled tree?
-    let Some(key) = state.pid_to_key.get(&pid).copied() else {
-        return Ok(());
-    };
-    let Some(record) = state.table.get(key) else {
-        return Ok(());
+    //
+    // We poll the exec and credacc ringbufs independently. An openat from a
+    // freshly-spawned descendant can therefore arrive in userspace *before*
+    // its own exec event has been drained from the other ringbuf, leaving
+    // pid_to_key without the binding. When that happens, walk the live /proc
+    // process tree up to an enrolled ancestor — slow path but correct, and
+    // we hit it for at most one open per process (after which pid_to_key
+    // catches up).
+    let record = match resolve_enrollment(pid, state) {
+        Some(r) => r,
+        None => return Ok(()),
     };
 
     // Filter 2: does the path classify as credentials?
@@ -467,6 +473,61 @@ where
 
     emit(event);
     Ok(())
+}
+
+/// Find the EnrollmentRecord for `pid`, falling back to a /proc walk if the
+/// fast-path `pid_to_key` lookup misses (race with the exec ringbuf). Caches
+/// any successful /proc-walk hit back into `pid_to_key` so subsequent opens
+/// from the same pid are O(1).
+fn resolve_enrollment(pid: i32, state: &mut SharedState) -> Option<EnrollmentRecord> {
+    if let Some(key) = state.pid_to_key.get(&pid).copied() {
+        if let Some(r) = state.table.get(key) {
+            return Some(r);
+        }
+    }
+
+    // Slow path: read /proc/<pid>/stat for start_time + ppid, then walk up.
+    let snap = proc::snapshot(pid);
+    if snap.start_time_ticks == 0 {
+        return None;
+    }
+    let my_key = ProcessKey {
+        pid,
+        start_time_ticks: snap.start_time_ticks,
+    };
+    if let Some(r) = state.table.get(my_key) {
+        state.pid_to_key.insert(pid, my_key);
+        return Some(r);
+    }
+
+    // Walk up to MAX_WALK ancestors. Each hop is a /proc/<pid>/stat read.
+    const MAX_WALK: usize = 16;
+    let mut current_ppid = snap.ppid;
+    for _ in 0..MAX_WALK {
+        if current_ppid <= 0 {
+            break;
+        }
+        let psnap = proc::snapshot(current_ppid);
+        if psnap.start_time_ticks == 0 {
+            break;
+        }
+        let pkey = ProcessKey {
+            pid: current_ppid,
+            start_time_ticks: psnap.start_time_ticks,
+        };
+        if state.table.get(pkey).is_some() {
+            // Found an enrolled ancestor — promote `pid` to be a tracked
+            // descendant carrying the same agent_root. Cache for next time.
+            let record = state.table.enroll(my_key, Some(pkey));
+            state.pid_to_key.insert(pid, my_key);
+            return Some(record);
+        }
+        if current_ppid == 1 {
+            break;
+        }
+        current_ppid = psnap.ppid;
+    }
+    None
 }
 
 fn absolutize(filename: &str, pid: i32) -> String {
