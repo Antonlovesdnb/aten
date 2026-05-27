@@ -359,13 +359,13 @@ mod tests {
             "time_window_ms": 92
         }"#;
         let a: Attribution = serde_json::from_str(json).unwrap();
-        assert_eq!(a.requested_in_tool_result, true);
-        assert_eq!(a.requested_in_user_message, false);
+        assert!(a.requested_in_tool_result);
+        assert!(!a.requested_in_user_message);
     }
 
     #[test]
     fn credential_class_round_trips() {
-        let v = serde_json::to_value(&CredentialClass::AwsCredentials).unwrap();
+        let v = serde_json::to_value(CredentialClass::AwsCredentials).unwrap();
         assert_eq!(v, json!("aws_credentials"));
         let back: CredentialClass = serde_json::from_value(v).unwrap();
         assert_eq!(back, CredentialClass::AwsCredentials);

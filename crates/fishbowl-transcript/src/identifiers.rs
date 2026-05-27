@@ -68,7 +68,7 @@ pub fn extract(text: &str) -> Vec<String> {
 }
 
 fn strip_trailing_punct(s: &str) -> &str {
-    s.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']'))
+    s.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']'])
 }
 
 /// Canonical form for cross-platform comparison.
