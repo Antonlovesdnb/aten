@@ -38,6 +38,12 @@ fn url_pattern() -> &'static Regex {
 }
 
 /// Pull every recognizable identifier out of a chunk of text. De-duped.
+///
+/// Trailing English punctuation (`. , ; : ! ?`) is stripped because the regex
+/// character classes are greedy enough to swallow sentence terminators —
+/// `"read ~/.aws/credentials."` would otherwise produce a different normalized
+/// key than `"read ~/.aws/credentials"`, and the two would not collide in the
+/// origin index. Same logic applied to URL captures.
 pub fn extract(text: &str) -> Vec<String> {
     let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (i, pat) in path_patterns().iter().enumerate() {
@@ -46,19 +52,23 @@ pub fn extract(text: &str) -> Vec<String> {
         if i == 2 {
             for cap in pat.captures_iter(text) {
                 if let Some(m) = cap.get(1) {
-                    out.insert(m.as_str().to_string());
+                    out.insert(strip_trailing_punct(m.as_str()).to_string());
                 }
             }
         } else {
             for m in pat.find_iter(text) {
-                out.insert(m.as_str().to_string());
+                out.insert(strip_trailing_punct(m.as_str()).to_string());
             }
         }
     }
     for m in url_pattern().find_iter(text) {
-        out.insert(m.as_str().to_string());
+        out.insert(strip_trailing_punct(m.as_str()).to_string());
     }
     out.into_iter().collect()
+}
+
+fn strip_trailing_punct(s: &str) -> &str {
+    s.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']'))
 }
 
 /// Canonical form for cross-platform comparison.
@@ -138,6 +148,22 @@ mod tests {
     fn no_false_positive_on_plain_text() {
         let got = extract("hello world, see file.txt");
         assert!(got.is_empty(), "got: {got:?}");
+    }
+
+    /// English punctuation at the end of a path or URL must not collide the
+    /// normalized key. Without trailing-punct stripping, the prompt-injection
+    /// detection would miss matches whenever the path appears at the end of a
+    /// sentence.
+    #[test]
+    fn trailing_punctuation_stripped() {
+        let got = extract("please read ~/.aws/credentials.");
+        assert!(got.iter().any(|s| s == "~/.aws/credentials"), "got: {got:?}");
+
+        let got2 = extract("check (https://attacker.com/path), then continue");
+        assert!(
+            got2.iter().any(|s| s == "https://attacker.com/path"),
+            "got: {got2:?}"
+        );
     }
 
     #[test]

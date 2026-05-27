@@ -13,7 +13,6 @@ use fishbowl_schema::{
     Event, EventKind, IndexEntry, Mention, Origin, Platform, PromptPayload, ResultStatus, Role,
     Source, ToolCallPayload, ToolResultPayload, SCHEMA_VERSION,
 };
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,10 +41,9 @@ struct TranscriptRecord {
 
 #[derive(Debug, Deserialize)]
 struct Message {
-    #[serde(default)]
-    role: Option<String>,
     /// Either a string (user-typed prompt) or an array of content blocks. Captured
-    /// as raw JSON and dispatched in `parse_record`.
+    /// as raw JSON and dispatched in `parse_record`. Role is inferred from the
+    /// containing record's `type` (`user`/`assistant`), not read here.
     #[serde(default)]
     content: serde_json::Value,
 }
@@ -103,7 +101,10 @@ fn envelope(rec: &TranscriptRecord, kind: EventKind, platform: Platform) -> Even
 
 /// Dispatch one transcript record into zero or more schema events. Metadata records
 /// (mode, permission-mode, file-history-snapshot, ai-title, attachments) yield zero.
-pub fn parse_record(rec: &TranscriptRecord, platform: Platform) -> Vec<Event> {
+///
+/// `pub(crate)` because the input type is private — `read_transcript` is the
+/// public entry point. Tests live inside the crate so they can call this directly.
+pub(crate) fn parse_record(rec: &TranscriptRecord, platform: Platform) -> Vec<Event> {
     let mut out = Vec::new();
     let Some(rtype) = rec.rtype.as_deref() else {
         return out;
@@ -331,12 +332,6 @@ pub fn build_identifier_index(events: &[Event], home: Option<&str>) -> Identifie
 
 // Re-export the regex inventory for callers who want to reuse the patterns.
 pub use identifiers::{extract, normalize};
-
-/// Thin wrapper so `regex`'s LazyLock-equivalent works without `once_cell` dep.
-#[allow(dead_code)]
-fn compile(pattern: &str) -> Regex {
-    Regex::new(pattern).expect("static regex must compile")
-}
 
 #[cfg(test)]
 mod tests {
