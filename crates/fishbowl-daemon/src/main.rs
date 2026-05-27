@@ -45,6 +45,20 @@ enum Command {
         #[arg(long)]
         idx: Option<PathBuf>,
     },
+    /// Run the Linux eBPF process-exec collector. Requires root or CAP_BPF+CAP_PERFMON.
+    #[cfg(target_os = "linux")]
+    CollectLinux {
+        /// Process `comm` names to enroll as agent roots. Comma-separated.
+        /// Default: claude,cursor,codex.
+        #[arg(long, value_delimiter = ',')]
+        agents: Option<Vec<String>>,
+        /// Stop after this many seconds. Default: run until SIGINT.
+        #[arg(long)]
+        duration_secs: Option<u64>,
+        /// Append emitted events as JSONL to this file. Default: stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -62,8 +76,92 @@ fn main() -> Result<()> {
             out,
             idx,
         } => run_transcript(transcript, out, idx)?,
+        #[cfg(target_os = "linux")]
+        Command::CollectLinux {
+            agents,
+            duration_secs,
+            out,
+        } => run_collect_linux(agents, duration_secs, out)?,
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_collect_linux(
+    agents: Option<Vec<String>>,
+    duration_secs: Option<u64>,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let cfg = fishbowl_collector_linux::CollectorConfig {
+        enrolled_agents: agents.unwrap_or_else(|| {
+            vec!["claude".into(), "cursor".into(), "codex".into()]
+        }),
+        host_id: read_machine_id(),
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // SIGINT handler — single line via signal-hook-style raw libc, no extra
+    // dep. Sets `stop`; the collector's poll loop notices on the next tick.
+    {
+        let stop = stop.clone();
+        static mut STOP_PTR: *const AtomicBool = std::ptr::null();
+        // SAFETY: STOP_PTR is set exactly once before sigaction is installed,
+        // and the handler reads it through Arc semantics on Linux atomics —
+        // which are async-signal-safe in practice for this access pattern.
+        unsafe {
+            STOP_PTR = Arc::as_ptr(&stop);
+            extern "C" fn handler(_sig: libc::c_int) {
+                // SAFETY: see above
+                unsafe {
+                    if !STOP_PTR.is_null() {
+                        (*STOP_PTR).store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+            libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
+        }
+    }
+
+    // Optional duration cap: spawn a thread that flips `stop` after N seconds.
+    if let Some(secs) = duration_secs {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+
+    let sink: Box<dyn Write + Send> = match out {
+        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    let sink = std::sync::Mutex::new(sink);
+
+    eprintln!("fishbowl collector starting (agents = {:?})", cfg.enrolled_agents);
+
+    fishbowl_collector_linux::run(cfg, stop, |event| {
+        let mut s = sink.lock().expect("sink lock");
+        if let Ok(line) = serde_json::to_string(&event) {
+            let _ = writeln!(s, "{line}");
+            let _ = s.flush();
+        }
+    })?;
+
+    eprintln!("fishbowl collector stopped");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_machine_id() -> Option<String> {
+    std::fs::read_to_string("/etc/machine-id")
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn detect_platform() -> Platform {
