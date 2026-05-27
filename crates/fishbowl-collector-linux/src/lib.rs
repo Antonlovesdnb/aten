@@ -392,25 +392,24 @@ where
     let pid = raw.pid as i32;
     let filename = nul_str(&raw.filename);
 
-    // Filter 1: is the opening process in the enrolled tree?
+    // Order matters here. 99%+ of all opens on a Linux box are not credential
+    // paths, and `credentials::classify` is a handful of substring checks on
+    // a ≤256-byte string — sub-microsecond. Doing it FIRST lets us drop the
+    // overwhelming majority of events before paying for any /proc lookup.
     //
-    // We poll the exec and credacc ringbufs independently. An openat from a
-    // freshly-spawned descendant can therefore arrive in userspace *before*
-    // its own exec event has been drained from the other ringbuf, leaving
-    // pid_to_key without the binding. When that happens, walk the live /proc
-    // process tree up to an enrolled ancestor — slow path but correct, and
-    // we hit it for at most one open per process (after which pid_to_key
-    // catches up).
-    let record = match resolve_enrollment(pid, state) {
-        Some(r) => r,
-        None => return Ok(()),
-    };
-
-    // Filter 2: does the path classify as credentials?
+    // The enrollment check is the expensive one (possible /proc walk to
+    // resolve a freshly-spawned descendant the exec ringbuf hasn't reported
+    // yet — see `resolve_enrollment`). We only reach it for credential-class
+    // opens, which on a dev endpoint is a small handful per minute.
     let class = credentials::classify(filename);
     if class == CredentialClass::None {
         return Ok(());
     }
+
+    let record = match resolve_enrollment(pid, state) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
 
     // Resolve the absolute path. The kernel gives us the syscall arg, which
     // may be relative (e.g. `.aws/credentials` from a process whose cwd is
