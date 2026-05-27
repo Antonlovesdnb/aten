@@ -392,11 +392,17 @@ where
     let pid = raw.pid as i32;
     let filename = nul_str(&raw.filename);
 
-    // Temporary diagnostic: print credential-like paths even when they don't
-    // pass the full classify. Helps catch path-encoding issues at the
-    // kernel→userspace boundary.
-    if filename.contains(".aws") || filename.contains(".ssh") || filename.contains("credential") {
-        eprintln!("credacc seen pid={pid} filename={filename}");
+    // Temporary diagnostic: log a sample of incoming credacc events to
+    // confirm filename strings are being copied across kernel→user. Caps
+    // total prints via an atomic so we don't flood.
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering as AO};
+        static CT: AtomicUsize = AtomicUsize::new(0);
+        let n = CT.fetch_add(1, AO::Relaxed);
+        if n < 20 {
+            eprintln!("credacc raw n={n} pid={pid} flags={} comm={} filename={filename:?}",
+                raw.flags, nul_str(&raw.comm));
+        }
     }
 
     // Order matters here. 99%+ of all opens on a Linux box are not credential
