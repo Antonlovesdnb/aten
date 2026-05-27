@@ -1,0 +1,33 @@
+# Session-only files (kept locally, not published)
+memory.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Rust / native build (future eBPF + ETW collectors)
+target/
+*.o
+*.so
+*.dylib
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local test outputs from the transcript reader
+*.events.jsonl
+*.idx.json
