@@ -1,29 +1,44 @@
-//! Linux eBPF process_exec collector.
+//! Linux eBPF collector.
 //!
-//! Attaches a tracepoint to `sched/sched_process_exec`, consumes exec events
-//! from a ringbuf, applies userspace enrollment filtering (only emit when the
-//! process is an enrolled agent CLI or a descendant of one), and produces
-//! schema v0.2 `ProcessExec` events.
+//! Attaches two tracepoints:
+//! - `sched/sched_process_exec` → `ProcessExec` events
+//! - `syscalls/sys_enter_openat` → `CredentialAccess` events (after the
+//!   userspace classifier maps the path to a real credential class)
+//!
+//! Both probes share an enrollment state machine: only processes that are
+//! enrolled agent CLIs or descendants of one produce events. The exec probe
+//! drives enrollment (it sees every new process); the openat probe consults
+//! the same `EnrollmentTable` via a side-table `pid_to_key` that the exec
+//! handler maintains.
 //!
 //! The attribution block on emitted events sets `attributed_by_descent = true`
 //! for enrolled descendants. The other attribution fields are placeholders
 //! until the daemon's attribution engine wires together transcript tool_calls
-//! (timing windows) and the identifier index (origin booleans).
+//! and the identifier index.
 //!
 //! Requires CAP_BPF + CAP_PERFMON. Run as root for v0.x.
 
+pub mod credentials;
 pub mod enroll;
 pub mod proc;
 
-mod skel {
+mod skel_execve {
     #![allow(clippy::all)]
     #![allow(dead_code)]
     #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
     include!(concat!(env!("OUT_DIR"), "/execve.skel.rs"));
 }
 
+mod skel_credacc {
+    #![allow(clippy::all)]
+    #![allow(dead_code)]
+    #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
+    include!(concat!(env!("OUT_DIR"), "/credacc.skel.rs"));
+}
+
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,15 +46,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use fishbowl_schema::{
-    Attribution, Event, EventKind, Platform, Process, ProcessExecPayload, Source, SCHEMA_VERSION,
+    AccessType, Attribution, CredentialAccessPayload, CredentialClass, Event, EventKind, Platform,
+    Process, ProcessExecPayload, Source, SCHEMA_VERSION,
 };
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::OpenObject;
 use plain::Plain;
 use serde::Deserialize;
 
-use crate::enroll::{EnrollmentTable, ProcessKey};
-use crate::skel::*;
+use crate::enroll::{EnrollmentTable, EnrollmentRecord, ProcessKey};
+use crate::skel_credacc::*;
+use crate::skel_execve::*;
 
 const TASK_COMM_LEN: usize = 16;
 const MAX_FILENAME_LEN: usize = 256;
@@ -65,6 +82,36 @@ impl RawExecEvent {
         // representation.
         unsafe { std::mem::zeroed() }
     }
+}
+
+/// Mirror of the BPF program's `struct credacc_event` in `credacc.bpf.c`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct RawCredaccEvent {
+    timestamp_ns: u64,
+    pid: u32,
+    uid: u32,
+    flags: i32,
+    comm: [u8; TASK_COMM_LEN],
+    filename: [u8; MAX_FILENAME_LEN],
+}
+unsafe impl Plain for RawCredaccEvent {}
+
+impl RawCredaccEvent {
+    fn zeroed() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// State shared between the two probe handlers. The exec handler maintains
+/// `pid_to_key` so the credacc handler can look up a process's enrollment
+/// record in O(1) without a /proc/<pid>/stat read on every open.
+#[derive(Debug, Default)]
+struct SharedState {
+    table: EnrollmentTable,
+    /// pid → ProcessKey, populated on each enrolled exec, removed on each
+    /// non-enrolled exec so PID reuse doesn't return a stale binding.
+    pid_to_key: HashMap<i32, ProcessKey>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,36 +160,54 @@ where
     F: FnMut(Event),
     T: FnMut(),
 {
-    let skel_builder = ExecveSkelBuilder::default();
-    // libbpf-rs 0.24 requires the caller to own an `OpenObject` slot for the
-    // skeleton's lifetime — we keep it on the stack via MaybeUninit.
-    let mut open_object: MaybeUninit<OpenObject> = MaybeUninit::uninit();
-    let open_skel = skel_builder
-        .open(&mut open_object)
-        .context("open BPF skeleton")?;
-    let mut skel = open_skel.load().context("load BPF program")?;
-    skel.attach().context("attach BPF program")?;
+    // libbpf-rs 0.24 requires the caller to own an `OpenObject` slot for
+    // each skeleton's lifetime — we keep them on the stack via MaybeUninit.
+    let mut exec_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
+    let mut cred_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
 
-    let table = RefCell::new(EnrollmentTable::new());
+    let exec_skel = ExecveSkelBuilder::default()
+        .open(&mut exec_obj)
+        .context("open execve skeleton")?;
+    let mut exec_skel = exec_skel.load().context("load execve BPF")?;
+    exec_skel.attach().context("attach execve BPF")?;
+
+    let cred_skel = CredaccSkelBuilder::default()
+        .open(&mut cred_obj)
+        .context("open credacc skeleton")?;
+    let mut cred_skel = cred_skel.load().context("load credacc BPF")?;
+    cred_skel.attach().context("attach credacc BPF")?;
+
+    let state = RefCell::new(SharedState::default());
     let emit_cell = RefCell::new(emit);
     let host_id = config.host_id.clone();
-    // Shared error sink. The ringbuf callback stores into `had_error`; the
-    // outer loop drains it after each poll. `Cell` because both sides hold
-    // shared references and `Option<anyhow::Error>::default()` is `None`.
     let had_error: Cell<Option<anyhow::Error>> = Cell::new(None);
 
-    // In libbpf-rs 0.24 the generated skeleton exposes maps as a struct
-    // field, not a method.
-    let maps = &skel.maps;
+    let exec_maps = &exec_skel.maps;
+    let cred_maps = &cred_skel.maps;
     let mut builder = libbpf_rs::RingBufferBuilder::new();
 
-    let handle = |bytes: &[u8]| -> i32 {
-        let mut table = table.borrow_mut();
+    let exec_handle = |bytes: &[u8]| -> i32 {
+        let mut state = state.borrow_mut();
         let mut emit = emit_cell.borrow_mut();
-        if let Err(e) = handle_event(
+        if let Err(e) = handle_exec_event(
             bytes,
             &config,
-            &mut table,
+            &mut state,
+            host_id.as_deref(),
+            &mut *emit,
+        ) {
+            had_error.set(Some(e));
+            return 1;
+        }
+        0
+    };
+
+    let cred_handle = |bytes: &[u8]| -> i32 {
+        let mut state = state.borrow_mut();
+        let mut emit = emit_cell.borrow_mut();
+        if let Err(e) = handle_credacc_event(
+            bytes,
+            &mut state,
             host_id.as_deref(),
             &mut *emit,
         ) {
@@ -153,8 +218,11 @@ where
     };
 
     builder
-        .add(&maps.events, handle)
-        .context("add ringbuf consumer")?;
+        .add(&exec_maps.events, exec_handle)
+        .context("add execve ringbuf consumer")?;
+    builder
+        .add(&cred_maps.cred_events, cred_handle)
+        .context("add credacc ringbuf consumer")?;
     let ringbuf = builder.build().context("build ringbuf")?;
 
     while !stop.load(Ordering::Relaxed) {
@@ -172,10 +240,10 @@ where
     Ok(())
 }
 
-fn handle_event<F>(
+fn handle_exec_event<F>(
     bytes: &[u8],
     config: &CollectorConfig,
-    table: &mut EnrollmentTable,
+    state: &mut SharedState,
     host_id: Option<&str>,
     emit: &mut F,
 ) -> Result<()>
@@ -222,15 +290,26 @@ where
     };
 
     let is_agent_root_match = config.enrolled_agents.iter().any(|n| n == &comm);
-    let parent_enrolled = parent_key.and_then(|pk| table.get(pk));
+    let parent_enrolled = parent_key.and_then(|pk| state.table.get(pk));
 
     let record = if is_agent_root_match {
-        Some(table.enroll(key, None))
+        Some(state.table.enroll(key, None))
     } else if parent_enrolled.is_some() {
-        Some(table.enroll(key, parent_key))
+        Some(state.table.enroll(key, parent_key))
     } else {
         None
     };
+
+    // Maintain pid_to_key so the credacc handler can look up enrollment in
+    // O(1). Invalidate on non-enrolled execs to avoid PID-reuse stale binds.
+    match record {
+        Some(_) => {
+            state.pid_to_key.insert(pid, key);
+        }
+        None => {
+            state.pid_to_key.remove(&pid);
+        }
+    }
 
     let Some(record) = record else {
         return Ok(()); // Not interesting — drop.
@@ -290,6 +369,129 @@ where
     emit(event);
     Ok(())
 }
+
+/// Handle one credential-access ringbuf record. Drop fast for the 99%+ of
+/// opens that aren't from an enrolled process tree or aren't credential
+/// paths; only emit the small minority that pass both filters.
+fn handle_credacc_event<F>(
+    bytes: &[u8],
+    state: &mut SharedState,
+    host_id: Option<&str>,
+    emit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Event),
+{
+    if bytes.len() < std::mem::size_of::<RawCredaccEvent>() {
+        return Ok(());
+    }
+    let mut raw = RawCredaccEvent::zeroed();
+    plain::copy_from_bytes(&mut raw, bytes)
+        .map_err(|_| anyhow!("ringbuf record size mismatch"))?;
+
+    let pid = raw.pid as i32;
+    let filename = nul_str(&raw.filename);
+
+    // Filter 1: is the opening process in the enrolled tree?
+    let Some(key) = state.pid_to_key.get(&pid).copied() else {
+        return Ok(());
+    };
+    let Some(record) = state.table.get(key) else {
+        return Ok(());
+    };
+
+    // Filter 2: does the path classify as credentials?
+    let class = credentials::classify(filename);
+    if class == CredentialClass::None {
+        return Ok(());
+    }
+
+    // Resolve the absolute path. The kernel gives us the syscall arg, which
+    // may be relative (e.g. `.aws/credentials` from a process whose cwd is
+    // $HOME). Use /proc/<pid>/cwd to normalize to an absolute path so the
+    // attribution engine's identifier match and the schema's file_path field
+    // are both unambiguous.
+    let abs_path = absolutize(filename, pid);
+
+    let snap = proc::snapshot(pid);
+    let chain = proc::parent_chain(pid, 16);
+    let is_agent_root = record.agent_root.pid == pid;
+    let attributed_by_descent = !is_agent_root;
+
+    let access_type = access_type_from_flags(raw.flags);
+
+    let event = Event {
+        schema_version: SCHEMA_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: rfc3339_from_boot_ns(raw.timestamp_ns),
+        monotonic_ns: Some(raw.timestamp_ns),
+        platform: Platform::Linux,
+        host_id: host_id.map(str::to_string),
+        agent_id: "agent-descendant".to_string(),
+        session_id: None,
+        user_id: Some(snap.user.clone()),
+        source: Source {
+            collector: "linux_ebpf".to_string(),
+            probe: "tracepoint/syscalls/sys_enter_openat".to_string(),
+            host_pid: Some(pid),
+        },
+        kind: EventKind::CredentialAccess(CredentialAccessPayload {
+            process: Process {
+                pid,
+                ppid: snap.ppid,
+                start_time: snap.start_time_ticks.to_string(),
+                name: snap.comm.clone(),
+                path: snap.exe_path.clone(),
+                cmdline: snap.cmdline.clone(),
+                cwd: snap.cwd.clone(),
+                user: snap.user.clone(),
+                integrity_level: None,
+                parent_chain: chain,
+                agent_root_pid: Some(record.agent_root.pid),
+            },
+            attribution: Attribution {
+                attributed_tool_call_id: None,
+                attributed_by_descent,
+                requested_by_tool_call: false,
+                requested_in_user_message: false,
+                requested_in_assistant_message: false,
+                requested_in_tool_result: false,
+                time_window_ms: None,
+            },
+            file_path: abs_path,
+            access_type,
+            credential_class: class,
+            bytes_read: None,
+        }),
+    };
+
+    emit(event);
+    Ok(())
+}
+
+fn absolutize(filename: &str, pid: i32) -> String {
+    if filename.starts_with('/') {
+        return filename.to_string();
+    }
+    if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+        let cwd_str = cwd.to_string_lossy();
+        return format!("{cwd_str}/{filename}");
+    }
+    filename.to_string()
+}
+
+fn access_type_from_flags(flags: i32) -> AccessType {
+    // openat flags: O_RDONLY=0, O_WRONLY=1, O_RDWR=2 occupy the bottom 2 bits.
+    const O_ACCMODE: i32 = 3;
+    match flags & O_ACCMODE {
+        0 => AccessType::Read,
+        1 | 2 => AccessType::Write,
+        _ => AccessType::Open,
+    }
+}
+
+#[allow(dead_code)]
+fn _silence_unused(_r: EnrollmentRecord) {}
 
 fn nul_str(buf: &[u8]) -> &str {
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());

@@ -87,6 +87,9 @@ impl AttributionEngine {
 
         let agent_root_pid = match &event.kind {
             EventKind::ProcessExec(p) => p.process.agent_root_pid,
+            EventKind::CredentialAccess(c) => c.process.agent_root_pid,
+            EventKind::NetworkEgress(n) => n.process.agent_root_pid,
+            EventKind::FileWrite(f) => f.process.agent_root_pid,
             _ => None,
         };
 
@@ -111,23 +114,62 @@ impl AttributionEngine {
         let event_ns = session::parse_rfc3339_ns(&event.timestamp).unwrap_or(i64::MAX);
         let tc = session.attribute_at(event_ns);
 
-        if let EventKind::ProcessExec(p) = &mut event.kind {
-            let primary_identifier = p.process.cmdline.clone();
-            if let Some(tc) = tc {
-                p.attribution.attributed_tool_call_id = Some(tc.id.clone());
-                p.attribution.time_window_ms =
-                    Some(((event_ns - tc.timestamp_ns).max(0) / 1_000_000) as u64);
-                p.attribution.requested_by_tool_call =
-                    identifiers_appear_in(&primary_identifier, &tc.input_text);
+        match &mut event.kind {
+            EventKind::ProcessExec(p) => {
+                let primary_identifier = p.process.cmdline.clone();
+                if let Some(tc) = tc {
+                    p.attribution.attributed_tool_call_id = Some(tc.id.clone());
+                    p.attribution.time_window_ms =
+                        Some(((event_ns - tc.timestamp_ns).max(0) / 1_000_000) as u64);
+                    p.attribution.requested_by_tool_call =
+                        identifiers_appear_in(&primary_identifier, &tc.input_text);
+                }
+                let origins = session.origins_for_text(&primary_identifier);
+                p.attribution.requested_in_user_message = origins.user_message;
+                p.attribution.requested_in_assistant_message = origins.assistant_message;
+                p.attribution.requested_in_tool_result = origins.tool_result;
             }
-            let origins = session.origins_for_text(&primary_identifier);
-            p.attribution.requested_in_user_message = origins.user_message;
-            p.attribution.requested_in_assistant_message = origins.assistant_message;
-            p.attribution.requested_in_tool_result = origins.tool_result;
+            EventKind::CredentialAccess(c) => {
+                // For credential_access the primary identifier is the file_path
+                // itself — there's no haystack to extract from. We still run it
+                // through the same normalization used for the origin index so
+                // matches against transcript-side mentions of the same path
+                // (which may have used `~/...` or different casing) hit.
+                let path = c.file_path.clone();
+                let normalized = fishbowl_transcript::normalize(&path, None);
+                if let Some(tc) = tc {
+                    c.attribution.attributed_tool_call_id = Some(tc.id.clone());
+                    c.attribution.time_window_ms =
+                        Some(((event_ns - tc.timestamp_ns).max(0) / 1_000_000) as u64);
+                    // Tool-call args may reference the path verbatim, in ~/
+                    // form, or by relative path. Substring-match in both the
+                    // raw and normalized forms.
+                    c.attribution.requested_by_tool_call = tc.input_text.contains(&path)
+                        || tc.input_text.to_lowercase().contains(&normalized);
+                }
+                // Identifier-origin lookup: use the normalized path as the key
+                // (origin index stores normalized identifiers).
+                if let Some(entry) = session.identifier_index.entries.get(&normalized) {
+                    for o in &entry.origins {
+                        match o {
+                            fishbowl_schema::Origin::UserMessage => {
+                                c.attribution.requested_in_user_message = true;
+                            }
+                            fishbowl_schema::Origin::AssistantMessage => {
+                                c.attribution.requested_in_assistant_message = true;
+                            }
+                            fishbowl_schema::Origin::ToolResult => {
+                                c.attribution.requested_in_tool_result = true;
+                            }
+                        }
+                    }
+                }
+            }
+            // NetworkEgress / FileWrite follow the same shape but the
+            // primary identifier differs (dest_host + URL path, or file_path).
+            // Wire when the probes land.
+            _ => {}
         }
-        // CredentialAccess / NetworkEgress / FileWrite follow the same shape —
-        // primary identifier differs (file_path or dest_host etc). Wire them
-        // when the probes land.
     }
 
     fn resolve_session_for_pid(
