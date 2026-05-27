@@ -59,6 +59,18 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Run the Windows ETW process-exec collector. Requires admin. Scaffolds the
+    /// Windows side of the daemon; credential and network probes follow.
+    #[cfg(target_os = "windows")]
+    CollectWindows {
+        /// Image-name basenames to enroll as agent roots (e.g. claude.exe).
+        #[arg(long, value_delimiter = ',')]
+        agents: Option<Vec<String>>,
+        #[arg(long)]
+        duration_secs: Option<u64>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Run the full daemon: eBPF collector + transcript reader + attribution.
     /// Linux only for v0.x. Requires root or CAP_BPF+CAP_PERFMON.
     #[cfg(target_os = "linux")]
@@ -109,8 +121,114 @@ fn main() -> Result<()> {
             duration_secs,
             out,
         } => run_daemon(transcript, agents, duration_secs, out)?,
+        #[cfg(target_os = "windows")]
+        Command::CollectWindows {
+            agents,
+            duration_secs,
+            out,
+        } => run_collect_windows(agents, duration_secs, out)?,
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn run_collect_windows(
+    agents: Option<Vec<String>>,
+    duration_secs: Option<u64>,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let cfg = fishbowl_collector_windows::CollectorConfig {
+        enrolled_agents: agents.unwrap_or_else(|| {
+            vec!["claude.exe".into(), "cursor.exe".into(), "codex.exe".into()]
+        }),
+        host_id: read_machine_guid_windows(),
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc_set_handler(move || stop.store(true, Ordering::Relaxed));
+    }
+    if let Some(secs) = duration_secs {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+
+    let sink: Box<dyn Write + Send> = match out {
+        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    let sink = std::sync::Arc::new(std::sync::Mutex::new(sink));
+    let sink_for_emit = sink.clone();
+
+    eprintln!(
+        "fishbowl windows collector starting (agents = {:?})",
+        cfg.enrolled_agents
+    );
+
+    fishbowl_collector_windows::run(cfg, stop, move |event| {
+        let mut s = sink_for_emit.lock().expect("sink lock");
+        if let Ok(line) = serde_json::to_string(&event) {
+            let _ = writeln!(s, "{line}");
+            let _ = s.flush();
+        }
+    })?;
+
+    eprintln!("fishbowl windows collector stopped");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn read_machine_guid_windows() -> Option<String> {
+    // HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid. Returns None if the
+    // registry call fails (e.g. unusual ACLs); the envelope just stays empty.
+    std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Cryptography",
+            "/v",
+            "MachineGuid",
+        ])
+        .output()
+        .ok()
+        .and_then(|out| {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines()
+                .find_map(|l| l.split_whitespace().last().map(str::to_string))
+                .filter(|s| s.len() > 30)
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn ctrlc_set_handler<F: FnMut() + Send + 'static>(mut handler: F) {
+    // Minimal Ctrl-C handler using Windows SetConsoleCtrlHandler. We avoid
+    // adding the `ctrlc` crate since one boolean toggle is the entire job.
+    use std::sync::OnceLock;
+    static HANDLER: OnceLock<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>> = OnceLock::new();
+    let slot = HANDLER.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().expect("ctrlc slot") = Some(Box::new(move || handler()));
+
+    unsafe extern "system" fn raw(_ctrl_type: u32) -> windows::core::BOOL {
+        if let Some(slot) = HANDLER.get() {
+            if let Ok(mut g) = slot.lock() {
+                if let Some(h) = g.as_mut() {
+                    h();
+                }
+            }
+        }
+        windows::core::BOOL(1) // TRUE — handled
+    }
+    unsafe {
+        use windows::Win32::System::Console::SetConsoleCtrlHandler;
+        let _ = SetConsoleCtrlHandler(Some(raw), true);
+    }
 }
 
 #[cfg(target_os = "linux")]

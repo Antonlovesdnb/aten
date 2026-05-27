@@ -13,6 +13,7 @@ description = "Always-on cross-platform telemetry daemon for AI agent activity"
 fishbowl-schema = { path = "crates/fishbowl-schema" }
 fishbowl-transcript = { path = "crates/fishbowl-transcript" }
 fishbowl-collector-linux = { path = "crates/fishbowl-collector-linux" }
+fishbowl-collector-windows = { path = "crates/fishbowl-collector-windows" }
 fishbowl-attribution = { path = "crates/fishbowl-attribution" }
 
 serde = { version = "1", features = ["derive"] }

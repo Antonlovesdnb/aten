@@ -19,9 +19,13 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+
+# Linux-only deps. The crate as a whole is a no-op on non-Linux hosts so the
+# workspace can build on Windows without pulling libbpf.
+[target.'cfg(target_os = "linux")'.dependencies]
 libbpf-rs = "0.24"
 libc = "0.2"
 plain = "0.2"
 
-[build-dependencies]
+[target.'cfg(target_os = "linux")'.build-dependencies]
 libbpf-cargo = "0.24"

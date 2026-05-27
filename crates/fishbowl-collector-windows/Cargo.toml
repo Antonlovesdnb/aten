@@ -1,0 +1,31 @@
+[package]
+name = "fishbowl-collector-windows"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Windows ETW collector for fishbowl-v2"
+
+[lib]
+name = "fishbowl_collector_windows"
+path = "src/lib.rs"
+
+[dependencies]
+fishbowl-schema = { workspace = true }
+fishbowl-collector-linux = { workspace = true }  # for enroll/credentials/network modules (cross-platform)
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+
+# Windows-only deps. The crate as a whole is a no-op on non-Windows hosts so
+# the workspace can build on Linux without pulling ETW.
+[target.'cfg(target_os = "windows")'.dependencies]
+ferrisetw = "1.2"
+windows = { version = "0.62", features = [
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    "Win32_Security",
+] }
