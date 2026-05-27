@@ -111,7 +111,9 @@ where
     // Build the ringbuf consumer with a small adapter that owns &mut state.
     // libbpf-rs's poll API runs the callback for each record; we pass it
     // through a closure that has captured the state by mutable reference.
-    let maps = skel.maps();
+    // In libbpf-rs 0.24 the generated skeleton exposes maps as a struct
+    // field, not a method.
+    let maps = &skel.maps;
     let mut builder = libbpf_rs::RingBufferBuilder::new();
     let mut had_error: Option<anyhow::Error> = None;
 
@@ -130,7 +132,7 @@ where
     };
 
     builder
-        .add(maps.events(), &mut handle)
+        .add(&maps.events, &mut handle)
         .context("add ringbuf consumer")?;
     let ringbuf = builder.build().context("build ringbuf")?;
 
