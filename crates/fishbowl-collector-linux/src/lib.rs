@@ -93,7 +93,7 @@ impl Default for CollectorConfig {
 /// One-shot bootstrap and run loop. `emit` is invoked for every emitted
 /// schema event; the caller decides where it goes (stdout, file, network).
 /// Returns when `stop` is set.
-pub fn run<F>(config: CollectorConfig, stop: Arc<AtomicBool>, mut emit: F) -> Result<()>
+pub fn run<F>(config: CollectorConfig, stop: Arc<AtomicBool>, emit: F) -> Result<()>
 where
     F: FnMut(Event),
 {
