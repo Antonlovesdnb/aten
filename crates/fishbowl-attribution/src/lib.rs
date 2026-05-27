@@ -165,9 +165,36 @@ impl AttributionEngine {
                     }
                 }
             }
-            // NetworkEgress / FileWrite follow the same shape but the
-            // primary identifier differs (dest_host + URL path, or file_path).
-            // Wire when the probes land.
+            EventKind::NetworkEgress(n) => {
+                // Primary identifier for an egress event is the IP and the
+                // hostname (when known). We check whatever's populated: the
+                // tool_call's input or any prompt may reference either form.
+                // Without TLS SNI capture, dest_host is None for v0.x; the
+                // attribution falls back to IP-only matching, which is what
+                // the malicious-npm demo needs (the user's prompt did not
+                // mention the beacon IP).
+                let ip = n.dest_ip.clone();
+                let host = n.dest_host.clone().unwrap_or_default();
+                if let Some(tc) = tc {
+                    n.attribution.attributed_tool_call_id = Some(tc.id.clone());
+                    n.attribution.time_window_ms =
+                        Some(((event_ns - tc.timestamp_ns).max(0) / 1_000_000) as u64);
+                    n.attribution.requested_by_tool_call =
+                        tc.input_text.contains(&ip)
+                            || (!host.is_empty() && tc.input_text.contains(&host));
+                }
+                let mut origins = session.origins_for_text(&ip);
+                if !host.is_empty() {
+                    let host_origins = session.origins_for_text(&host);
+                    origins.user_message |= host_origins.user_message;
+                    origins.assistant_message |= host_origins.assistant_message;
+                    origins.tool_result |= host_origins.tool_result;
+                }
+                n.attribution.requested_in_user_message = origins.user_message;
+                n.attribution.requested_in_assistant_message = origins.assistant_message;
+                n.attribution.requested_in_tool_result = origins.tool_result;
+            }
+            // FileWrite probe still pending.
             _ => {}
         }
     }

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 const SOURCES: &[(&str, &str)] = &[
     ("src/bpf/execve.bpf.c", "execve.skel.rs"),
     ("src/bpf/credacc.bpf.c", "credacc.skel.rs"),
+    ("src/bpf/connect.bpf.c", "connect.skel.rs"),
 ];
 
 fn main() {

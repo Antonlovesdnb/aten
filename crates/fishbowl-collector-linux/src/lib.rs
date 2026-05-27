@@ -20,6 +20,7 @@
 
 pub mod credentials;
 pub mod enroll;
+pub mod network;
 pub mod proc;
 
 mod skel_execve {
@@ -36,6 +37,13 @@ mod skel_credacc {
     include!(concat!(env!("OUT_DIR"), "/credacc.skel.rs"));
 }
 
+mod skel_connect {
+    #![allow(clippy::all)]
+    #![allow(dead_code)]
+    #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
+    include!(concat!(env!("OUT_DIR"), "/connect.skel.rs"));
+}
+
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -46,15 +54,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use fishbowl_schema::{
-    AccessType, Attribution, CredentialAccessPayload, CredentialClass, Event, EventKind, Platform,
-    Process, ProcessExecPayload, Source, SCHEMA_VERSION,
+    AccessType, Attribution, CredentialAccessPayload, CredentialClass, Event, EventKind,
+    NetworkEgressPayload, Platform, Process, ProcessExecPayload, Protocol, Source, SCHEMA_VERSION,
 };
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::OpenObject;
 use plain::Plain;
 use serde::Deserialize;
 
-use crate::enroll::{EnrollmentTable, EnrollmentRecord, ProcessKey};
+use crate::enroll::{EnrollmentRecord, EnrollmentTable, ProcessKey};
+use crate::network::Endpoint;
+use crate::skel_connect::*;
 use crate::skel_credacc::*;
 use crate::skel_execve::*;
 
@@ -98,6 +108,25 @@ struct RawCredaccEvent {
 unsafe impl Plain for RawCredaccEvent {}
 
 impl RawCredaccEvent {
+    fn zeroed() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// Mirror of the BPF program's `struct connect_event` in `connect.bpf.c`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct RawConnectEvent {
+    timestamp_ns: u64,
+    pid: u32,
+    uid: u32,
+    addrlen: u32,
+    comm: [u8; TASK_COMM_LEN],
+    sockaddr: [u8; 28],
+}
+unsafe impl Plain for RawConnectEvent {}
+
+impl RawConnectEvent {
     fn zeroed() -> Self {
         unsafe { std::mem::zeroed() }
     }
@@ -164,6 +193,7 @@ where
     // each skeleton's lifetime — we keep them on the stack via MaybeUninit.
     let mut exec_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
     let mut cred_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
+    let mut conn_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
 
     let exec_skel = ExecveSkelBuilder::default()
         .open(&mut exec_obj)
@@ -177,6 +207,12 @@ where
     let mut cred_skel = cred_skel.load().context("load credacc BPF")?;
     cred_skel.attach().context("attach credacc BPF")?;
 
+    let conn_skel = ConnectSkelBuilder::default()
+        .open(&mut conn_obj)
+        .context("open connect skeleton")?;
+    let mut conn_skel = conn_skel.load().context("load connect BPF")?;
+    conn_skel.attach().context("attach connect BPF")?;
+
     let state = RefCell::new(SharedState::default());
     let emit_cell = RefCell::new(emit);
     let host_id = config.host_id.clone();
@@ -184,6 +220,7 @@ where
 
     let exec_maps = &exec_skel.maps;
     let cred_maps = &cred_skel.maps;
+    let conn_maps = &conn_skel.maps;
     let mut builder = libbpf_rs::RingBufferBuilder::new();
 
     let exec_handle = |bytes: &[u8]| -> i32 {
@@ -217,12 +254,30 @@ where
         0
     };
 
+    let conn_handle = |bytes: &[u8]| -> i32 {
+        let mut state = state.borrow_mut();
+        let mut emit = emit_cell.borrow_mut();
+        if let Err(e) = handle_connect_event(
+            bytes,
+            &mut state,
+            host_id.as_deref(),
+            &mut *emit,
+        ) {
+            had_error.set(Some(e));
+            return 1;
+        }
+        0
+    };
+
     builder
         .add(&exec_maps.events, exec_handle)
         .context("add execve ringbuf consumer")?;
     builder
         .add(&cred_maps.cred_events, cred_handle)
         .context("add credacc ringbuf consumer")?;
+    builder
+        .add(&conn_maps.connect_events, conn_handle)
+        .context("add connect ringbuf consumer")?;
     let ringbuf = builder.build().context("build ringbuf")?;
 
     while !stop.load(Ordering::Relaxed) {
@@ -543,6 +598,116 @@ fn resolve_enrollment(pid: i32, state: &mut SharedState) -> Option<EnrollmentRec
         current_ppid = psnap.ppid;
     }
     None
+}
+
+/// Handle one connect() ringbuf record. Drop fast for loopback/link-local
+/// destinations and for opens by processes outside the enrolled tree.
+fn handle_connect_event<F>(
+    bytes: &[u8],
+    state: &mut SharedState,
+    host_id: Option<&str>,
+    emit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Event),
+{
+    if bytes.len() < std::mem::size_of::<RawConnectEvent>() {
+        return Ok(());
+    }
+    let mut raw = RawConnectEvent::zeroed();
+    plain::copy_from_bytes(&mut raw, bytes)
+        .map_err(|_| anyhow!("ringbuf record size mismatch"))?;
+
+    let pid = raw.pid as i32;
+    let endpoint = network::parse_sockaddr(&raw.sockaddr);
+
+    // Cheap filter first: skip loopback/link-local/unspecified and non-IP.
+    // Most connect() calls in a busy system go to localhost (X server, dbus,
+    // systemd-resolved, etc.) — dropping these here saves the /proc work.
+    if network::is_uninteresting(&endpoint) {
+        return Ok(());
+    }
+
+    let record = match resolve_enrollment(pid, state) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    let (dest_ip_str, dest_port, protocol) = match &endpoint {
+        Endpoint::V4 { ip, port } => (ip.to_string(), *port, Protocol::Tcp),
+        Endpoint::V6 { ip, port } => (ip.to_string(), *port, Protocol::Tcp),
+        Endpoint::Other => return Ok(()),
+    };
+
+    let snap = proc::snapshot(pid);
+    let chain = proc::parent_chain(pid, 16);
+    let is_agent_root = record.agent_root.pid == pid;
+    let attributed_by_descent = !is_agent_root;
+
+    let bpf_comm = nul_str(&raw.comm).to_string();
+    let process_name = if !snap.comm.is_empty() {
+        snap.comm.clone()
+    } else {
+        bpf_comm.clone()
+    };
+    let user = if !snap.user.is_empty() {
+        snap.user.clone()
+    } else {
+        raw.uid.to_string()
+    };
+
+    let event = Event {
+        schema_version: SCHEMA_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: rfc3339_from_boot_ns(raw.timestamp_ns),
+        monotonic_ns: Some(raw.timestamp_ns),
+        platform: Platform::Linux,
+        host_id: host_id.map(str::to_string),
+        agent_id: "agent-descendant".to_string(),
+        session_id: None,
+        user_id: Some(user.clone()),
+        source: Source {
+            collector: "linux_ebpf".to_string(),
+            probe: "tracepoint/syscalls/sys_enter_connect".to_string(),
+            host_pid: Some(pid),
+        },
+        kind: EventKind::NetworkEgress(NetworkEgressPayload {
+            process: Process {
+                pid,
+                ppid: snap.ppid,
+                start_time: snap.start_time_ticks.to_string(),
+                name: process_name,
+                path: snap.exe_path.clone(),
+                cmdline: snap.cmdline.clone(),
+                cwd: snap.cwd.clone(),
+                user,
+                integrity_level: None,
+                parent_chain: chain,
+                agent_root_pid: Some(record.agent_root.pid),
+            },
+            attribution: Attribution {
+                attributed_tool_call_id: None,
+                attributed_by_descent,
+                requested_by_tool_call: false,
+                requested_in_user_message: false,
+                requested_in_assistant_message: false,
+                requested_in_tool_result: false,
+                time_window_ms: None,
+            },
+            dest_ip: dest_ip_str,
+            dest_port,
+            // TLS SNI capture would require a uprobe on SSL_write — out of
+            // scope for v0.x. Hostname can be left None; detections that need
+            // it can do reverse-DNS or correlate with DNS observer events
+            // when those probes land.
+            dest_host: None,
+            protocol,
+            tls_sni: None,
+        }),
+    };
+
+    emit(event);
+    Ok(())
 }
 
 fn absolutize(filename: &str, pid: i32) -> String {
