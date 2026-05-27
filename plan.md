@@ -85,6 +85,15 @@ index=fishbowl event=credential_access attributed_tool_call=null
 
 Plain English: *"In an AI session, something touched credentials that no agent tool call requested and the user never mentioned."* Catches postinstall scripts, malicious skills firing before tool-call attribution, anything riding the agent's process tree.
 
+## Engineering stack
+
+- **User-space daemon (both platforms): Rust.** `libbpf-rs` on Linux, `ferrisetw` on Windows. Single static binary per platform, no runtime dependencies — important for the "install like Sysmon" deployment pitch. Matches AgentSight's Rust+C structure for direct architectural comparison.
+- **BPF programs: C** compiled to BPF bytecode via clang. Standard for both `libbpf-rs` and `cilium/ebpf` ecosystems.
+- **Schema / event types / identifier index / attribution engine:** shared Rust crate consumed by both collectors. The Python transcript-reader prototype gets ported to Rust once the schema stabilizes.
+- **Packaging:** `cargo-deb` produces the `.deb`; `cargo-wix` produces the Windows `.msi`. GitHub Actions matrix builds both on `git tag`. See `deployment.md`.
+
+Why not Go: `cilium/ebpf` is more mature than `libbpf-rs`, but Go's ETW story is thin and the Go runtime is a deployment-shape liability for a daemon that pitches itself as drop-in. Why not C/C++: user-space side would be painful — manual JSON, no decent HTTP clients, manual cross-platform abstraction.
+
 ## Engineering effort estimate
 
 - Unified schema + attribution engine + Claude Code log reader: ~2 weeks

@@ -1,0 +1,16 @@
+[package]
+name = "fishbowl-transcript"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Claude Code transcript reader for fishbowl-v2"
+
+[dependencies]
+fishbowl-schema = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+regex = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
