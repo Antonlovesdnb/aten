@@ -22,6 +22,8 @@ mod skel {
     include!(concat!(env!("OUT_DIR"), "/execve.skel.rs"));
 }
 
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -105,34 +107,37 @@ where
     let mut skel = open_skel.load().context("load BPF program")?;
     skel.attach().context("attach BPF program")?;
 
-    let mut table = EnrollmentTable::new();
+    let table = RefCell::new(EnrollmentTable::new());
+    let emit_cell = RefCell::new(emit);
     let host_id = config.host_id.clone();
+    // Shared error sink. The ringbuf callback stores into `had_error`; the
+    // outer loop drains it after each poll. `Cell` because both sides hold
+    // shared references and `Option<anyhow::Error>::default()` is `None`.
+    let had_error: Cell<Option<anyhow::Error>> = Cell::new(None);
 
-    // Build the ringbuf consumer with a small adapter that owns &mut state.
-    // libbpf-rs's poll API runs the callback for each record; we pass it
-    // through a closure that has captured the state by mutable reference.
     // In libbpf-rs 0.24 the generated skeleton exposes maps as a struct
     // field, not a method.
     let maps = &skel.maps;
     let mut builder = libbpf_rs::RingBufferBuilder::new();
-    let mut had_error: Option<anyhow::Error> = None;
 
-    let mut handle = |bytes: &[u8]| -> i32 {
+    let handle = |bytes: &[u8]| -> i32 {
+        let mut table = table.borrow_mut();
+        let mut emit = emit_cell.borrow_mut();
         if let Err(e) = handle_event(
             bytes,
             &config,
             &mut table,
             host_id.as_deref(),
-            &mut emit,
+            &mut *emit,
         ) {
-            had_error = Some(e);
+            had_error.set(Some(e));
             return 1;
         }
         0
     };
 
     builder
-        .add(&maps.events, &mut handle)
+        .add(&maps.events, handle)
         .context("add ringbuf consumer")?;
     let ringbuf = builder.build().context("build ringbuf")?;
 
