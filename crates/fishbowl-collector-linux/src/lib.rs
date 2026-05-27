@@ -391,19 +391,7 @@ where
 
     let pid = raw.pid as i32;
     let filename = nul_str(&raw.filename);
-
-    // Temporary diagnostic: log a sample of incoming credacc events to
-    // confirm filename strings are being copied across kernel→user. Caps
-    // total prints via an atomic so we don't flood.
-    {
-        use std::sync::atomic::{AtomicUsize, Ordering as AO};
-        static CT: AtomicUsize = AtomicUsize::new(0);
-        let n = CT.fetch_add(1, AO::Relaxed);
-        if n < 20 {
-            eprintln!("credacc raw n={n} pid={pid} flags={} comm={} filename={filename:?}",
-                raw.flags, nul_str(&raw.comm));
-        }
-    }
+    let bpf_comm = nul_str(&raw.comm).to_string();
 
     // Order matters here. 99%+ of all opens on a Linux box are not credential
     // paths, and `credentials::classify` is a handful of substring checks on
@@ -431,10 +419,25 @@ where
     // are both unambiguous.
     let abs_path = absolutize(filename, pid);
 
+    // /proc/<pid>/ may be gone by the time we get here — short-lived
+    // descendants like `cat` exit before the credacc ringbuf is drained.
+    // Fall back to what the BPF event itself gave us (kernel comm, BPF
+    // timestamp, pid).
     let snap = proc::snapshot(pid);
     let chain = proc::parent_chain(pid, 16);
     let is_agent_root = record.agent_root.pid == pid;
     let attributed_by_descent = !is_agent_root;
+
+    let process_name = if !snap.comm.is_empty() {
+        snap.comm.clone()
+    } else {
+        bpf_comm.clone()
+    };
+    let user = if !snap.user.is_empty() {
+        snap.user.clone()
+    } else {
+        raw.uid.to_string()
+    };
 
     let access_type = access_type_from_flags(raw.flags);
 
@@ -447,7 +450,7 @@ where
         host_id: host_id.map(str::to_string),
         agent_id: "agent-descendant".to_string(),
         session_id: None,
-        user_id: Some(snap.user.clone()),
+        user_id: Some(user.clone()),
         source: Source {
             collector: "linux_ebpf".to_string(),
             probe: "tracepoint/syscalls/sys_enter_openat".to_string(),
@@ -458,11 +461,11 @@ where
                 pid,
                 ppid: snap.ppid,
                 start_time: snap.start_time_ticks.to_string(),
-                name: snap.comm.clone(),
+                name: process_name,
                 path: snap.exe_path.clone(),
                 cmdline: snap.cmdline.clone(),
                 cwd: snap.cwd.clone(),
-                user: snap.user.clone(),
+                user,
                 integrity_level: None,
                 parent_chain: chain,
                 agent_root_pid: Some(record.agent_root.pid),
