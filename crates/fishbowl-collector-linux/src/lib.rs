@@ -376,8 +376,9 @@ mod tests {
 
     #[test]
     fn unix_to_civil_known_date() {
-        // 2026-05-27T17:52:11Z → 1779990731
-        let (y, m, d, h, mi, s) = unix_to_civil(1_779_990_731);
+        // 2026-05-27T17:52:11Z → 1_779_904_331
+        // (20600 days since epoch * 86400 + 17*3600 + 52*60 + 11)
+        let (y, m, d, h, mi, s) = unix_to_civil(1_779_904_331);
         assert_eq!((y, m, d, h, mi, s), (2026, 5, 27, 17, 52, 11));
     }
 }
