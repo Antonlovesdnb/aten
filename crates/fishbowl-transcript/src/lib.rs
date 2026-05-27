@@ -344,10 +344,7 @@ mod tests {
             session_id: Some("s1".to_string()),
             uuid: Some("u1".to_string()),
             timestamp: Some("2026-05-27T19:08:02.110Z".to_string()),
-            message: Some(Message {
-                role: Some("user".to_string()),
-                content,
-            }),
+            message: Some(Message { content }),
         }
     }
 
@@ -357,10 +354,7 @@ mod tests {
             session_id: Some("s1".to_string()),
             uuid: Some("a1".to_string()),
             timestamp: Some("2026-05-27T19:08:02.940Z".to_string()),
-            message: Some(Message {
-                role: Some("assistant".to_string()),
-                content,
-            }),
+            message: Some(Message { content }),
         }
     }
 
