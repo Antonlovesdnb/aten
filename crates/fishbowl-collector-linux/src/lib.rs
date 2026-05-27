@@ -22,6 +22,7 @@ mod skel {
     include!(concat!(env!("OUT_DIR"), "/execve.skel.rs"));
 }
 
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,6 +31,8 @@ use anyhow::{anyhow, Context, Result};
 use fishbowl_schema::{
     Attribution, Event, EventKind, Platform, Process, ProcessExecPayload, Source, SCHEMA_VERSION,
 };
+use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
+use libbpf_rs::OpenObject;
 use plain::Plain;
 use serde::Deserialize;
 
@@ -41,9 +44,10 @@ const MAX_FILENAME_LEN: usize = 256;
 
 /// Mirror of the BPF program's `struct exec_event`. Must stay byte-compatible
 /// with `src/bpf/execve.bpf.c`. `plain::Plain` lets us read the ringbuf bytes
-/// without unsafe transmute.
+/// without unsafe transmute. We don't derive `Default` because Rust stdlib's
+/// Default impls for `[u8; N]` only go up to N=32 — we initialize via zeroed().
 #[repr(C)]
-#[derive(Default, Copy, Clone)]
+#[derive(Copy, Clone)]
 struct RawExecEvent {
     timestamp_ns: u64,
     pid: u32,
@@ -52,6 +56,14 @@ struct RawExecEvent {
     filename: [u8; MAX_FILENAME_LEN],
 }
 unsafe impl Plain for RawExecEvent {}
+
+impl RawExecEvent {
+    fn zeroed() -> Self {
+        // SAFETY: every field is a plain-old-data type with a valid all-zeros
+        // representation.
+        unsafe { std::mem::zeroed() }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollectorConfig {
@@ -83,8 +95,13 @@ pub fn run<F>(config: CollectorConfig, stop: Arc<AtomicBool>, mut emit: F) -> Re
 where
     F: FnMut(Event),
 {
-    let mut skel_builder = ExecveSkelBuilder::default();
-    let mut open_skel = skel_builder.open().context("open BPF skeleton")?;
+    let skel_builder = ExecveSkelBuilder::default();
+    // libbpf-rs 0.24 requires the caller to own an `OpenObject` slot for the
+    // skeleton's lifetime — we keep it on the stack via MaybeUninit.
+    let mut open_object: MaybeUninit<OpenObject> = MaybeUninit::uninit();
+    let open_skel = skel_builder
+        .open(&mut open_object)
+        .context("open BPF skeleton")?;
     let mut skel = open_skel.load().context("load BPF program")?;
     skel.attach().context("attach BPF program")?;
 
@@ -144,7 +161,7 @@ where
     if bytes.len() < std::mem::size_of::<RawExecEvent>() {
         return Ok(());
     }
-    let mut raw = RawExecEvent::default();
+    let mut raw = RawExecEvent::zeroed();
     plain::copy_from_bytes(&mut raw, bytes)
         .map_err(|_| anyhow!("ringbuf record size mismatch"))?;
 

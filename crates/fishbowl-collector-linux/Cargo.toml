@@ -16,6 +16,7 @@ path = "src/lib.rs"
 fishbowl-schema = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 libbpf-rs = "0.24"
