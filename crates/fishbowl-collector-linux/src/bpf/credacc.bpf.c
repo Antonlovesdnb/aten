@@ -32,15 +32,19 @@ struct {
     __uint(max_entries, 512 * 1024);
 } cred_events SEC(".maps");
 
-// Layout for tracepoint/syscalls/sys_enter_openat — stable across kernels.
-// /sys/kernel/debug/tracing/events/syscalls/sys_enter_openat/format
+// Layout for tracepoint/syscalls/sys_enter_openat.
+// On x86_64 the kernel pads every syscall arg to 8 bytes regardless of the
+// declared C type — `dfd` is `int` but takes size:8 in the format. Mirror
+// that exactly or the field offsets shift and `filename` ends up pointing
+// at random bytes from the next field. Cross-checked against
+// /sys/kernel/tracing/events/syscalls/sys_enter_openat/format on 6.17.
 struct sys_enter_openat_args {
-    __u64 __unused_pad;
-    __s32 __syscall_nr;
-    __s32 dfd;
-    const char *filename;
-    __s32 flags;
-    __u32 mode;
+    __u64 __unused_pad;   // 0..8   common header
+    __s64 __syscall_nr;   // 8..16
+    __s64 dfd;            // 16..24
+    const char *filename; // 24..32
+    __s64 flags;          // 32..40
+    __u64 mode;           // 40..48
 };
 
 SEC("tracepoint/syscalls/sys_enter_openat")
@@ -52,7 +56,7 @@ int handle_openat(struct sys_enter_openat_args *ctx) {
     e->timestamp_ns = bpf_ktime_get_boot_ns();
     e->pid = bpf_get_current_pid_tgid() >> 32;
     e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
-    e->flags = ctx->flags;
+    e->flags = (__s32)ctx->flags;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
     bpf_probe_read_user_str(e->filename, sizeof(e->filename), ctx->filename);
     bpf_ringbuf_submit(e, 0);
