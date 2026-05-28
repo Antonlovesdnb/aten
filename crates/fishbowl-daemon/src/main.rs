@@ -20,22 +20,24 @@ use clap::{Parser, Subcommand};
 use fishbowl_schema::Platform;
 
 mod config;
+#[cfg(target_os = "windows")]
+mod service;
 
 /// Merged inputs for a daemon run, after layering CLI flags over the
 /// config file. Returned from `resolve_daemon_inputs` so the two
 /// platform-specific `run_daemon` impls share parsing logic.
-struct DaemonInputs {
+pub(crate) struct DaemonInputs {
     /// Transcript files + directories the engine will read.
-    transcript_paths: Vec<PathBuf>,
+    pub transcript_paths: Vec<PathBuf>,
     /// Image basenames (Windows) or `comm` strings (Linux) to enroll.
-    agents: Vec<String>,
+    pub agents: Vec<String>,
     /// Where to write the event JSONL. `None` = stdout.
-    out_path: Option<PathBuf>,
+    pub out_path: Option<PathBuf>,
 }
 
 /// Merge config file + CLI flags into a single set of daemon inputs.
 /// Precedence: CLI flag > config file > built-in default.
-fn resolve_daemon_inputs(
+pub(crate) fn resolve_daemon_inputs(
     config_path: Option<PathBuf>,
     cli_transcripts: Vec<PathBuf>,
     cli_watch_dirs: Vec<PathBuf>,
@@ -111,6 +113,24 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Register the daemon as a Windows service (`fishbowlsvc`). Drops a
+    /// default config.toml in `%ProgramData%\fishbowl\` if none exists,
+    /// pointing at the current user's Claude/Codex transcript dirs.
+    /// Service runs as LocalSystem and auto-starts on boot. Needs admin.
+    #[cfg(target_os = "windows")]
+    Install,
+    /// Stop and unregister the `fishbowlsvc` service. Leaves config and
+    /// the events JSONL on disk so you can inspect them after the
+    /// service is gone. Needs admin.
+    #[cfg(target_os = "windows")]
+    Uninstall,
+    /// Service entry point. Invoked by SCM (not by humans typing).
+    /// `fishbowl install` registers this subcommand as the service's
+    /// launch argument; SCM then calls `fishbowl service` when it starts
+    /// the service. Hands control to the Windows service-control
+    /// dispatcher which blocks until the service stops.
+    #[cfg(target_os = "windows")]
+    Service,
     /// Run the Windows ETW collector. Requires admin. Hooks
     /// Microsoft-Windows-Kernel-Process (ProcessStart),
     /// Microsoft-Windows-Kernel-File (Create), and
@@ -199,6 +219,12 @@ fn main() -> Result<()> {
             out,
         } => run_daemon(config, transcript, watch_dir, agents, duration_secs, out)?,
         #[cfg(target_os = "windows")]
+        Command::Install => service::install_service()?,
+        #[cfg(target_os = "windows")]
+        Command::Uninstall => service::uninstall_service()?,
+        #[cfg(target_os = "windows")]
+        Command::Service => service::run_service_dispatcher()?,
+        #[cfg(target_os = "windows")]
         Command::CollectWindows {
             agents,
             duration_secs,
@@ -217,12 +243,8 @@ fn run_daemon(
     duration_secs: Option<u64>,
     out: Option<PathBuf>,
 ) -> Result<()> {
-    use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-
-    use fishbowl_attribution::{AttributionEngine, EngineConfig};
+    use std::sync::Arc;
 
     let inputs = resolve_daemon_inputs(
         config_path,
@@ -232,26 +254,6 @@ fn run_daemon(
         out,
         &["claude.exe", "cursor.exe", "codex.exe"],
     )?;
-
-    let cfg = fishbowl_collector_windows::CollectorConfig {
-        enrolled_agents: inputs.agents.clone(),
-        host_id: read_machine_guid_windows(),
-    };
-
-    // Shared between the ETW callback thread (emit closure → `attribute`) and
-    // the main thread (tick closure → `refresh`). Arc<Mutex<_>> rather than
-    // RefCell because the Windows collector's emit closure must be
-    // `Send + 'static` (ferrisetw runs callbacks on a thread it owns).
-    //
-    // `cwd_for_pid` is wired to the collector's PEB-walking `query_cwd` so
-    // attribution can bind an agent_root_pid (which on Windows isn't
-    // queryable via /proc) to a transcript session by cwd match.
-    let engine = Arc::new(Mutex::new(AttributionEngine::new(EngineConfig {
-        cwd_for_pid: windows_cwd_for_pid,
-        transcript_paths: inputs.transcript_paths.clone(),
-    })));
-    engine.lock().expect("engine lock").refresh()?;
-    let loaded = engine.lock().expect("engine lock").session_count();
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -265,6 +267,42 @@ fn run_daemon(
             stop.store(true, Ordering::Relaxed);
         });
     }
+
+    run_daemon_loop_windows(inputs, stop)
+}
+
+/// The Windows daemon loop, factored out so it can be driven from both the
+/// CLI (`fishbowl daemon ...`) and the Windows service entry point
+/// (where the stop signal comes from SCM events rather than Ctrl-C).
+///
+/// Sets up the attribution engine, opens the JSONL sink, and runs the
+/// ETW collector's run_with_tick which blocks until `stop` is set.
+#[cfg(target_os = "windows")]
+pub(crate) fn run_daemon_loop_windows(
+    inputs: DaemonInputs,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use fishbowl_attribution::{AttributionEngine, EngineConfig};
+
+    let cfg = fishbowl_collector_windows::CollectorConfig {
+        enrolled_agents: inputs.agents.clone(),
+        host_id: read_machine_guid_windows(),
+    };
+
+    // Shared between the ETW callback thread (emit closure → `attribute`) and
+    // the main thread (tick closure → `refresh`). Arc<Mutex<_>> rather than
+    // RefCell because the Windows collector's emit closure must be
+    // `Send + 'static` (ferrisetw runs callbacks on a thread it owns).
+    let engine = Arc::new(Mutex::new(AttributionEngine::new(EngineConfig {
+        cwd_for_pid: windows_cwd_for_pid,
+        transcript_paths: inputs.transcript_paths.clone(),
+    })));
+    engine.lock().expect("engine lock").refresh()?;
+    let loaded = engine.lock().expect("engine lock").session_count();
 
     let sink: Box<dyn Write + Send> = match inputs.out_path {
         Some(ref path) => {

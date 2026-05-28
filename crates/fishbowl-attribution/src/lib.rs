@@ -29,7 +29,7 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use fishbowl_schema::{Event, EventKind};
-use fishbowl_transcript::{detect_dialect_from_path, TranscriptDialect};
+use fishbowl_transcript::detect_dialect_from_path;
 
 pub mod session;
 

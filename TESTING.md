@@ -1,137 +1,182 @@
 # Testing fishbowl-v2
 
-Hands-on recipes for verifying the collectors and the daemon end-to-end. All
-commands assume a checkout at `~/Desktop/fishbowl-v2` and a release build at
-`target/release/`.
+How to install and exercise the daemon on a real Windows host. The
+intended use is as a Windows service, installed once, then left running
+while you use Claude Code / Codex normally — events accumulate to a
+JSONL file you can inspect at any time.
 
-## Windows: malicious-npm demo
+## Install as a service (recommended)
 
-The headline demo. A local npm `file:` dependency's `postinstall` reads
-`~/.aws/credentials` and beacons to a literal IP. Running `npm install`
-under an enrolled Claude Code session emits a `credential_access` and a
-`network_egress` from the *same* `node.exe` PID, both bound to the
-specific tool call that ran the install.
-
-### Prerequisites
-
-- **Elevated PowerShell** — ETW user traces require admin
-- Node.js + npm in `PATH`
-- A real Claude Code session running (so a transcript file exists)
-- `cargo build --release` against `target/release/fishbowl.exe`
-
-### Demo harness
-
-Two-package layout under `~/Desktop/fishbowl-demo/`:
-
-- `malicious-pkg/` — `package.json` with a `postinstall` script that runs
-  `postinstall.js` (reads `%USERPROFILE%\.aws\credentials`, makes an HTTPS
-  request to `1.1.1.1`)
-- `victim-project/` — `package.json` with `"dependencies": { "fishbowl-demo-credstealer": "file:../malicious-pkg" }`
-
-`npm install` in `victim-project` triggers the malicious package's
-postinstall, which fires the credacc + beacon from a `node.exe` whose
-parent chain reaches back to `claude.exe`.
-
-### Recipe
+From an **elevated PowerShell**:
 
 ```powershell
-# 1. Find the most-recent Claude Code transcript for this project.
-$session = Get-ChildItem "$env:USERPROFILE\.claude\projects\C--Users-aovru-Desktop-fishbowl-v2\*.jsonl" |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+cargo build --release
+.\target\release\fishbowl.exe install
+```
 
-# 2. Reset the victim project so npm install fires postinstall fresh.
-$victim = "$env:USERPROFILE\Desktop\fishbowl-demo\victim-project"
-Remove-Item -Recurse -Force $victim\node_modules -ErrorAction SilentlyContinue
-Remove-Item -Force $victim\package-lock.json -ErrorAction SilentlyContinue
+That command:
+1. Registers the service `fishbowlsvc` with the SCM, set to auto-start
+2. Drops a default config at `C:\ProgramData\fishbowl\config.toml` (only
+   if no config exists yet — re-running `install` preserves your edits)
+3. Starts the service
 
-# 3. Start the daemon (25s window, writes to Desktop).
-$out = "$env:USERPROFILE\Desktop\fishbowl-test.jsonl"
-Start-Process -NoNewWindow -FilePath "$env:USERPROFILE\Desktop\fishbowl-v2\target\release\fishbowl.exe" `
-    -ArgumentList "daemon", "--transcript", $session.FullName,
-                  "--agents", "claude.exe",
-                  "--duration-secs", "25",
-                  "--out", $out
+Verify it's running:
 
-# 4. Give the trace ~3s to initialize, then run the victim install.
-Start-Sleep -Seconds 3
-Set-Location $victim
-npm install --foreground-scripts
+```powershell
+Get-Service fishbowlsvc
+```
 
-# 5. After the 25s window closes, summarize the captured events.
-Start-Sleep -Seconds 25
-Get-Content $out | ForEach-Object { $_ | ConvertFrom-Json } |
+`Status: Running` means kernel events are being captured into
+`C:\ProgramData\fishbowl\events.jsonl` whenever an enrolled agent
+(by default `claude.exe`, `cursor.exe`, `codex.exe`) or one of its
+descendants does something interesting.
+
+## What gets detected
+
+The service consumes three ETW kernel providers and emits one schema
+event per matching syscall:
+
+| Probe | Fires when |
+|---|---|
+| `process_exec` | An enrolled agent spawns (descendants don't emit their own exec; they're tracked via `parent_chain`) |
+| `credential_access` | An enrolled agent or descendant opens a file whose path matches the credential classifier (`~/.aws/credentials`, `~/.ssh/id_rsa`, `~/.kube/config`, `*.pem`, browser cookie stores, etc.) |
+| `network_egress` | An enrolled agent or descendant makes an outbound TCP connection (loopback + link-local filtered out) |
+
+Anything else — your browser, Notepad, an unenrolled Python REPL — is
+invisible to fishbowl. That's the design: telemetry is bounded to the
+agent's process tree.
+
+## Use it ambiently
+
+Once installed, just use Claude Code / Codex as you normally would. The
+service is reading every agent session in `~/.claude/projects/` and
+`~/.codex/sessions/` (the default config watch_dirs) and attributing
+kernel events back to specific tool calls when timing and process tree
+line up.
+
+Inspect what's been captured:
+
+```powershell
+# Last 20 credential reads and network connects, in attribution order.
+Get-Content C:\ProgramData\fishbowl\events.jsonl |
+    ForEach-Object { $_ | ConvertFrom-Json } |
     Where-Object { $_.event_type -in 'credential_access','network_egress' } |
-    Select-Object event_type,
-        @{n='target';e={ if ($_.dest_ip) { "$($_.dest_ip):$($_.dest_port)" } else { $_.file_path } }},
+    Select-Object -Last 20 timestamp,
+        event_type,
         @{n='process';e={ $_.process.name }},
-        @{n='integrity';e={ $_.process.integrity_level }},
+        @{n='target';e={ if ($_.dest_ip) { "$($_.dest_ip):$($_.dest_port)" } else { $_.file_path } }},
+        @{n='session';e={ if ($_.session_id) { $_.session_id.Substring(0,8) } else { '<unbound>' } }},
         @{n='tool_call';e={ $_.attribution.attributed_tool_call_id }} |
     Format-Table -AutoSize
 ```
 
-### Expected output
+A few honest test scenarios that exercise different parts of the
+system. None require special harness:
 
-```
-event_type        target                              process  integrity tool_call
-----------        ------                              -------  --------- ---------
-credential_access C:\Users\aovru\.aws\credentials     node.exe high      toolu_01...
-network_egress    1.1.1.1:443                         node.exe high      toolu_01...
-```
+1. **Direct prompt** — ask Claude Code "read `~/.aws/credentials` and
+   summarize." Expect a `credential_access` event tied to the bash-tool
+   `tool_call_id` that ran `cat`.
+2. **Multi-event chain** — ask Claude to "ssh into the fishbowl VM and
+   run uptime." Expect a `credential_access` on `~/.ssh/id_rsa` plus a
+   `network_egress` to `192.168.1.215:22`, both bound to the same
+   tool_call.
+3. **Network only** — ask Claude to "fetch `https://example.com`."
+   Expect a `network_egress`.
+4. **Ambient noise** — leave the service running for an hour while you
+   use Claude/Codex. Every time the agent's bash tool spawns a process
+   that reads a creds-shaped file or opens a TCP connection, an event
+   lands in the JSONL.
 
-Both rows share the same `tool_call` value — that's the cross-platform
-"same query, both kernels" hook. The `file_path` is in Win32 drive-letter
-form (not `\Device\HarddiskVolumeN\...`) thanks to the path-normalization
-helper. `integrity_level: high` reflects that the postinstall ran under
-the elevated PowerShell.
+## Edit the config
 
-### Common gotchas
+`C:\ProgramData\fishbowl\config.toml` controls what's enrolled, where
+transcripts are read from, and where events get written:
 
-- **Empty JSONL.** The daemon must run from an *elevated* PowerShell. If
-  not, `start_and_process` returns `Access is denied.` and exits cleanly
-  with no events written.
-- **Trace startup race.** Anything started *before* `fishbowl-etw: trace starting`
-  prints is enrolled retroactively by the pre-trace rundown. Anything
-  started after is enrolled via the live `ProcessStart` event. There's no
-  in-between gap — except, very briefly, between `trace starting` and the
-  rundown thread actually getting CPU time. Sleeping ~3 seconds before
-  triggering the demo is a safe margin.
-- **Stale `node_modules`.** npm short-circuits postinstall when packages
-  are already present. Always remove `node_modules` + `package-lock.json`
-  between runs.
+```toml
+[daemon]
+agents = ["claude.exe", "cursor.exe", "codex.exe"]
 
-## Linux: same demo via SSH
+[transcripts]
+watch_dirs = [
+    "C:\\Users\\aovru\\.claude\\projects",
+    "C:\\Users\\aovru\\.codex\\sessions",
+]
 
-The Linux side is feature-complete on the VM at `192.168.1.215`. Same
-malicious-npm scenario, with the kernel events sourced from eBPF
-tracepoints instead of ETW. Build + test loop:
-
-```bash
-git push origin main
-ssh fishbowl-vm "cd ~/src/fishbowl-v2 && git pull --ff-only && ~/.cargo/bin/cargo test --workspace"
+[output]
+file_path = "C:\\ProgramData\\fishbowl\\events.jsonl"
 ```
 
-A live run on the VM (under root) would be the natural cross-platform
-side-by-side once the post is being written.
-
-## Transcript reader
-
-The `fishbowl transcript <path>` subcommand reads a session JSONL and
-emits the schema events + identifier-origin index. It auto-detects the
-dialect from the path:
-
-- `~/.claude/projects/...` → Claude Code reader
-- `~/.codex/sessions/.../rollout-*.jsonl` → Codex reader
+After editing, restart the service:
 
 ```powershell
-# Claude Code session
-target\release\fishbowl.exe transcript $env:USERPROFILE\.claude\projects\C--Users-aovru-Desktop-fishbowl-v2\<uuid>.jsonl
-
-# Codex session
-target\release\fishbowl.exe transcript $env:USERPROFILE\.codex\sessions\2026\03\07\rollout-<uuid>.jsonl
+sc.exe stop fishbowlsvc
+sc.exe start fishbowlsvc
 ```
 
-Both emit the same schema event types (`prompt`, `tool_call`, `tool_result`)
-and write `<stem>.events.jsonl` + `<stem>.idx.json` next to the input.
+## Stop / start the service
+
+```powershell
+sc.exe stop fishbowlsvc          # pause capture
+sc.exe start fishbowlsvc         # resume
+Get-Service fishbowlsvc          # current state
+```
+
+## Uninstall
+
+```powershell
+.\target\release\fishbowl.exe uninstall
+```
+
+Stops the service if running, then deletes it from the SCM. Your
+config + events JSONL are left in `C:\ProgramData\fishbowl\` for
+inspection.
+
+## Debugging
+
+If the service won't start, or events aren't flowing:
+
+```powershell
+# Service-mode status messages (start, stop, errors). Anything that
+# would have gone to stderr in CLI mode lands here.
+Get-Content C:\ProgramData\fishbowl\service.log -Tail 30
+
+# How many transcripts the engine has loaded.
+Get-Content C:\ProgramData\fishbowl\service.log | Select-String "sessions"
+
+# Event volume by type.
+Get-Content C:\ProgramData\fishbowl\events.jsonl |
+    ForEach-Object { ($_ | ConvertFrom-Json).event_type } |
+    Group-Object | Format-Table Count, Name
+```
+
+## Manual / debug mode (no service)
+
+For development iterations where you want to see live stderr from the
+collector, run the daemon directly in an elevated PowerShell instead of
+installing it. Same config + same kernel probes, just no SCM in front:
+
+```powershell
+# Single session, fixed window — useful for repeatable demos.
+$session = Get-ChildItem "$env:USERPROFILE\.claude\projects\*\*.jsonl" |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+.\target\release\fishbowl.exe daemon --transcript $session.FullName --duration-secs 30 --out test.jsonl
+
+# Multi-session, runs until Ctrl-C (same as service mode).
+.\target\release\fishbowl.exe daemon `
+    --watch-dir "$env:USERPROFILE\.claude\projects" `
+    --watch-dir "$env:USERPROFILE\.codex\sessions" `
+    --out test.jsonl
+
+# Config file + CLI overrides combined.
+.\target\release\fishbowl.exe daemon --config C:\ProgramData\fishbowl\config.toml --duration-secs 60
+```
+
+## Linux
+
+Same daemon binary builds for Linux but uses eBPF instead of ETW. Live
+testing is on the VM at `192.168.1.215`. The service-mode story on
+Linux is `cargo-deb` + systemd unit — backlog item, not implemented yet
+(see `deployment.md`).
 
 ## Unit tests
 
@@ -139,7 +184,5 @@ and write `<stem>.events.jsonl` + `<stem>.idx.json` next to the input.
 cargo test --workspace
 ```
 
-Expected: ~40 tests across `fishbowl-collector-linux`, `fishbowl-collector-windows`,
-`fishbowl-transcript`, `fishbowl-attribution`. Cross-platform crates
-(`fishbowl-schema`, `fishbowl-transcript`) run on both hosts; collectors
-are platform-gated and only build their tests on the matching OS.
+Expected: ~44 tests across the workspace. The Linux collector's tests
+require Linux (skipped on Windows builds) and vice versa.
