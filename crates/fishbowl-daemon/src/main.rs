@@ -59,8 +59,12 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Run the Windows ETW process-exec collector. Requires admin. Scaffolds the
-    /// Windows side of the daemon; credential and network probes follow.
+    /// Run the Windows ETW collector. Requires admin. Hooks
+    /// Microsoft-Windows-Kernel-Process (ProcessStart),
+    /// Microsoft-Windows-Kernel-File (Create), and
+    /// Microsoft-Windows-Kernel-Network (TcpIp/Connect V4 + V6); emits
+    /// schema `ProcessExec`, `CredentialAccess`, and `NetworkEgress`
+    /// events with cmdline + parent_chain + user enrichment.
     #[cfg(target_os = "windows")]
     CollectWindows {
         /// Image-name basenames to enroll as agent roots (e.g. claude.exe).
@@ -71,17 +75,19 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Run the full daemon: eBPF collector + transcript reader + attribution.
-    /// Linux only for v0.x. Requires root or CAP_BPF+CAP_PERFMON.
-    #[cfg(target_os = "linux")]
+    /// Run the full daemon: kernel collector + transcript reader + attribution.
+    /// On Linux uses eBPF (needs root or CAP_BPF+CAP_PERFMON); on Windows uses
+    /// ETW (needs admin). Same subcommand on both platforms; the build picks
+    /// the right collector via `cfg(target_os = ...)`.
     Daemon {
         /// Path to a Claude Code session transcript JSONL. The daemon binds
         /// kernel-side events to this session by matching the agent root
         /// process's cwd against the transcript's recorded cwd.
         #[arg(long)]
         transcript: PathBuf,
-        /// Process `comm` names to enroll as agent roots. Comma-separated.
-        /// Default: claude,cursor,codex.
+        /// Process names to enroll as agent roots. Comma-separated. On Linux
+        /// matches `comm` (e.g. `claude,cursor,codex`); on Windows matches
+        /// image basename (e.g. `claude.exe,cursor.exe,codex.exe`).
         #[arg(long, value_delimiter = ',')]
         agents: Option<Vec<String>>,
         /// Stop after this many seconds.
@@ -114,7 +120,6 @@ fn main() -> Result<()> {
             duration_secs,
             out,
         } => run_collect_linux(agents, duration_secs, out)?,
-        #[cfg(target_os = "linux")]
         Command::Daemon {
             transcript,
             agents,
@@ -128,6 +133,94 @@ fn main() -> Result<()> {
             out,
         } => run_collect_windows(agents, duration_secs, out)?,
     }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn run_daemon(
+    transcript: PathBuf,
+    agents: Option<Vec<String>>,
+    duration_secs: Option<u64>,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use fishbowl_attribution::{AttributionEngine, EngineConfig};
+
+    let cfg = fishbowl_collector_windows::CollectorConfig {
+        enrolled_agents: agents.unwrap_or_else(|| {
+            vec!["claude.exe".into(), "cursor.exe".into(), "codex.exe".into()]
+        }),
+        host_id: read_machine_guid_windows(),
+    };
+
+    // Shared between the ETW callback thread (emit closure → `attribute`) and
+    // the main thread (tick closure → `refresh`). Arc<Mutex<_>> rather than
+    // RefCell because the Windows collector's emit closure must be
+    // `Send + 'static` (ferrisetw runs callbacks on a thread it owns).
+    let engine = Arc::new(Mutex::new(AttributionEngine::new(EngineConfig {
+        transcript_path: transcript.clone(),
+    })));
+    engine.lock().expect("engine lock").refresh()?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc_set_handler(move || stop.store(true, Ordering::Relaxed));
+    }
+    if let Some(secs) = duration_secs {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+
+    let sink: Box<dyn Write + Send> = match out {
+        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    let sink = Arc::new(Mutex::new(sink));
+
+    eprintln!(
+        "fishbowl daemon starting (agents = {:?}, transcript = {})",
+        cfg.enrolled_agents,
+        transcript.display()
+    );
+
+    let refresh_every = Duration::from_millis(500);
+    let last_refresh = std::cell::Cell::new(Instant::now());
+
+    let engine_emit = engine.clone();
+    let sink_emit = sink.clone();
+    fishbowl_collector_windows::run_with_tick(
+        cfg,
+        stop,
+        move |mut event| {
+            engine_emit
+                .lock()
+                .expect("engine lock")
+                .attribute(&mut event);
+            let mut s = sink_emit.lock().expect("sink lock");
+            if let Ok(line) = serde_json::to_string(&event) {
+                let _ = writeln!(s, "{line}");
+                let _ = s.flush();
+            }
+        },
+        || {
+            if last_refresh.get().elapsed() >= refresh_every {
+                if let Err(e) = engine.lock().expect("engine lock").refresh() {
+                    eprintln!("transcript refresh failed: {e}");
+                }
+                last_refresh.set(Instant::now());
+            }
+        },
+    )?;
+
+    eprintln!("fishbowl daemon stopped");
     Ok(())
 }
 

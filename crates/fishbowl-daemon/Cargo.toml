@@ -25,4 +25,5 @@ libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 fishbowl-collector-windows = { workspace = true }
+fishbowl-attribution = { workspace = true }
 windows = { version = "0.62", features = ["Win32_System_Console", "Win32_Foundation"] }

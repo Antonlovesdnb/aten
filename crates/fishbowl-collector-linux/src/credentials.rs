@@ -1,13 +1,25 @@
 //! Credential classifier — maps a file path to the schema's `CredentialClass`
 //! enum. Runs at the collector so detections never need to regex over
-//! `file_path`. This is the Linux side of the cross-platform taxonomy from
-//! `schema.md` §6.
+//! `file_path`. This is the cross-platform taxonomy from `schema.md` §6;
+//! both the Linux eBPF probe and the Windows ETW probe call into this
+//! module.
 //!
 //! Classification is by *path fragment*, not by absolute path. `~/.aws/
 //! credentials` and `/root/.aws/credentials` and any other user's
 //! `~/.aws/credentials` all produce `AwsCredentials`. That makes the
 //! classifier user-agnostic and lets the daemon work without resolving a
-//! per-process HOME from /proc.
+//! per-process HOME from /proc (Linux) or token user profile (Windows).
+//!
+//! Windows paths (`C:\Users\anton\.aws\credentials`,
+//! `\Device\HarddiskVolume3\Users\anton\.aws\credentials`) are normalized
+//! to forward-slash form before matching, so the same patterns work on both
+//! platforms with one source of truth.
+//!
+//! Known v0.x false-positive: a directory literally named `.env`
+//! (`C:\foo\.env.bak\unrelated.txt` or `/home/x/.env.bak/unrelated.txt`)
+//! will classify as `GenericDotenv` because of the `.env.` substring match.
+//! Accepted for v0.x; the false-positive rate is bounded by enrollment
+//! filtering (only enrolled agent descendants are checked).
 
 use fishbowl_schema::CredentialClass;
 
@@ -15,7 +27,9 @@ use fishbowl_schema::CredentialClass;
 /// don't look like credentials — the caller should drop those events at the
 /// collector rather than emitting `credential_class=none` to the SIEM.
 pub fn classify(path: &str) -> CredentialClass {
-    let p = path.to_lowercase();
+    // Normalize Windows separators to POSIX so a single set of suffix patterns
+    // works for both platforms. No-op for inputs that don't contain `\`.
+    let p = path.to_lowercase().replace('\\', "/");
 
     if p.ends_with("/.aws/credentials") || p.ends_with("/.aws/config") {
         return CredentialClass::AwsCredentials;
@@ -120,6 +134,35 @@ mod tests {
         assert_eq!(
             classify("/home/anton/.kube/config"),
             CredentialClass::KubeConfig
+        );
+    }
+
+    // Windows path forms — both `C:\...` user-land and the
+    // `\Device\HarddiskVolumeN\...` NT-namespace form that ETW Kernel-File
+    // events deliver. Same patterns must match after backslash → forward-slash
+    // normalization.
+    #[test]
+    fn windows_paths_match() {
+        assert_eq!(
+            classify(r"C:\Users\anton\.aws\credentials"),
+            CredentialClass::AwsCredentials
+        );
+        assert_eq!(
+            classify(r"\Device\HarddiskVolume3\Users\anton\.ssh\id_rsa"),
+            CredentialClass::SshPrivateKey
+        );
+        assert_eq!(
+            classify(r"C:\Users\anton\.kube\config"),
+            CredentialClass::KubeConfig
+        );
+        assert_eq!(
+            classify(r"C:\Users\anton\.azure\accessTokens.json"),
+            CredentialClass::AzureCredentials
+        );
+        // `.pub` discriminator still holds after normalization.
+        assert_eq!(
+            classify(r"C:\Users\anton\.ssh\id_rsa.pub"),
+            CredentialClass::None
         );
     }
 }

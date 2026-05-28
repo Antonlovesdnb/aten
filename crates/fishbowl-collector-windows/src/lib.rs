@@ -18,6 +18,8 @@
 //! workspace builds on Linux too.
 
 #[cfg(target_os = "windows")]
+mod enrich;
+#[cfg(target_os = "windows")]
 mod windows_impl;
 
 #[cfg(target_os = "windows")]
