@@ -161,8 +161,13 @@ fn run_daemon(
     // the main thread (tick closure → `refresh`). Arc<Mutex<_>> rather than
     // RefCell because the Windows collector's emit closure must be
     // `Send + 'static` (ferrisetw runs callbacks on a thread it owns).
+    //
+    // `cwd_for_pid` is wired to the collector's PEB-walking `query_cwd` so
+    // attribution can bind an agent_root_pid (which on Windows isn't
+    // queryable via /proc) to a transcript session by cwd match.
     let engine = Arc::new(Mutex::new(AttributionEngine::new(EngineConfig {
         transcript_path: transcript.clone(),
+        cwd_for_pid: windows_cwd_for_pid,
     })));
     engine.lock().expect("engine lock").refresh()?;
 
@@ -276,6 +281,17 @@ fn run_collect_windows(
 
     eprintln!("fishbowl windows collector stopped");
     Ok(())
+}
+
+/// Bridge between the attribution engine's cross-platform `fn(i32) -> Option<String>`
+/// signature and the collector's Win32 PEB-walking `query_cwd(pid: u32)`.
+/// Negative or zero PIDs are non-meaningful on Windows; return early.
+#[cfg(target_os = "windows")]
+fn windows_cwd_for_pid(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    fishbowl_collector_windows::query_cwd(pid as u32)
 }
 
 #[cfg(target_os = "windows")]
@@ -427,6 +443,7 @@ fn run_daemon(
     // Build the attribution engine and seed it from the transcript.
     let engine = AttributionEngine::new(EngineConfig {
         transcript_path: transcript.clone(),
+        cwd_for_pid: fishbowl_attribution::default_cwd_for_pid,
     });
     let engine = RefCell::new(engine);
     engine.borrow_mut().refresh()?;

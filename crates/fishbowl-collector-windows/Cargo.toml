@@ -36,4 +36,8 @@ windows = { version = "0.62", features = [
     # the pre-trace enrollment rundown to find already-running agent
     # processes that started before the ETW trace was enabled.
     "Win32_System_Diagnostics_ToolHelp",
+    # ReadProcessMemory — used by `enrich::query_cwd` to walk the PEB of an
+    # arbitrary process. Required because Windows has no documented
+    # equivalent of `/proc/<pid>/cwd`; the PEB walk is the standard way.
+    "Win32_System_Diagnostics_Debug",
 ] }

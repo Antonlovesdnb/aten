@@ -24,3 +24,12 @@ mod windows_impl;
 
 #[cfg(target_os = "windows")]
 pub use windows_impl::{run, run_with_tick, CollectorConfig};
+
+/// Query the working directory of an arbitrary running process by walking
+/// its PEB. Re-exported so the daemon can inject a Windows cwd resolver
+/// into the attribution engine without that crate taking a direct Win32
+/// dependency.
+#[cfg(target_os = "windows")]
+pub fn query_cwd(pid: u32) -> Option<String> {
+    enrich::query_cwd(pid)
+}

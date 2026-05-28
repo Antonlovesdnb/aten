@@ -28,9 +28,41 @@ pub mod session;
 
 use session::SessionState;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineConfig {
     pub transcript_path: PathBuf,
+    /// Function used to resolve the cwd of an agent-root process, called
+    /// at attribution time. The default implementation reads
+    /// `/proc/<pid>/cwd` — correct on Linux, returns `None` on Windows
+    /// because that path doesn't exist. Windows daemons inject a
+    /// PEB-walk-based resolver from `fishbowl_collector_windows::query_cwd`
+    /// so the engine stays platform-agnostic.
+    pub cwd_for_pid: fn(i32) -> Option<String>,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            transcript_path: PathBuf::new(),
+            cwd_for_pid: default_cwd_for_pid,
+        }
+    }
+}
+
+/// Default cwd resolver. Linux: reads `/proc/<pid>/cwd`. Everywhere else:
+/// returns `None` (and the daemon is expected to inject a real resolver).
+pub fn default_cwd_for_pid(pid: i32) -> Option<String> {
+    let _ = pid;
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 pub struct AttributionEngine {
@@ -212,15 +244,15 @@ impl AttributionEngine {
         if session_cwd.is_empty() {
             return None;
         }
-        let proc_cwd = std::fs::read_link(format!("/proc/{agent_root_pid}/cwd"))
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())?;
+        let proc_cwd = (self.cfg.cwd_for_pid)(agent_root_pid)?;
         // Match either exact or one is a path prefix of the other to absorb
-        // symlink resolution variance. Simple string compare for v0.x.
-        if proc_cwd == session_cwd
-            || proc_cwd.starts_with(session_cwd)
-            || session_cwd.starts_with(&proc_cwd)
-        {
+        // symlink resolution variance on Linux, and to absorb minor case /
+        // separator differences on Windows where DosPath may come back with
+        // a different case than the transcript-recorded cwd. Simple string
+        // compare in lowercase for cross-platform robustness.
+        let a = proc_cwd.to_lowercase().replace('\\', "/");
+        let b = session_cwd.to_lowercase().replace('\\', "/");
+        if a == b || a.starts_with(&b) || b.starts_with(&a) {
             self.pid_bindings
                 .insert(agent_root_pid, session_id.to_string());
             Some(session_id.to_string())

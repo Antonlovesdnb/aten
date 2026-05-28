@@ -36,9 +36,10 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{
     GetTokenInformation, LookupAccountSidW, TokenUser, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER,
 };
+use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
 };
 
 /// `ProcessBasicInformation` — documented, stable. Returns the
@@ -252,6 +253,133 @@ pub fn ancestor_pids(start_pid: u32, max_depth: usize) -> Vec<u32> {
         pid = parent;
     }
     out
+}
+
+/// Fetch the current working directory for `pid` by walking the target
+/// process's PEB → `RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.DosPath`
+/// via `ReadProcessMemory`. Returns `None` if the process is gone, has
+/// already exited, the target is a protected/system process we can't read,
+/// or any of the layered reads fails.
+///
+/// Used by the attribution engine on Windows to bind an `agent_root_pid`
+/// to a transcript session by matching the agent root's cwd against the
+/// recorded session cwd — the same logic the Linux side gets from
+/// `/proc/<pid>/cwd`. There is no documented Win32 API for "cwd of an
+/// arbitrary process"; the PEB walk is the standard approach (used by
+/// Process Hacker, sysinternals, etc.).
+///
+/// 64-bit-only — `PEB.ProcessParameters` is at offset 0x20 and
+/// `RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.DosPath` is at offset
+/// 0x38 in the x86_64 layout. 32-bit (WoW64) processes have a different
+/// PEB and aren't currently supported; the daemon's own architecture
+/// matches what we deploy on (x86_64).
+pub fn query_cwd(pid: u32) -> Option<String> {
+    if pid == PID_IDLE || pid == PID_SYSTEM {
+        return None;
+    }
+
+    // PROCESS_VM_READ is required for ReadProcessMemory; the limited-info
+    // bit covers the NtQueryInformationProcess call.
+    let h: OwnedHandle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            false,
+            pid,
+        )
+        .ok()
+        .map(OwnedHandle)?
+    };
+
+    // Step 1: get PEB base address from PROCESS_BASIC_INFORMATION.
+    let mut pbi: ProcessBasicInformation = unsafe { mem::zeroed() };
+    let mut ret_len: u32 = 0;
+    let status = unsafe {
+        NtQueryInformationProcess(
+            h.0,
+            PROCESS_BASIC_INFORMATION_CLASS,
+            &mut pbi as *mut _ as *mut c_void,
+            mem::size_of::<ProcessBasicInformation>() as u32,
+            &mut ret_len,
+        )
+    };
+    if status.0 != 0 || pbi.peb_base_address.is_null() {
+        return None;
+    }
+
+    // Step 2: read ProcessParameters pointer from PEB. Offset 0x20 on x86_64.
+    const PEB_PROCESS_PARAMETERS_OFFSET: usize = 0x20;
+    let mut process_parameters: *mut c_void = std::ptr::null_mut();
+    let mut bytes_read: usize = 0;
+    let pp_addr = unsafe { pbi.peb_base_address.byte_add(PEB_PROCESS_PARAMETERS_OFFSET) };
+    if unsafe {
+        ReadProcessMemory(
+            h.0,
+            pp_addr,
+            &mut process_parameters as *mut _ as *mut c_void,
+            mem::size_of::<*mut c_void>(),
+            Some(&mut bytes_read),
+        )
+    }
+    .is_err()
+        || process_parameters.is_null()
+    {
+        return None;
+    }
+
+    // Step 3: read CurrentDirectory.DosPath UNICODE_STRING from
+    // RTL_USER_PROCESS_PARAMETERS. Offset 0x38 on x86_64.
+    const RTL_USER_PROCESS_PARAMETERS_CURRENT_DIRECTORY_OFFSET: usize = 0x38;
+    let mut us: UnicodeString = unsafe { mem::zeroed() };
+    let us_addr = unsafe {
+        process_parameters.byte_add(RTL_USER_PROCESS_PARAMETERS_CURRENT_DIRECTORY_OFFSET)
+    };
+    if unsafe {
+        ReadProcessMemory(
+            h.0,
+            us_addr,
+            &mut us as *mut _ as *mut c_void,
+            mem::size_of::<UnicodeString>(),
+            Some(&mut bytes_read),
+        )
+    }
+    .is_err()
+        || us.length == 0
+        || us.buffer.is_null()
+    {
+        return None;
+    }
+
+    // Step 4: read the cwd string from the UNICODE_STRING.Buffer in the
+    // target process. Length is in bytes, not chars; sanity-cap to bound a
+    // hostile/corrupt process advertising an absurd size.
+    let length_bytes = us.length as usize;
+    if length_bytes > 32 * 1024 {
+        return None;
+    }
+    let nchars = length_bytes / 2;
+    let mut buf: Vec<u16> = vec![0u16; nchars];
+    if unsafe {
+        ReadProcessMemory(
+            h.0,
+            us.buffer as *const c_void,
+            buf.as_mut_ptr() as *mut c_void,
+            length_bytes,
+            Some(&mut bytes_read),
+        )
+    }
+    .is_err()
+    {
+        return None;
+    }
+
+    // CurrentDirectory.DosPath conventionally has a trailing `\` on Windows
+    // (e.g. `C:\Users\anton\`). Trim it for clean comparison against the
+    // transcript's recorded cwd, which doesn't.
+    let mut s = String::from_utf16_lossy(&buf);
+    if s.ends_with('\\') {
+        s.pop();
+    }
+    Some(s)
 }
 
 /// Enumerate currently-running processes, returning `(pid, image_basename)`
