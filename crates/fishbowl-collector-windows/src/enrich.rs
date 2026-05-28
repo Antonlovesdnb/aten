@@ -254,6 +254,50 @@ pub fn ancestor_pids(start_pid: u32, max_depth: usize) -> Vec<u32> {
     out
 }
 
+/// Enumerate currently-running processes, returning `(pid, image_basename)`
+/// pairs. Used by the pre-trace enrollment rundown: ETW only delivers
+/// `ProcessStart` for processes that begin AFTER the trace is enabled, so
+/// long-running agents (e.g. a `claude.exe` started before the daemon
+/// service) are invisible to the enrollment table without an explicit
+/// snapshot at startup.
+///
+/// Uses the Toolhelp32 snapshot API — one syscall to enumerate, no
+/// per-process `OpenProcess`. Image name comes from `PROCESSENTRY32W::szExeFile`
+/// (already the basename, no path).
+pub fn list_processes() -> Vec<(u32, String)> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let mut out: Vec<(u32, String)> = Vec::new();
+    let snap = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
+        Ok(h) if !h.is_invalid() => h,
+        _ => return out,
+    };
+    let _owner = OwnedHandle(snap);
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+
+    if unsafe { Process32FirstW(snap, &mut entry) }.is_ok() {
+        loop {
+            let wide = &entry.szExeFile;
+            let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+            let name = String::from_utf16_lossy(&wide[..len]);
+            if !name.is_empty() {
+                out.push((entry.th32ProcessID, name));
+            }
+            if unsafe { Process32NextW(snap, &mut entry) }.is_err() {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Walk PPIDs upward starting from `start_ppid`. Returns ancestor basenames
 /// in root → leaf order, capped at `max_depth` hops. The result excludes the
 /// caller's own process to match the Linux collector's contract (see

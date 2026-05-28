@@ -46,10 +46,6 @@
 //!   form (`credentials::classify` normalizes separators), but
 //!   screenshot-quality post output wants drive letters. Needs
 //!   `QueryDosDeviceW` + `GetLogicalDriveStringsW` and an inverse cache.
-//! - Pre-trace process enrollment. The ancestor-walk handles cross-provider
-//!   races but not an `claude.exe` that was running before the collector
-//!   started. Real always-on deployment needs an `EnumProcesses` rundown
-//!   at startup.
 //! - `Create`-disposition filtering. Kernel-File Create fires for
 //!   pure-metadata opens too (Defender, Search Indexer, Explorer). Reading
 //!   `CreateOptions` would let us drop `FILE_OPEN_FOR_BACKUP_INTENT` and
@@ -208,9 +204,61 @@ where
     let host_id_net = config.host_id.clone();
     let agents = config.enrolled_agents.clone();
 
+    // Pre-trace enrollment rundown. ETW only delivers `ProcessStart` for
+    // processes that begin AFTER the trace is enabled, so any already-running
+    // instance of an enrolled agent (e.g. a long-running `claude.exe` started
+    // before this daemon, or the service starting on boot after the agent CLI
+    // is already alive in a user session) would be invisible. Without the
+    // rundown, `resolve_enrollment_for_pid`'s ancestor-walk fallback finds no
+    // enrolled PIDs in `pid_to_key` and silently drops every credacc/network
+    // event from descendants — the symptom is a completely empty JSONL.
+    //
+    // Each rundown-seeded process becomes its own agent root (we have no way
+    // to reconstruct the parent chain from a snapshot — and even if we did, a
+    // pre-existing `claude.exe` is by definition the root of its subtree from
+    // the trace's point of view). The fallback walk picks up descendants
+    // organically as their events fire.
+    let rundown_count = {
+        let mut st = state.lock().expect("state lock");
+        let mut n: usize = 0;
+        for (pid, image_name) in enrich::list_processes() {
+            let basename = image_basename(&image_name);
+            let is_match = agents.iter().any(|a| a.eq_ignore_ascii_case(&basename));
+            if !is_match {
+                continue;
+            }
+            let key = ProcessKey {
+                pid: pid as i32,
+                // start_time_ticks is the PID-reuse disambiguator. For
+                // rundown we don't have the original ProcessStart timestamp;
+                // 0 is fine because lookup is by raw PID and any subsequent
+                // ProcessStart for the same PID overwrites.
+                start_time_ticks: 0,
+            };
+            st.table.enroll(key, None);
+            st.pid_to_key.insert(pid, key);
+            n += 1;
+        }
+        n
+    };
+
+    // `.any(ALL_KEYWORDS)` is critical: ferrisetw's `Provider::by_guid` defaults
+    // `MatchAnyKeyword = 0`, which under ETW semantics means "only events with
+    // keyword = 0 in the manifest fire" — i.e., excludes every event that has
+    // any keyword set. Microsoft-Windows-Kernel-File Event 12 (IRP_MJ_CREATE,
+    // the only event with a usable FileName field on every fire) is gated by
+    // `KERNEL_FILE_KEYWORD_CREATE = 0x80`, so without this the file callback
+    // received the Close/Cleanup/Write firehose (all keyword = 0) but never
+    // saw a Create. Symptom: process_exec and network_egress flowed but
+    // credential_access never fired no matter what was read. `0xFFFFFFFF_FFFFFFFF`
+    // = "enable every keyword the manifest defines" on all three providers;
+    // event_id filtering inside the callbacks does the actual narrowing.
+    const ALL_KEYWORDS: u64 = 0xFFFFFFFF_FFFFFFFF;
+
     let state_proc = state.clone();
     let emit_proc = emit_sink.clone();
     let process_provider = Provider::by_guid(KERNEL_PROCESS_GUID)
+        .any(ALL_KEYWORDS)
         .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
             if let Err(e) = handle_etw_event(
                 record,
@@ -228,6 +276,7 @@ where
     let state_file = state.clone();
     let emit_file = emit_sink.clone();
     let file_provider = Provider::by_guid(KERNEL_FILE_GUID)
+        .any(ALL_KEYWORDS)
         .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
             if let Err(e) = handle_file_event(
                 record,
@@ -244,6 +293,7 @@ where
     let state_net = state.clone();
     let emit_net = emit_sink.clone();
     let network_provider = Provider::by_guid(KERNEL_NETWORK_GUID)
+        .any(ALL_KEYWORDS)
         .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
             if let Err(e) = handle_network_event(
                 record,
@@ -257,15 +307,9 @@ where
         })
         .build();
 
-    // Surfaced as a usability hint: anything started before this point won't
-    // be in the enrollment table (its ProcessStart event already fired into
-    // the void). The ancestor-walk handles cross-provider races but not
-    // pre-existing processes. If Anton sees "no events" when he expected
-    // some, this is usually why.
     eprintln!(
-        "fishbowl-etw: trace starting. Processes already running won't be enrolled; \
-         start the agent (e.g. claude.exe) AFTER this line for credential- and \
-         network-access events to fire."
+        "fishbowl-etw: trace starting. enrollment rundown seeded {rundown_count} \
+         pre-existing agent process(es); new starts will enroll via ProcessStart."
     );
 
     let trace = UserTrace::new()
@@ -481,7 +525,12 @@ fn handle_file_event(
         return Ok(());
     }
 
-    let pid: u32 = parser.try_parse("ProcessID").unwrap_or(0);
+    // Kernel-File Event 12 (Create) has no `ProcessID` field in its manifest
+    // payload — the process info lives in the ETW event header. Using
+    // `parser.try_parse("ProcessID")` silently returned 0, which then failed
+    // the pid != 0 guard and dropped every credential-class file event.
+    // `record.process_id()` reads `EVENT_HEADER.ProcessId` directly.
+    let pid: u32 = record.process_id();
     if pid == 0 {
         return Ok(());
     }
