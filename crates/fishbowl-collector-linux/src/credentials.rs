@@ -42,10 +42,30 @@ pub fn classify(path: &str) -> CredentialClass {
     }
     if let Some(idx) = p.find("/.ssh/") {
         let after = &p[idx + "/.ssh/".len()..];
-        // Private key files start with "id_" and aren't the corresponding
-        // .pub file. authorized_keys / known_hosts are non-secret.
         if let Some(name) = after.split('/').next() {
-            if name.starts_with("id_") && !name.ends_with(".pub") {
+            // Any file directly under `.ssh/` that isn't on the well-known
+            // non-secret list and isn't a `.pub` (public-key) file is
+            // treated as an SSH private key. Real users name their keys
+            // anything (`work_key`, `github_personal`, `fishbowl_vm_ed25519`),
+            // not just `id_*`. Cert/pub files end in `.pub`.
+            //
+            // Blocklist captures the standard SSH client/server bookkeeping
+            // files that aren't secret. Anything outside this list and not
+            // a `.pub` is conservatively treated as a private key.
+            const NON_SECRET_SSH: &[&str] = &[
+                "authorized_keys",
+                "authorized_keys2",
+                "known_hosts",
+                "known_hosts.old",
+                "config",
+                "environment",
+                "rc",
+            ];
+            if !name.ends_with(".pub")
+                && !name.ends_with("-cert.pub")
+                && !name.is_empty()
+                && !NON_SECRET_SSH.contains(&name)
+            {
                 return CredentialClass::SshPrivateKey;
             }
         }
@@ -88,18 +108,39 @@ mod tests {
 
     #[test]
     fn ssh_private_only_not_pub() {
+        // Real users name keys anything — not just `id_*`. Classifier
+        // must catch arbitrary key names.
         assert_eq!(
             classify("/home/anton/.ssh/id_ed25519"),
             CredentialClass::SshPrivateKey
         );
         assert_eq!(
+            classify("/home/anton/.ssh/fishbowl_vm_ed25519"),
+            CredentialClass::SshPrivateKey
+        );
+        assert_eq!(
+            classify(r"C:\Users\anton\.ssh\github_personal"),
+            CredentialClass::SshPrivateKey
+        );
+        // `.pub` and `-cert.pub` are public material, not secret.
+        assert_eq!(
             classify("/home/anton/.ssh/id_rsa.pub"),
             CredentialClass::None
         );
         assert_eq!(
+            classify("/home/anton/.ssh/id_rsa-cert.pub"),
+            CredentialClass::None
+        );
+        // Bookkeeping files are not secret.
+        assert_eq!(
             classify("/home/anton/.ssh/authorized_keys"),
             CredentialClass::None
         );
+        assert_eq!(
+            classify("/home/anton/.ssh/known_hosts"),
+            CredentialClass::None
+        );
+        assert_eq!(classify("/home/anton/.ssh/config"), CredentialClass::None);
     }
 
     #[test]
