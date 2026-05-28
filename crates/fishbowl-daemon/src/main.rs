@@ -334,61 +334,119 @@ pub(crate) fn run_daemon_loop_windows(
         loaded,
     );
 
-    // 100ms refresh tick. Closes most of the polling race where a kernel
-    // event fires inside the same window as a brand-new tool_call: the
-    // transcript file's record gets flushed by the agent within tens of
-    // ms, so the engine sees the new tool_call before the kernel event
-    // arrives. Cost is 10 syscalls/sec/transcript — negligible on
-    // dev-endpoint workloads. Switch to notify-based file watching if
-    // this ever shows up in profiling.
+    // 100ms refresh tick — transcript poll cadence.
     let refresh_every = Duration::from_millis(100);
+    // 500ms attribution buffer. Kernel events fire concurrently with the
+    // agent CLI's write of the corresponding tool_call record to the
+    // transcript file; the transcript write may not even be on disk yet
+    // when the kernel event arrives. Holding the event briefly before
+    // calling engine.attribute() gives the polling refresh time to
+    // catch up, so the attributed_tool_call_id ends up pointing at the
+    // ACTUAL triggering tool_call instead of the previous one.
+    //
+    // The cost is 500ms of latency from kernel event to JSONL write.
+    // Acceptable for security telemetry (Sysmon / SIEM forwarders all
+    // tolerate seconds-level lag). On clean shutdown the remaining
+    // buffered events get a final drain so we don't lose anything.
+    let attribution_delay = Duration::from_millis(500);
     let last_refresh = std::cell::Cell::new(Instant::now());
 
-    let engine_emit = engine.clone();
-    let sink_emit = sink.clone();
+    // Shared between the ETW callback thread (pushes) and the main
+    // thread (drains). Each entry is (received_at, event). Drain order
+    // is FIFO by received_at.
+    let pending: Arc<Mutex<std::collections::VecDeque<(Instant, fishbowl_schema::Event)>>> =
+        Arc::new(Mutex::new(std::collections::VecDeque::new()));
+
+    let pending_emit = pending.clone();
+    let engine_tick = engine.clone();
+    let pending_tick = pending.clone();
+    let sink_tick = sink.clone();
     fishbowl_collector_windows::run_with_tick(
         cfg,
-        stop,
-        move |mut event| {
-            engine_emit
-                .lock()
-                .expect("engine lock")
-                .attribute(&mut event);
-            let mut s = sink_emit.lock().expect("sink lock");
-            if let Ok(line) = serde_json::to_string(&event) {
-                let _ = writeln!(s, "{line}");
-                let _ = s.flush();
-            }
+        stop.clone(),
+        move |event| {
+            // ETW callback runs on a ferrisetw-owned thread. Just enqueue;
+            // attribution + sink write happen on the main thread under
+            // the tick callback below, where transcript refresh has had
+            // a chance to fold in new tool_calls.
+            let mut q = pending_emit.lock().expect("pending lock");
+            q.push_back((Instant::now(), event));
         },
         || {
+            // Transcript refresh tick.
             if last_refresh.get().elapsed() >= refresh_every {
                 let result = {
-                    let mut eng = engine.lock().expect("engine lock");
+                    let mut eng = engine_tick.lock().expect("engine lock");
                     let r = eng.refresh();
-                    // Persist emission cursors so a service restart picks up
-                    // exactly where we left off. Save is no-op when nothing
-                    // changed since the previous call.
                     let _ = eng.save_state();
                     r
                 };
-                match result {
-                    Ok(new_events) => {
-                        if !new_events.is_empty() {
-                            let mut s = sink.lock().expect("sink lock");
-                            for ev in new_events {
-                                if let Ok(line) = serde_json::to_string(&ev) {
-                                    let _ = writeln!(s, "{line}");
-                                }
+                if let Ok(new_events) = result {
+                    if !new_events.is_empty() {
+                        let mut s = sink_tick.lock().expect("sink lock");
+                        for ev in new_events {
+                            if let Ok(line) = serde_json::to_string(&ev) {
+                                let _ = writeln!(s, "{line}");
                             }
-                            let _ = s.flush();
                         }
+                        let _ = s.flush();
                     }
-                    Err(e) => eprintln!("transcript refresh failed: {e}"),
                 }
                 last_refresh.set(Instant::now());
             }
+
+            // Drain any pending kernel events that have aged past
+            // `attribution_delay`. Each gets attributed against the
+            // engine's current session state (which is up-to-date as of
+            // the most recent refresh, including potentially the
+            // tool_call that triggered the event), then written.
+            let now = Instant::now();
+            let drained: Vec<fishbowl_schema::Event> = {
+                let mut q = pending_tick.lock().expect("pending lock");
+                let mut out = Vec::new();
+                while let Some((t, _)) = q.front() {
+                    if now.duration_since(*t) >= attribution_delay {
+                        if let Some((_, ev)) = q.pop_front() {
+                            out.push(ev);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                out
+            };
+            if !drained.is_empty() {
+                let mut eng = engine_tick.lock().expect("engine lock");
+                let mut s = sink_tick.lock().expect("sink lock");
+                for mut ev in drained {
+                    eng.attribute(&mut ev);
+                    if let Ok(line) = serde_json::to_string(&ev) {
+                        let _ = writeln!(s, "{line}");
+                    }
+                }
+                let _ = s.flush();
+            }
         },
     )?;
+
+    // Final drain on shutdown — flush any buffered events that haven't
+    // aged out yet. Without this, the last ~500ms of kernel activity
+    // before a service stop would be lost.
+    let remaining: Vec<fishbowl_schema::Event> = {
+        let mut q = pending.lock().expect("pending lock");
+        q.drain(..).map(|(_, ev)| ev).collect()
+    };
+    if !remaining.is_empty() {
+        let mut eng = engine.lock().expect("engine lock");
+        let mut s = sink.lock().expect("sink lock");
+        for mut ev in remaining {
+            eng.attribute(&mut ev);
+            if let Ok(line) = serde_json::to_string(&ev) {
+                let _ = writeln!(s, "{line}");
+            }
+        }
+        let _ = s.flush();
+    }
 
     eprintln!("fishbowl daemon stopped");
     Ok(())
@@ -688,15 +746,16 @@ fn run_daemon(
     };
     let sink = std::sync::Mutex::new(sink);
 
-    // 100ms refresh tick. Closes most of the polling race where a kernel
-    // event fires inside the same window as a brand-new tool_call: the
-    // transcript file's record gets flushed by the agent within tens of
-    // ms, so the engine sees the new tool_call before the kernel event
-    // arrives. Cost is 10 syscalls/sec/transcript — negligible on
-    // dev-endpoint workloads. Switch to notify-based file watching if
-    // this ever shows up in profiling.
+    // 100ms refresh tick + 500ms attribution buffer. See the matching
+    // Windows daemon comment block for the rationale — kernel events
+    // can fire concurrently with the transcript write, so we buffer
+    // briefly to give attribution a chance to bind to the correct
+    // tool_call.
     let refresh_every = Duration::from_millis(100);
+    let attribution_delay = Duration::from_millis(500);
     let last_refresh = std::cell::Cell::new(Instant::now());
+    let pending: std::cell::RefCell<std::collections::VecDeque<(Instant, fishbowl_schema::Event)>> =
+        std::cell::RefCell::new(std::collections::VecDeque::new());
 
     eprintln!(
         "fishbowl daemon starting (agents = {:?}, transcript sources = {}, sessions loaded = {})",
@@ -708,13 +767,10 @@ fn run_daemon(
     fishbowl_collector_linux::run_with_tick(
         cfg,
         stop,
-        |mut event| {
-            engine.borrow_mut().attribute(&mut event);
-            let mut s = sink.lock().expect("sink lock");
-            if let Ok(line) = serde_json::to_string(&event) {
-                let _ = writeln!(s, "{line}");
-                let _ = s.flush();
-            }
+        |event| {
+            // Enqueue; attribution + sink write happen in the tick
+            // callback after the attribution_delay window has elapsed.
+            pending.borrow_mut().push_back((Instant::now(), event));
         },
         || {
             if last_refresh.get().elapsed() >= refresh_every {
@@ -724,24 +780,63 @@ fn run_daemon(
                     let _ = eng.save_state();
                     r
                 };
-                match result {
-                    Ok(new_events) => {
-                        if !new_events.is_empty() {
-                            let mut s = sink.lock().expect("sink lock");
-                            for ev in new_events {
-                                if let Ok(line) = serde_json::to_string(&ev) {
-                                    let _ = writeln!(s, "{line}");
-                                }
+                if let Ok(new_events) = result {
+                    if !new_events.is_empty() {
+                        let mut s = sink.lock().expect("sink lock");
+                        for ev in new_events {
+                            if let Ok(line) = serde_json::to_string(&ev) {
+                                let _ = writeln!(s, "{line}");
                             }
-                            let _ = s.flush();
                         }
+                        let _ = s.flush();
                     }
-                    Err(e) => eprintln!("transcript refresh failed: {e}"),
                 }
                 last_refresh.set(Instant::now());
             }
+
+            // Drain kernel events aged past `attribution_delay`.
+            let now = Instant::now();
+            let mut drained: Vec<fishbowl_schema::Event> = Vec::new();
+            {
+                let mut q = pending.borrow_mut();
+                while let Some((t, _)) = q.front() {
+                    if now.duration_since(*t) >= attribution_delay {
+                        if let Some((_, ev)) = q.pop_front() {
+                            drained.push(ev);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if !drained.is_empty() {
+                let mut eng = engine.borrow_mut();
+                let mut s = sink.lock().expect("sink lock");
+                for mut ev in drained {
+                    eng.attribute(&mut ev);
+                    if let Ok(line) = serde_json::to_string(&ev) {
+                        let _ = writeln!(s, "{line}");
+                    }
+                }
+                let _ = s.flush();
+            }
         },
     )?;
+
+    // Final drain on shutdown.
+    let remaining: Vec<fishbowl_schema::Event> =
+        pending.borrow_mut().drain(..).map(|(_, ev)| ev).collect();
+    if !remaining.is_empty() {
+        let mut eng = engine.borrow_mut();
+        let mut s = sink.lock().expect("sink lock");
+        for mut ev in remaining {
+            eng.attribute(&mut ev);
+            if let Ok(line) = serde_json::to_string(&ev) {
+                let _ = writeln!(s, "{line}");
+            }
+        }
+        let _ = s.flush();
+    }
 
     eprintln!("fishbowl daemon stopped");
     Ok(())
