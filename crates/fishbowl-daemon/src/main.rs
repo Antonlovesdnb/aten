@@ -348,7 +348,15 @@ pub(crate) fn run_daemon_loop_windows(
     // Acceptable for security telemetry (Sysmon / SIEM forwarders all
     // tolerate seconds-level lag). On clean shutdown the remaining
     // buffered events get a final drain so we don't lose anything.
-    let attribution_delay = Duration::from_millis(500);
+    // 2-second attribution buffer. 500ms covered the common case but
+    // wasn't long enough when Claude Code batched several transcript
+    // records before flushing — the kernel event would arrive, age out,
+    // and attribute against the previous tool_call because the actual
+    // triggering tool_call wasn't on disk yet. 2s catches essentially
+    // every realistic flush cadence we've observed. Latency cost is
+    // negligible for security telemetry (still well under any SIEM
+    // forwarder's batching interval).
+    let attribution_delay = Duration::from_millis(2000);
     let last_refresh = std::cell::Cell::new(Instant::now());
 
     // Shared between the ETW callback thread (pushes) and the main
@@ -752,7 +760,15 @@ fn run_daemon(
     // briefly to give attribution a chance to bind to the correct
     // tool_call.
     let refresh_every = Duration::from_millis(100);
-    let attribution_delay = Duration::from_millis(500);
+    // 2-second attribution buffer. 500ms covered the common case but
+    // wasn't long enough when Claude Code batched several transcript
+    // records before flushing — the kernel event would arrive, age out,
+    // and attribute against the previous tool_call because the actual
+    // triggering tool_call wasn't on disk yet. 2s catches essentially
+    // every realistic flush cadence we've observed. Latency cost is
+    // negligible for security telemetry (still well under any SIEM
+    // forwarder's batching interval).
+    let attribution_delay = Duration::from_millis(2000);
     let last_refresh = std::cell::Cell::new(Instant::now());
     let pending: std::cell::RefCell<std::collections::VecDeque<(Instant, fishbowl_schema::Event)>> =
         std::cell::RefCell::new(std::collections::VecDeque::new());
