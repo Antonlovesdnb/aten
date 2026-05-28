@@ -1,5 +1,6 @@
 # Session-only files (kept locally, not published)
 memory.md
+scenarios.md
 
 # Python
 __pycache__/
