@@ -62,7 +62,7 @@ Nested under `process`:
 | `cwd` | string | |
 | `user` | string | Effective user (euid on Linux, primary token user on Windows) |
 | `integrity_level` | string\|null | Windows only: `low`/`medium`/`high`/`system`. `null` on Linux. |
-| `parent_chain` | array of strings | Process names root→current, e.g. `["systemd","claude","bash","npm","node"]`. Capped at 16. |
+| `parent_chain` | array of `{pid, name}` | Ancestor chain root → immediate parent (excludes the event's own process). Capped at 16. The last entry's `pid` equals `process.ppid`, so consumers can verify order. Schema v0.3 replaced the prior `array of strings` form to let SIEM rules join links against earlier `process_exec` events by PID. |
 | `agent_root_pid` | int | The enrolled agent process at the top of this descent tree |
 
 ## 4. Attribution block (every event with a PID)

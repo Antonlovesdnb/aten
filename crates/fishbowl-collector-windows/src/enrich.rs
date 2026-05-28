@@ -32,6 +32,7 @@ use std::ffi::c_void;
 use std::mem;
 use std::sync::OnceLock;
 
+use fishbowl_schema::ParentChainEntry;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -678,16 +679,16 @@ pub fn list_processes() -> Vec<(u32, String)> {
     out
 }
 
-/// Walk PPIDs upward starting from `start_ppid`. Returns ancestor basenames
-/// in root → leaf order, capped at `max_depth` hops. The result excludes the
-/// caller's own process to match the Linux collector's contract (see
-/// `fishbowl_collector_linux::proc::parent_chain`).
+/// Walk PPIDs upward starting from `start_ppid`. Returns one
+/// `ParentChainEntry` per ancestor in root → immediate-parent order,
+/// capped at `max_depth` hops. The result excludes the caller's own
+/// process to match the Linux collector's contract.
 ///
-/// Stops on: hitting PID 0/4, a PPID self-loop, or `OpenProcess` failing
-/// (likely a process that exited between hops — a normal race, not an
-/// error).
-pub fn parent_chain(start_ppid: u32, max_depth: usize) -> Vec<String> {
-    let mut chain: Vec<String> = Vec::new();
+/// Stops on: hitting PID 0/4, a PPID self-loop, or `OpenProcess`
+/// failing (likely a process that exited between hops — a normal race,
+/// not an error).
+pub fn parent_chain(start_ppid: u32, max_depth: usize) -> Vec<ParentChainEntry> {
+    let mut chain: Vec<ParentChainEntry> = Vec::new();
     let mut pid = start_ppid;
     for _ in 0..max_depth {
         if pid == PID_IDLE || pid == PID_SYSTEM {
@@ -700,7 +701,10 @@ pub fn parent_chain(start_ppid: u32, max_depth: usize) -> Vec<String> {
         if image.is_empty() {
             break;
         }
-        chain.push(basename(&image));
+        chain.push(ParentChainEntry {
+            pid: pid as i32,
+            name: basename(&image),
+        });
         let Some(parent) = query_ppid(&h) else {
             break;
         };

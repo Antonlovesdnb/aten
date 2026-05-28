@@ -14,7 +14,31 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire-format version. Bumped on field semantic changes. Additive-only within 0.x.
-pub const SCHEMA_VERSION: &str = "0.2";
+///
+/// History:
+/// - 0.1: initial schema.
+/// - 0.2: attribution block split into the 5-boolean shape (descent +
+///   the four `requested_*`), separating user-typed origin from
+///   tool-result origin for prompt-injection scenarios.
+/// - 0.3: `Process.parent_chain` changed from `Vec<String>` to
+///   `Vec<ParentChainEntry>` so each link carries `{pid, name}`. Order
+///   is still root → immediate parent; PIDs let SIEM rules join the
+///   chain against `process_exec` events emitted earlier for the same
+///   ancestors.
+pub const SCHEMA_VERSION: &str = "0.3";
+
+/// One link in a process's ancestor chain. Same order semantics as the
+/// old `Vec<String>` (root → immediate parent, excludes the event's own
+/// process), but each entry now carries the PID so downstream joins
+/// don't need to re-walk PPIDs. The last entry's `pid` should equal
+/// the event's `process.ppid`; the first entry's `pid` is the
+/// shallowest ancestor we could walk to within the depth cap (typically
+/// 16).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParentChainEntry {
+    pub pid: i32,
+    pub name: String,
+}
 
 /// One fishbowl event. Serializes flat — envelope fields and the per-kind payload
 /// share the top level of the JSON object. `event_type` is the discriminator.
@@ -122,7 +146,7 @@ pub struct Process {
     pub user: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity_level: Option<String>,
-    pub parent_chain: Vec<String>,
+    pub parent_chain: Vec<ParentChainEntry>,
     pub agent_root_pid: Option<i32>,
 }
 
@@ -310,7 +334,7 @@ mod tests {
         assert_eq!(v["event_type"], json!("prompt"));
         assert_eq!(v["role"], json!("user"));
         assert_eq!(v["prompt_text"], json!("hello"));
-        assert_eq!(v["schema_version"], json!("0.2"));
+        assert_eq!(v["schema_version"], json!(SCHEMA_VERSION));
     }
 
     #[test]

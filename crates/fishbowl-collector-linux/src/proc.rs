@@ -13,6 +13,8 @@
 use std::fs;
 use std::path::PathBuf;
 
+use fishbowl_schema::ParentChainEntry;
+
 /// Best-effort snapshot of /proc/<pid>/ for one process. Anything that fails
 /// to read becomes an empty string — collectors should never panic on a
 /// process that disappeared between exec and our /proc read.
@@ -49,11 +51,14 @@ pub fn snapshot(pid: i32) -> ProcSnapshot {
     }
 }
 
-/// Walk up the process tree from `pid` and return ancestor comms, root → leaf.
-/// Stops at PID 1, when a parent can't be read, or after `max_depth` hops
-/// (schema caps at 16). The result excludes `pid` itself.
-pub fn parent_chain(pid: i32, max_depth: usize) -> Vec<String> {
-    let mut chain: Vec<String> = Vec::new();
+/// Walk up the process tree from `pid` and return one `ParentChainEntry`
+/// per ancestor in root → immediate-parent order. Stops at PID 1, when
+/// a parent can't be read, or after `max_depth` hops (schema caps at
+/// 16). The result excludes `pid` itself. Each entry carries `{pid, name}`
+/// so downstream rules can join the chain against `process_exec` events
+/// emitted earlier for the same ancestors without re-walking PPIDs.
+pub fn parent_chain(pid: i32, max_depth: usize) -> Vec<ParentChainEntry> {
+    let mut chain: Vec<ParentChainEntry> = Vec::new();
     let mut current = pid;
     for _ in 0..max_depth {
         let snap = snapshot(current);
@@ -64,7 +69,10 @@ pub fn parent_chain(pid: i32, max_depth: usize) -> Vec<String> {
         if parent_snap.comm.is_empty() {
             break;
         }
-        chain.push(parent_snap.comm.clone());
+        chain.push(ParentChainEntry {
+            pid: snap.ppid,
+            name: parent_snap.comm.clone(),
+        });
         if snap.ppid == 1 {
             break;
         }
