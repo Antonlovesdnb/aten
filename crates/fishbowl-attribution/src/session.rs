@@ -124,13 +124,21 @@ pub fn parse_rfc3339_ns(s: &str) -> Option<i64> {
     dt.timestamp_nanos_opt()
 }
 
-/// Read every JSONL transcript file beneath `root` and group their events by
-/// `session_id`. Returns one map entry per session. Used by the engine to
-/// rebuild its session set on each refresh tick.
-pub fn load_sessions_from_file(transcript_path: &std::path::Path) -> anyhow::Result<(String, Vec<Event>)> {
+/// Read a transcript JSONL file and return (session_id, events). Picks the
+/// parser based on `dialect` — Claude Code's per-line format or Codex's
+/// session_meta-rooted envelope. Used by the engine to rebuild its session
+/// set on each refresh tick.
+pub fn load_sessions_from_file(
+    transcript_path: &std::path::Path,
+    dialect: fishbowl_transcript::TranscriptDialect,
+) -> anyhow::Result<(String, Vec<Event>)> {
     let content = std::fs::read_to_string(transcript_path)?;
-    let (events, _idx) =
-        fishbowl_transcript::read_transcript(&content, fishbowl_schema::Platform::Linux, None)?;
+    let (events, _idx) = fishbowl_transcript::read_transcript_by_dialect(
+        dialect,
+        &content,
+        fishbowl_schema::Platform::Linux,
+        None,
+    )?;
     let session_id = events
         .iter()
         .find_map(|e| e.session_id.clone())
@@ -139,11 +147,15 @@ pub fn load_sessions_from_file(transcript_path: &std::path::Path) -> anyhow::Res
 }
 
 /// Extract the `cwd` from the first transcript record that carries it.
-/// Claude Code records cwd on most non-metadata lines. Re-reading the raw
-/// JSONL is cheaper than going through the schema events here because the
-/// schema strips the cwd field — it's a transcript-record property, not an
-/// event property.
-pub fn cwd_from_transcript_raw(transcript_path: &std::path::Path) -> Option<String> {
+/// Claude Code records cwd on most non-metadata lines; Codex records it
+/// once in the `session_meta.payload.cwd` opener.
+pub fn cwd_from_transcript_raw(
+    transcript_path: &std::path::Path,
+    dialect: fishbowl_transcript::TranscriptDialect,
+) -> Option<String> {
+    if dialect == fishbowl_transcript::TranscriptDialect::Codex {
+        return fishbowl_transcript::codex::cwd_from_codex_transcript_raw(transcript_path);
+    }
     let content = std::fs::read_to_string(transcript_path).ok()?;
     for line in content.lines() {
         let v: serde_json::Value = match serde_json::from_str(line) {

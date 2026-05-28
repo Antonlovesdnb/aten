@@ -27,15 +27,19 @@
 //! cache is the obvious next step (PID-only cache is unsafe because of
 //! Windows PID reuse — start time disambiguates).
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem;
+use std::sync::OnceLock;
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{
-    GetTokenInformation, LookupAccountSidW, TokenUser, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, LookupAccountSidW, TokenIntegrityLevel, TokenUser, SID_NAME_USE,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
 };
+use windows::Win32::Storage::FileSystem::{GetLogicalDriveStringsW, QueryDosDeviceW};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
@@ -380,6 +384,173 @@ pub fn query_cwd(pid: u32) -> Option<String> {
         s.pop();
     }
     Some(s)
+}
+
+/// Fetch the integrity level of `pid`'s primary token, returning the schema
+/// string form (`"low"`, `"medium"`, `"high"`, `"system"`). Returns `None`
+/// when the process is gone, we can't open its token, or the SID's RID
+/// doesn't match a documented integrity level.
+///
+/// Implementation:
+///   - `OpenProcessToken(handle, TOKEN_QUERY)` — needs only QUERY rights
+///     on the process (covered by the existing `open_query_handle`).
+///   - `GetTokenInformation(token, TokenIntegrityLevel, ...)` returns a
+///     `TOKEN_MANDATORY_LABEL` whose `Label.Sid` is the integrity SID.
+///     The last sub-authority (RID) of that SID is the integrity level
+///     constant.
+///
+/// The four documented RIDs (`SECURITY_MANDATORY_*_RID`):
+///   0x1000 low, 0x2000 medium, 0x3000 high, 0x4000 system.
+/// Anything else (untrusted, medium+, protected high) maps to `None` for
+/// v0.x — the schema enum only carries the common four.
+pub fn query_integrity_level(pid: u32) -> Option<String> {
+    use windows::Win32::Security::{GetSidSubAuthority, GetSidSubAuthorityCount, PSID};
+
+    let h = open_query_handle(pid)?;
+
+    // OpenProcessToken with TOKEN_QUERY.
+    let mut token: HANDLE = HANDLE::default();
+    let ok = unsafe { OpenProcessToken(h.0, TOKEN_QUERY, &mut token) };
+    if ok.is_err() || token.is_invalid() {
+        return None;
+    }
+    let _token_guard = OwnedHandle(token);
+
+    // Sized query — first call with zero buffer tells us required size.
+    let mut needed: u32 = 0;
+    let _ = unsafe {
+        GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut needed)
+    };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf: Vec<u8> = vec![0u8; needed as usize];
+    let mut written: u32 = 0;
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            buf.len() as u32,
+            &mut written,
+        )
+    }
+    .is_err()
+        || written == 0
+    {
+        return None;
+    }
+
+    // Cast the buffer to TOKEN_MANDATORY_LABEL and pull the RID from the SID's
+    // last sub-authority.
+    if (buf.len() as usize) < mem::size_of::<TOKEN_MANDATORY_LABEL>() {
+        return None;
+    }
+    let tml = unsafe { &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL) };
+    let sid: PSID = tml.Label.Sid;
+    if sid.0.is_null() {
+        return None;
+    }
+    let count_ptr = unsafe { GetSidSubAuthorityCount(sid) };
+    if count_ptr.is_null() {
+        return None;
+    }
+    let count = unsafe { *count_ptr };
+    if count == 0 {
+        return None;
+    }
+    let rid_ptr = unsafe { GetSidSubAuthority(sid, (count - 1) as u32) };
+    if rid_ptr.is_null() {
+        return None;
+    }
+    let rid = unsafe { *rid_ptr };
+    Some(integrity_rid_to_str(rid).to_string())
+}
+
+/// Map a mandatory-label SID RID to the schema enum string. Values from
+/// `winnt.h` `SECURITY_MANDATORY_*_RID`. Anything outside the documented
+/// four maps to `"unknown"` for visibility (rather than dropping the
+/// field) — useful for noticing AppContainer / protected-process cases.
+fn integrity_rid_to_str(rid: u32) -> &'static str {
+    match rid {
+        0x0000..=0x0FFF => "untrusted",
+        0x1000..=0x1FFF => "low",
+        0x2000..=0x2FFF => "medium",
+        0x3000..=0x3FFF => "high",
+        0x4000..=u32::MAX => "system",
+    }
+}
+
+/// Build a map from NT device path (lowercased, no trailing separator) to
+/// the Win32 drive letter (e.g. `\device\harddiskvolume9` → `C:`). Used to
+/// rewrite ETW Kernel-File `FileName` values from NT-namespace form to a
+/// human-readable drive-letter path. Built once on first use and cached.
+fn drive_map() -> &'static HashMap<String, String> {
+    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut out: HashMap<String, String> = HashMap::new();
+        // GetLogicalDriveStringsW writes NUL-separated entries like
+        // "A:\0C:\0D:\0\0". 512 is comfortably larger than any realistic
+        // drive-list payload (each entry is 4 chars).
+        let mut buf = vec![0u16; 512];
+        let n = unsafe { GetLogicalDriveStringsW(Some(&mut buf)) } as usize;
+        if n == 0 || n > buf.len() {
+            return out;
+        }
+        for chunk in buf[..n].split(|&c| c == 0) {
+            if chunk.is_empty() {
+                continue;
+            }
+            // chunk is like "C:\". Strip the trailing "\" — QueryDosDeviceW
+            // expects just "C:" without the separator.
+            let letter_raw = String::from_utf16_lossy(chunk);
+            let letter = letter_raw.trim_end_matches('\\').to_string();
+            if letter.len() != 2 {
+                continue;
+            }
+            let letter_wide: Vec<u16> = letter.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut dev_buf = vec![0u16; 1024];
+            let dev_len = unsafe {
+                QueryDosDeviceW(PCWSTR(letter_wide.as_ptr()), Some(&mut dev_buf))
+            };
+            if dev_len == 0 {
+                continue;
+            }
+            // dev_buf contains the device path followed by a NUL. Trim.
+            let dev = String::from_utf16_lossy(
+                &dev_buf[..dev_len.saturating_sub(1).min(dev_buf.len() as u32) as usize],
+            );
+            let dev_key = dev.trim_end_matches('\0').trim_end_matches('\\').to_lowercase();
+            if !dev_key.is_empty() {
+                out.insert(dev_key, letter);
+            }
+        }
+        out
+    })
+}
+
+/// Rewrite an NT-namespace device path (`\Device\HarddiskVolume9\Users\...`)
+/// to the equivalent Win32 drive-letter path (`C:\Users\...`). Returns the
+/// input unchanged when no device prefix matches — covers paths that
+/// already use drive letters, UNC paths, and unmapped devices.
+///
+/// Lowercase comparison; preserves the suffix's original case in output.
+pub fn normalize_nt_path(nt_path: &str) -> String {
+    if !nt_path.starts_with('\\') {
+        return nt_path.to_string();
+    }
+    let lower = nt_path.to_lowercase();
+    for (device, letter) in drive_map().iter() {
+        if let Some(rest) = lower.strip_prefix(device.as_str()) {
+            // Device prefix must be followed by `\` so we don't match
+            // `\Device\HarddiskVolume9X` against `\Device\HarddiskVolume9`.
+            if rest.starts_with('\\') {
+                let suffix = &nt_path[device.len()..];
+                return format!("{letter}{suffix}");
+            }
+        }
+    }
+    nt_path.to_string()
 }
 
 /// Enumerate currently-running processes, returning `(pid, image_basename)`

@@ -23,6 +23,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use fishbowl_schema::{Event, EventKind};
+use fishbowl_transcript::TranscriptDialect;
 
 pub mod session;
 
@@ -38,6 +39,10 @@ pub struct EngineConfig {
     /// PEB-walk-based resolver from `fishbowl_collector_windows::query_cwd`
     /// so the engine stays platform-agnostic.
     pub cwd_for_pid: fn(i32) -> Option<String>,
+    /// Which transcript dialect to parse. The daemon picks this from the
+    /// transcript path (`~/.claude/...` vs `~/.codex/...`); the engine
+    /// itself just dispatches to the right parser.
+    pub dialect: TranscriptDialect,
 }
 
 impl Default for EngineConfig {
@@ -45,6 +50,7 @@ impl Default for EngineConfig {
         Self {
             transcript_path: PathBuf::new(),
             cwd_for_pid: default_cwd_for_pid,
+            dialect: TranscriptDialect::ClaudeCode,
         }
     }
 }
@@ -85,11 +91,12 @@ impl AttributionEngine {
     /// Read the transcript, build (or update) the per-session state. Call this
     /// on startup and on each refresh tick.
     pub fn refresh(&mut self) -> Result<()> {
-        let (session_id, events) = session::load_sessions_from_file(&self.cfg.transcript_path)?;
+        let (session_id, events) =
+            session::load_sessions_from_file(&self.cfg.transcript_path, self.cfg.dialect)?;
         if session_id.is_empty() {
             return Ok(());
         }
-        let cwd = session::cwd_from_transcript_raw(&self.cfg.transcript_path);
+        let cwd = session::cwd_from_transcript_raw(&self.cfg.transcript_path, self.cfg.dialect);
         match &mut self.session {
             Some(state) if state.session_id == session_id => {
                 state.refresh(&events);

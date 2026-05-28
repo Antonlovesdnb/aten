@@ -38,14 +38,6 @@
 //! ETW events on a busy host.
 //!
 //! Open follow-ups (deliberately out of scope here):
-//! - `integrity_level` on `Process` — the SID is in the Kernel-Process
-//!   event, mapping `S-1-16-{4096,8192,12288,16384}` to the schema enum is
-//!   a small task.
-//! - NT-namespace → Win32 path normalization. Kernel-File events deliver
-//!   `\Device\HarddiskVolumeN\Users\...`; classification works on the raw
-//!   form (`credentials::classify` normalizes separators), but
-//!   screenshot-quality post output wants drive letters. Needs
-//!   `QueryDosDeviceW` + `GetLogicalDriveStringsW` and an inverse cache.
 //! - `Create`-disposition filtering. Kernel-File Create fires for
 //!   pure-metadata opens too (Defender, Search Indexer, Explorer). Reading
 //!   `CreateOptions` would let us drop `FILE_OPEN_FOR_BACKUP_INTENT` and
@@ -450,15 +442,11 @@ fn handle_etw_event(
                 ppid: ppid as i32,
                 start_time: process_key.start_time_ticks.to_string(),
                 name: basename,
-                path: image_name.clone(),
+                path: enrich::normalize_nt_path(&image_name),
                 cmdline,
                 cwd: String::new(),
                 user,
-                // Integrity-level SID is in the ETW event but mapping it to
-                // the schema's low/medium/high/system enum is a separate
-                // follow-up. Leaving null until then is a strict subset of
-                // the schema, not a misuse.
-                integrity_level: None,
+                integrity_level: enrich::query_integrity_level(pid),
                 parent_chain,
                 agent_root_pid,
             },
@@ -590,11 +578,11 @@ fn handle_file_event(
                 // single host within a sane time window.
                 start_time: String::new(),
                 name: process_name,
-                path: image_path,
+                path: enrich::normalize_nt_path(&image_path),
                 cmdline,
                 cwd: String::new(),
                 user,
-                integrity_level: None,
+                integrity_level: enrich::query_integrity_level(pid),
                 parent_chain,
                 agent_root_pid,
             },
@@ -607,7 +595,7 @@ fn handle_file_event(
                 requested_in_tool_result: false,
                 time_window_ms: None,
             },
-            file_path: file_name,
+            file_path: enrich::normalize_nt_path(&file_name),
             // openat-style: the event we hook is the open itself. Matches
             // the Linux side, which also emits Open for its openat probe.
             access_type: AccessType::Open,
@@ -750,11 +738,11 @@ fn handle_network_event(
                 ppid: immediate_parent as i32,
                 start_time: String::new(),
                 name: process_name,
-                path: image_path,
+                path: enrich::normalize_nt_path(&image_path),
                 cmdline,
                 cwd: String::new(),
                 user,
-                integrity_level: None,
+                integrity_level: enrich::query_integrity_level(pid),
                 parent_chain,
                 agent_root_pid,
             },

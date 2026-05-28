@@ -18,7 +18,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use fishbowl_schema::Platform;
-use fishbowl_transcript::read_transcript;
 
 #[derive(Parser)]
 #[command(name = "fishbowl", version, about = "fishbowl-v2 daemon CLI")]
@@ -166,8 +165,9 @@ fn run_daemon(
     // attribution can bind an agent_root_pid (which on Windows isn't
     // queryable via /proc) to a transcript session by cwd match.
     let engine = Arc::new(Mutex::new(AttributionEngine::new(EngineConfig {
-        transcript_path: transcript.clone(),
         cwd_for_pid: windows_cwd_for_pid,
+        dialect: fishbowl_transcript::detect_dialect_from_path(&transcript),
+        transcript_path: transcript.clone(),
     })));
     engine.lock().expect("engine lock").refresh()?;
 
@@ -442,8 +442,9 @@ fn run_daemon(
 
     // Build the attribution engine and seed it from the transcript.
     let engine = AttributionEngine::new(EngineConfig {
-        transcript_path: transcript.clone(),
         cwd_for_pid: fishbowl_attribution::default_cwd_for_pid,
+        dialect: fishbowl_transcript::detect_dialect_from_path(&transcript),
+        transcript_path: transcript.clone(),
     });
     let engine = RefCell::new(engine);
     engine.borrow_mut().refresh()?;
@@ -538,7 +539,9 @@ fn run_transcript(
         .with_context(|| format!("read {}", transcript.display()))?;
 
     let platform = detect_platform();
-    let (events, index) = read_transcript(&content, platform, None)?;
+    let dialect = fishbowl_transcript::detect_dialect_from_path(&transcript);
+    let (events, index) =
+        fishbowl_transcript::read_transcript_by_dialect(dialect, &content, platform, None)?;
 
     let out_path = out.unwrap_or_else(|| transcript.with_extension("events.jsonl"));
     let idx_path = idx.unwrap_or_else(|| transcript.with_extension("idx.json"));

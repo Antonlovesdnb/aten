@@ -16,9 +16,51 @@ use fishbowl_schema::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod codex;
 pub mod identifiers;
 
-const COLLECTOR_NAME: &str = "transcript";
+/// Which agent CLI emitted this transcript. The two structurally similar
+/// but field-incompatible JSONL formats fishbowl-v2 reads today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptDialect {
+    /// Claude Code — `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`.
+    /// Each record has `sessionId`, `type` (`user`/`assistant`/...), and
+    /// a `message.content` array of typed content blocks.
+    ClaudeCode,
+    /// Codex CLI — `~/.codex/sessions/<date>/rollout-<uuid>.jsonl`.
+    /// First record is `session_meta` carrying the session id; subsequent
+    /// records are `response_item` / `event_msg` envelopes.
+    Codex,
+}
+
+/// Heuristic dialect detection from the transcript path. Avoids reading
+/// the file when the location is unambiguous. Falls back to Claude Code
+/// for paths that don't match either pattern — preserving v0.x behavior.
+pub fn detect_dialect_from_path(path: &std::path::Path) -> TranscriptDialect {
+    let s = path.to_string_lossy().to_lowercase().replace('\\', "/");
+    if s.contains("/.codex/") || s.contains("/sessions/") && s.contains("/rollout-") {
+        TranscriptDialect::Codex
+    } else {
+        TranscriptDialect::ClaudeCode
+    }
+}
+
+/// Dispatch to the right parser. Used by callers that don't want to know
+/// the dialect at the call site (the attribution engine and the
+/// `fishbowl transcript` CLI subcommand).
+pub fn read_transcript_by_dialect(
+    dialect: TranscriptDialect,
+    transcript_jsonl: &str,
+    platform: Platform,
+    home: Option<&str>,
+) -> anyhow::Result<(Vec<Event>, IdentifierIndex)> {
+    match dialect {
+        TranscriptDialect::ClaudeCode => read_transcript(transcript_jsonl, platform, home),
+        TranscriptDialect::Codex => codex::read_codex_transcript(transcript_jsonl, platform, home),
+    }
+}
+
+pub(crate) const COLLECTOR_NAME: &str = "transcript";
 const PROBE_NAME: &str = "claude-code-jsonl";
 const AGENT_ID: &str = "claude-code";
 
@@ -74,7 +116,7 @@ pub fn read_transcript(
     Ok((events, index))
 }
 
-fn make_event_id() -> String {
+pub(crate) fn make_event_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
@@ -255,7 +297,7 @@ fn extract_text(v: Option<&serde_json::Value>) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
