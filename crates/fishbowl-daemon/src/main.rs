@@ -303,6 +303,7 @@ pub(crate) fn run_daemon_loop_windows(
         transcript_paths: inputs.transcript_paths.clone(),
         host_id: host_id.clone(),
         user_for_transcript: windows_user_for_transcript,
+        state_path: Some(config::windows_program_data_dir().join("state.json")),
     })));
     // Initial refresh: load every transcript file on disk into SessionState
     // for attribution context. The returned Vec is empty because every
@@ -333,7 +334,14 @@ pub(crate) fn run_daemon_loop_windows(
         loaded,
     );
 
-    let refresh_every = Duration::from_millis(500);
+    // 100ms refresh tick. Closes most of the polling race where a kernel
+    // event fires inside the same window as a brand-new tool_call: the
+    // transcript file's record gets flushed by the agent within tens of
+    // ms, so the engine sees the new tool_call before the kernel event
+    // arrives. Cost is 10 syscalls/sec/transcript — negligible on
+    // dev-endpoint workloads. Switch to notify-based file watching if
+    // this ever shows up in profiling.
+    let refresh_every = Duration::from_millis(100);
     let last_refresh = std::cell::Cell::new(Instant::now());
 
     let engine_emit = engine.clone();
@@ -354,7 +362,16 @@ pub(crate) fn run_daemon_loop_windows(
         },
         || {
             if last_refresh.get().elapsed() >= refresh_every {
-                match engine.lock().expect("engine lock").refresh() {
+                let result = {
+                    let mut eng = engine.lock().expect("engine lock");
+                    let r = eng.refresh();
+                    // Persist emission cursors so a service restart picks up
+                    // exactly where we left off. Save is no-op when nothing
+                    // changed since the previous call.
+                    let _ = eng.save_state();
+                    r
+                };
+                match result {
                     Ok(new_events) => {
                         if !new_events.is_empty() {
                             let mut s = sink.lock().expect("sink lock");
@@ -636,6 +653,7 @@ fn run_daemon(
         transcript_paths: inputs.transcript_paths.clone(),
         host_id: read_machine_id(),
         user_for_transcript: linux_user_for_transcript,
+        state_path: Some(std::path::PathBuf::from("/var/lib/fishbowl/state.json")),
     });
     let engine = RefCell::new(engine);
     // Initial refresh — loads transcript history into SessionState for
@@ -670,7 +688,14 @@ fn run_daemon(
     };
     let sink = std::sync::Mutex::new(sink);
 
-    let refresh_every = Duration::from_millis(500);
+    // 100ms refresh tick. Closes most of the polling race where a kernel
+    // event fires inside the same window as a brand-new tool_call: the
+    // transcript file's record gets flushed by the agent within tens of
+    // ms, so the engine sees the new tool_call before the kernel event
+    // arrives. Cost is 10 syscalls/sec/transcript — negligible on
+    // dev-endpoint workloads. Switch to notify-based file watching if
+    // this ever shows up in profiling.
+    let refresh_every = Duration::from_millis(100);
     let last_refresh = std::cell::Cell::new(Instant::now());
 
     eprintln!(
@@ -693,7 +718,13 @@ fn run_daemon(
         },
         || {
             if last_refresh.get().elapsed() >= refresh_every {
-                match engine.borrow_mut().refresh() {
+                let result = {
+                    let mut eng = engine.borrow_mut();
+                    let r = eng.refresh();
+                    let _ = eng.save_state();
+                    r
+                };
+                match result {
                     Ok(new_events) => {
                         if !new_events.is_empty() {
                             let mut s = sink.lock().expect("sink lock");

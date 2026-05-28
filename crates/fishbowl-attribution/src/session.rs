@@ -41,23 +41,27 @@ impl SessionState {
             cwd,
             ..Default::default()
         };
-        s.fold_events(events);
+        s.refresh(events);
         s
     }
 
-    /// Append-only update: fold in any events past the cursor. Called on every
-    /// transcript refresh. Tool_calls are sorted by timestamp at the end so the
-    /// binary search in `attribute_at` stays valid.
+    /// Update state from the current full event list. Append-only:
+    /// only events past `processed_event_count` get folded into
+    /// `tool_calls`. The identifier index is rebuilt from the full list
+    /// (cheap on dev-endpoint transcript sizes) so it always reflects
+    /// every prompt and tool_result ever seen.
+    ///
+    /// **Invariant**: `processed_event_count` always equals the full
+    /// event list's length after a successful refresh — so the next
+    /// call sees an accurate cursor. A prior version mistakenly set it
+    /// to the delta size, which caused the engine to re-emit older
+    /// events to the JSONL on every subsequent refresh (the "prompt
+    /// appears 5 times" symptom).
     pub fn refresh(&mut self, events: &[Event]) {
         if events.len() <= self.processed_event_count {
             return;
         }
-        let new_events = &events[self.processed_event_count..];
-        self.fold_events(new_events);
-    }
-
-    fn fold_events(&mut self, events: &[Event]) {
-        for ev in events {
+        for ev in &events[self.processed_event_count..] {
             if let EventKind::ToolCall(tc) = &ev.kind {
                 let ts_ns = parse_rfc3339_ns(&ev.timestamp).unwrap_or(i64::MAX);
                 self.tool_calls.push(ToolCallEntry {
@@ -68,13 +72,9 @@ impl SessionState {
                 });
             }
         }
-        // Build a fresh identifier index from all events the session has seen.
-        // Cheap on dev-endpoint transcript sizes; refactor to incremental if
-        // sessions get long enough that this dominates CPU.
-        self.identifier_index =
-            fishbowl_transcript::build_identifier_index(events, None);
-        self.processed_event_count = events.len();
         self.tool_calls.sort_by_key(|tc| tc.timestamp_ns);
+        self.identifier_index = fishbowl_transcript::build_identifier_index(events, None);
+        self.processed_event_count = events.len();
     }
 
     /// Most-recent tool_call with timestamp <= `event_ns`. Returns None if no

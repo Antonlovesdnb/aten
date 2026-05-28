@@ -70,6 +70,12 @@ pub struct EngineConfig {
     /// the engine, so each transcript is queried once even across many
     /// refresh ticks.
     pub user_for_transcript: fn(&Path) -> Option<String>,
+    /// Optional path to a JSON state file that persists per-transcript
+    /// emission cursors across service restarts. `None` = no persistence
+    /// (the engine still works; restarts replay no history because the
+    /// initial-sight cursor for each new file is set to its current
+    /// length). Service-mode default: `%ProgramData%\fishbowl\state.json`.
+    pub state_path: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -79,6 +85,7 @@ impl Default for EngineConfig {
             cwd_for_pid: default_cwd_for_pid,
             host_id: None,
             user_for_transcript: default_user_for_transcript,
+            state_path: None,
         }
     }
 }
@@ -108,43 +115,122 @@ pub fn default_cwd_for_pid(pid: i32) -> Option<String> {
 
 #[derive(Debug)]
 struct FileMeta {
-    mtime: SystemTime,
+    mtime: Option<SystemTime>,
     /// File owner resolved on first sight (DOMAIN\username on Windows;
     /// username on Linux). Cached because file ownership rarely changes
     /// and the lookup is a Win32 syscall we don't want to do per event.
     user_id: Option<String>,
+    /// Cursor — count of events already emitted to the daemon's sink.
+    /// On first sight of a file that's NOT in the persisted state file,
+    /// this is initialized to the file's current length, so historical
+    /// content gets folded into SessionState (for attribution) but
+    /// doesn't replay to the output. Across service restarts the cursor
+    /// is loaded from `state.json` so emission resumes exactly where it
+    /// left off, with no gap and no duplication.
+    emitted_count: usize,
+    /// True if this entry came from the persisted state file at startup.
+    /// New files seen at runtime get `emitted_count = events.len()` on
+    /// first sight; files loaded from state get whatever the file said.
+    from_persisted_state: bool,
+}
+
+/// On-disk shape of `state.json`. Held to a small Serde struct so we can
+/// add fields later without breaking forward-compat (unknown fields are
+/// ignored on load).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+struct PersistedState {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    files: HashMap<PathBuf, PersistedFile>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+struct PersistedFile {
+    emitted_count: usize,
 }
 
 pub struct AttributionEngine {
     cfg: EngineConfig,
     sessions: HashMap<String, SessionState>,
-    /// File mtime cache. Lets refresh() skip re-reading transcripts whose
-    /// on-disk timestamp hasn't moved since last refresh.
+    /// Per-file metadata: mtime cache (for refresh skip), file owner
+    /// cache, and the emission cursor that persists across restarts.
     file_meta: HashMap<PathBuf, FileMeta>,
     /// Resolved agent_root_pid → session_id binding. Populated lazily on
     /// the first kernel event whose process cwd matches a session's cwd.
     pid_bindings: HashMap<i32, String>,
-    /// Engine creation time (RFC 3339 ns). Transcript events with a
-    /// timestamp older than this are loaded into SessionState for
-    /// attribution context but NOT returned from `refresh()` — the
-    /// daemon only wants to emit prompts / tool_calls / tool_results
-    /// that happened *while it was running*, not the historical record
-    /// of every session that existed on disk at startup.
-    start_time_ns: i64,
+    /// Dirty flag — true if emission cursors have advanced since the
+    /// last `save_state()`. The daemon calls `save_state()` whenever
+    /// refresh() returns events; this flag avoids writing the state
+    /// file on no-op ticks.
+    state_dirty: bool,
 }
 
 impl AttributionEngine {
     pub fn new(cfg: EngineConfig) -> Self {
-        let start_time_ns = chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .unwrap_or(i64::MIN);
-        Self {
+        let mut engine = Self {
             cfg,
             sessions: HashMap::new(),
             file_meta: HashMap::new(),
             pid_bindings: HashMap::new(),
-            start_time_ns,
+            state_dirty: false,
+        };
+        // Best-effort load of the persisted state file. If it doesn't
+        // exist (fresh install) or can't be parsed, start clean — first
+        // refresh will populate from-scratch cursors.
+        if let Some(path) = engine.cfg.state_path.clone() {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(state) = serde_json::from_str::<PersistedState>(&text) {
+                    for (file, pf) in state.files {
+                        engine.file_meta.insert(
+                            file,
+                            FileMeta {
+                                mtime: None,
+                                user_id: None,
+                                emitted_count: pf.emitted_count,
+                                from_persisted_state: true,
+                            },
+                        );
+                    }
+                }
+            }
         }
+        engine
+    }
+
+    /// Write the current emission cursors to `state_path` (atomic via
+    /// temp + rename). No-op when no `state_path` is configured or when
+    /// nothing has changed since the last save.
+    pub fn save_state(&mut self) -> Result<()> {
+        if !self.state_dirty {
+            return Ok(());
+        }
+        let Some(ref path) = self.cfg.state_path else {
+            self.state_dirty = false;
+            return Ok(());
+        };
+        let mut files: HashMap<PathBuf, PersistedFile> = HashMap::new();
+        for (file, meta) in &self.file_meta {
+            files.insert(
+                file.clone(),
+                PersistedFile {
+                    emitted_count: meta.emitted_count,
+                },
+            );
+        }
+        let state = PersistedState {
+            version: 1,
+            files,
+        };
+        let text = serde_json::to_string(&state)?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, path)?;
+        self.state_dirty = false;
+        Ok(())
     }
 
     /// Walk all configured transcript paths, load any new or modified
@@ -192,9 +278,14 @@ impl AttributionEngine {
         new_events: &mut Vec<Event>,
     ) {
         // Skip files we've already loaded that haven't changed.
+        // Persisted-state entries have mtime=None, so they always
+        // re-read on first encounter (we don't trust an old mtime
+        // across restarts).
         if let (Some(meta), Some(mt)) = (self.file_meta.get(&file), mtime) {
-            if meta.mtime >= mt {
-                return;
+            if let Some(prev_mt) = meta.mtime {
+                if prev_mt >= mt {
+                    return;
+                }
             }
         }
 
@@ -208,13 +299,25 @@ impl AttributionEngine {
         }
         let cwd = session::cwd_from_transcript_raw(&file, dialect);
 
-        // Capture the "previous cursor" before mutating SessionState, so
-        // we can slice out events that are new in *this* refresh tick.
-        let prev_cursor = self
-            .sessions
-            .get(&session_id)
-            .map(|s| s.processed_event_count)
-            .unwrap_or(0);
+        // Determine emission cursor:
+        //  - File was loaded from state.json (`from_persisted_state`):
+        //    use the persisted `emitted_count`. May be less than
+        //    `events.len()` if events accrued while the service was off;
+        //    we'll emit the missed ones.
+        //  - File seen for the first time at runtime (no persisted
+        //    state): set cursor to `events.len()` so historical content
+        //    gets folded into SessionState but doesn't replay to the
+        //    sink. Subsequent refreshes will emit the delta.
+        let existing = self.file_meta.get(&file);
+        let emit_cursor = match existing {
+            Some(meta) if meta.from_persisted_state => meta.emitted_count.min(events.len()),
+            Some(meta) => meta.emitted_count.min(events.len()),
+            None => events.len(),
+        };
+        let user_id = match existing {
+            Some(meta) => meta.user_id.clone(),
+            None => (self.cfg.user_for_transcript)(&file),
+        };
 
         match self.sessions.get_mut(&session_id) {
             Some(state) => {
@@ -230,36 +333,12 @@ impl AttributionEngine {
                 );
             }
         }
-        // Resolve and cache the file owner. Look it up once per file —
-        // ownership is stable so we don't want to syscall on every tick.
-        let user_id = match self.file_meta.get(&file) {
-            Some(meta) => meta.user_id.clone(),
-            None => (self.cfg.user_for_transcript)(&file),
-        };
-        if let Some(mt) = mtime {
-            self.file_meta.insert(
-                file.clone(),
-                FileMeta {
-                    mtime: mt,
-                    user_id: user_id.clone(),
-                },
-            );
-        }
 
-        // Emit only the events past the prior cursor AND newer than the
-        // engine's startup time. The startup-time filter is what makes a
-        // service restart cheap: existing transcripts get folded into
-        // SessionState but their historical contents don't replay to the
-        // output sink. Stamp host_id and user_id on each — the transcript
+        // Stamp host_id and user_id on each emitted event — the transcript
         // reader leaves those null because they aren't in the source
         // JSONL; the daemon enriches at emit time.
+        let prev_cursor = emit_cursor;
         for ev in events.iter().skip(prev_cursor) {
-            let Some(ts_ns) = session::parse_rfc3339_ns(&ev.timestamp) else {
-                continue;
-            };
-            if ts_ns < self.start_time_ns {
-                continue;
-            }
             let mut enriched = ev.clone();
             if enriched.host_id.is_none() {
                 enriched.host_id = self.cfg.host_id.clone();
@@ -269,6 +348,23 @@ impl AttributionEngine {
             }
             new_events.push(enriched);
         }
+
+        // Update cursor + cached file metadata. If any events were
+        // actually emitted past the cursor, flag state dirty so the
+        // daemon's next save_state() persists this advance.
+        let new_emitted_count = events.len();
+        if new_emitted_count > emit_cursor {
+            self.state_dirty = true;
+        }
+        self.file_meta.insert(
+            file,
+            FileMeta {
+                mtime,
+                user_id,
+                emitted_count: new_emitted_count,
+                from_persisted_state: false,
+            },
+        );
     }
 
     /// Mutate a kernel-side event in place to fill in attribution. Looks
