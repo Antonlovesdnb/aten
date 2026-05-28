@@ -128,17 +128,23 @@ pub fn parse_rfc3339_ns(s: &str) -> Option<i64> {
 /// parser based on `dialect` — Claude Code's per-line format or Codex's
 /// session_meta-rooted envelope. Used by the engine to rebuild its session
 /// set on each refresh tick.
+///
+/// `Platform` is derived from the build target — events get stamped with
+/// the OS the *daemon* is running on, not the OS embedded in the transcript
+/// (Claude Code transcripts carry no platform marker, and a Codex session
+/// could in principle have been moved cross-host).
 pub fn load_sessions_from_file(
     transcript_path: &std::path::Path,
     dialect: fishbowl_transcript::TranscriptDialect,
 ) -> anyhow::Result<(String, Vec<Event>)> {
+    let platform = if cfg!(target_os = "windows") {
+        fishbowl_schema::Platform::Windows
+    } else {
+        fishbowl_schema::Platform::Linux
+    };
     let content = std::fs::read_to_string(transcript_path)?;
-    let (events, _idx) = fishbowl_transcript::read_transcript_by_dialect(
-        dialect,
-        &content,
-        fishbowl_schema::Platform::Linux,
-        None,
-    )?;
+    let (events, _idx) =
+        fishbowl_transcript::read_transcript_by_dialect(dialect, &content, platform, None)?;
     let session_id = events
         .iter()
         .find_map(|e| e.session_id.clone())
