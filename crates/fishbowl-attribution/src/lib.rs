@@ -314,8 +314,13 @@ impl AttributionEngine {
             Some(meta) => meta.emitted_count.min(events.len()),
             None => events.len(),
         };
-        let user_id = match existing {
-            Some(meta) => meta.user_id.clone(),
+        // Resolve and cache the file owner. State-loaded entries have
+        // `user_id: None` (we don't persist user_id to disk), so we have
+        // to actually look it up on the first refresh that touches the
+        // file at runtime — not just on first-ever sight. Once cached,
+        // subsequent refreshes use the cached value.
+        let user_id = match existing.and_then(|m| m.user_id.clone()) {
+            Some(u) => Some(u),
             None => (self.cfg.user_for_transcript)(&file),
         };
 
