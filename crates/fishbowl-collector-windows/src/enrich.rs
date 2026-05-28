@@ -553,6 +553,87 @@ pub fn normalize_nt_path(nt_path: &str) -> String {
     nt_path.to_string()
 }
 
+/// Look up the owner of a file on disk and return `DOMAIN\username`.
+/// Used by the daemon to stamp `user_id` on transcript-derived events
+/// (Claude Code / Codex JSONLs live in a user's home dir; the file
+/// owner is therefore the user who launched the agent session).
+///
+/// Returns `None` when the path doesn't exist, the daemon lacks
+/// permission to read its security descriptor, or the owner SID can't
+/// be resolved to a name (e.g. SID belongs to a since-deleted account).
+pub fn file_owner(path: &std::path::Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID, PSECURITY_DESCRIPTOR,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut owner_sid: PSID = PSID::default();
+    let mut sd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR::default();
+
+    let res = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OBJECT_SECURITY_INFORMATION(OWNER_SECURITY_INFORMATION.0),
+            Some(&mut owner_sid),
+            None,
+            None,
+            None,
+            &mut sd,
+        )
+    };
+    if res.is_err() || owner_sid.0.is_null() {
+        return None;
+    }
+
+    // Resolve SID -> "DOMAIN\name". The buffers are sized for typical
+    // domain/user lengths; LookupAccountSidW returns the required size
+    // in *_len on ERROR_INSUFFICIENT_BUFFER, but 256 covers every real
+    // domain\username on a Windows host.
+    let mut name = [0u16; 256];
+    let mut domain = [0u16; 256];
+    let mut name_len: u32 = name.len() as u32;
+    let mut domain_len: u32 = domain.len() as u32;
+    let mut sid_use: SID_NAME_USE = SID_NAME_USE::default();
+    let ok = unsafe {
+        LookupAccountSidW(
+            PCWSTR::null(),
+            owner_sid,
+            Some(PWSTR(name.as_mut_ptr())),
+            &mut name_len,
+            Some(PWSTR(domain.as_mut_ptr())),
+            &mut domain_len,
+            &mut sid_use,
+        )
+    };
+
+    // GetNamedSecurityInfoW allocates the SECURITY_DESCRIPTOR; we have
+    // to free it whether or not LookupAccountSidW succeeded.
+    if !sd.0.is_null() {
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(sd.0 as *mut _)));
+        }
+    }
+    if ok.is_err() {
+        return None;
+    }
+
+    let name_str = String::from_utf16_lossy(&name[..name_len as usize]);
+    let domain_str = String::from_utf16_lossy(&domain[..domain_len as usize]);
+    if domain_str.is_empty() {
+        Some(name_str)
+    } else {
+        Some(format!("{domain_str}\\{name_str}"))
+    }
+}
+
 /// Enumerate currently-running processes, returning `(pid, image_basename)`
 /// pairs. Used by the pre-trace enrollment rundown: ETW only delivers
 /// `ProcessStart` for processes that begin AFTER the trace is enabled, so

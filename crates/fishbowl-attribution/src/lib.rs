@@ -56,6 +56,20 @@ pub struct EngineConfig {
     /// PEB-walk-based resolver from `fishbowl_collector_windows::query_cwd`
     /// so the engine stays platform-agnostic.
     pub cwd_for_pid: fn(i32) -> Option<String>,
+    /// MachineGuid (or equivalent host identifier) to stamp on
+    /// transcript-derived events. The transcript reader sets host_id to
+    /// None because transcripts don't carry host info; the daemon
+    /// enriches at emit time. Same value the kernel collector stamps on
+    /// its own events, so kernel and transcript events from the same
+    /// host correlate cleanly downstream.
+    pub host_id: Option<String>,
+    /// Resolve the file-owner of a transcript file → `DOMAIN\username`
+    /// (Windows) or `username` (Linux), used as `user_id` on
+    /// transcript-derived events. The default returns None; the daemon
+    /// injects a platform-specific implementation. Cached per file in
+    /// the engine, so each transcript is queried once even across many
+    /// refresh ticks.
+    pub user_for_transcript: fn(&Path) -> Option<String>,
 }
 
 impl Default for EngineConfig {
@@ -63,8 +77,17 @@ impl Default for EngineConfig {
         Self {
             transcript_paths: Vec::new(),
             cwd_for_pid: default_cwd_for_pid,
+            host_id: None,
+            user_for_transcript: default_user_for_transcript,
         }
     }
+}
+
+/// Default user-lookup. Returns None on every platform; the daemon
+/// injects a real implementation.
+pub fn default_user_for_transcript(path: &Path) -> Option<String> {
+    let _ = path;
+    None
 }
 
 /// Default cwd resolver. Linux: reads `/proc/<pid>/cwd`. Everywhere else:
@@ -86,6 +109,10 @@ pub fn default_cwd_for_pid(pid: i32) -> Option<String> {
 #[derive(Debug)]
 struct FileMeta {
     mtime: SystemTime,
+    /// File owner resolved on first sight (DOMAIN\username on Windows;
+    /// username on Linux). Cached because file ownership rarely changes
+    /// and the lookup is a Win32 syscall we don't want to do per event.
+    user_id: Option<String>,
 }
 
 pub struct AttributionEngine {
@@ -203,21 +230,44 @@ impl AttributionEngine {
                 );
             }
         }
+        // Resolve and cache the file owner. Look it up once per file —
+        // ownership is stable so we don't want to syscall on every tick.
+        let user_id = match self.file_meta.get(&file) {
+            Some(meta) => meta.user_id.clone(),
+            None => (self.cfg.user_for_transcript)(&file),
+        };
         if let Some(mt) = mtime {
-            self.file_meta.insert(file, FileMeta { mtime: mt });
+            self.file_meta.insert(
+                file.clone(),
+                FileMeta {
+                    mtime: mt,
+                    user_id: user_id.clone(),
+                },
+            );
         }
 
         // Emit only the events past the prior cursor AND newer than the
         // engine's startup time. The startup-time filter is what makes a
         // service restart cheap: existing transcripts get folded into
         // SessionState but their historical contents don't replay to the
-        // output sink.
+        // output sink. Stamp host_id and user_id on each — the transcript
+        // reader leaves those null because they aren't in the source
+        // JSONL; the daemon enriches at emit time.
         for ev in events.iter().skip(prev_cursor) {
-            if let Some(ts_ns) = session::parse_rfc3339_ns(&ev.timestamp) {
-                if ts_ns >= self.start_time_ns {
-                    new_events.push(ev.clone());
-                }
+            let Some(ts_ns) = session::parse_rfc3339_ns(&ev.timestamp) else {
+                continue;
+            };
+            if ts_ns < self.start_time_ns {
+                continue;
             }
+            let mut enriched = ev.clone();
+            if enriched.host_id.is_none() {
+                enriched.host_id = self.cfg.host_id.clone();
+            }
+            if enriched.user_id.is_none() {
+                enriched.user_id = user_id.clone();
+            }
+            new_events.push(enriched);
         }
     }
 

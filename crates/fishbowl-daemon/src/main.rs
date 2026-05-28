@@ -288,9 +288,10 @@ pub(crate) fn run_daemon_loop_windows(
 
     use fishbowl_attribution::{AttributionEngine, EngineConfig};
 
+    let host_id = read_machine_guid_windows();
     let cfg = fishbowl_collector_windows::CollectorConfig {
         enrolled_agents: inputs.agents.clone(),
-        host_id: read_machine_guid_windows(),
+        host_id: host_id.clone(),
     };
 
     // Shared between the ETW callback thread (emit closure → `attribute`) and
@@ -300,6 +301,8 @@ pub(crate) fn run_daemon_loop_windows(
     let engine = Arc::new(Mutex::new(AttributionEngine::new(EngineConfig {
         cwd_for_pid: windows_cwd_for_pid,
         transcript_paths: inputs.transcript_paths.clone(),
+        host_id: host_id.clone(),
+        user_for_transcript: windows_user_for_transcript,
     })));
     // Initial refresh: load every transcript file on disk into SessionState
     // for attribution context. The returned Vec is empty because every
@@ -439,6 +442,15 @@ fn windows_cwd_for_pid(pid: i32) -> Option<String> {
     fishbowl_collector_windows::query_cwd(pid as u32)
 }
 
+/// Bridge to the collector's `file_owner` so the attribution engine can
+/// stamp `user_id` on transcript-derived events. Cached per-file in the
+/// engine, so the Win32 cost is paid once per transcript regardless of
+/// how many events that transcript ultimately produces.
+#[cfg(target_os = "windows")]
+fn windows_user_for_transcript(path: &std::path::Path) -> Option<String> {
+    fishbowl_collector_windows::file_owner(path)
+}
+
 #[cfg(target_os = "windows")]
 fn read_machine_guid_windows() -> Option<String> {
     // HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid. Returns None if the
@@ -574,6 +586,19 @@ fn read_machine_id() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Linux equivalent of `windows_user_for_transcript`. Resolves a
+/// transcript file's owner uid → `uid:NNN` so `user_id` on transcript
+/// events lines up with kernel events' `user_id`. Username resolution
+/// via `getpwuid` is a follow-up — the raw uid is enough to correlate
+/// in v0.x.
+#[cfg(target_os = "linux")]
+fn linux_user_for_transcript(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| format!("uid:{}", m.uid()))
+}
+
 #[cfg(target_os = "linux")]
 fn run_daemon(
     config_path: Option<PathBuf>,
@@ -609,6 +634,8 @@ fn run_daemon(
     let engine = AttributionEngine::new(EngineConfig {
         cwd_for_pid: fishbowl_attribution::default_cwd_for_pid,
         transcript_paths: inputs.transcript_paths.clone(),
+        host_id: read_machine_id(),
+        user_for_transcript: linux_user_for_transcript,
     });
     let engine = RefCell::new(engine);
     // Initial refresh — loads transcript history into SessionState for

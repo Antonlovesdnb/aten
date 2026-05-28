@@ -33,3 +33,11 @@ pub use windows_impl::{run, run_with_tick, CollectorConfig};
 pub fn query_cwd(pid: u32) -> Option<String> {
     enrich::query_cwd(pid)
 }
+
+/// Look up the file owner on disk and return `DOMAIN\username`. Same
+/// reason for the re-export as `query_cwd` — the daemon stamps the
+/// returned name as `user_id` on transcript-derived events.
+#[cfg(target_os = "windows")]
+pub fn file_owner(path: &std::path::Path) -> Option<String> {
+    enrich::file_owner(path)
+}

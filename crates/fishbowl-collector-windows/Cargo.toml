@@ -28,6 +28,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_Foundation",
     "Win32_Security",
+    # GetNamedSecurityInfoW for transcript-file owner lookup -> user_id
+    # on transcript-derived events.
+    "Win32_Security_Authorization",
     # NtQueryInformationProcess (ProcessBasicInformation, ProcessCommandLineInformation)
     # lives in the Wdk surface in the windows crate — it's the user-mode entry
     # in ntdll but isn't part of the Win32 documented surface.
