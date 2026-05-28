@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use fishbowl_schema::{Event, EventKind, Origin};
+use fishbowl_schema::{Event, EventKind, Origin, Role};
 use fishbowl_transcript::IdentifierIndex;
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,17 @@ pub struct ToolCallEntry {
     pub timestamp_ns: i64,
 }
 
+/// Most-recent user-prompt cache. Used to populate
+/// `attribution.triggering_prompt` on kernel events — the human-readable
+/// "user intent that led to this" field. User prompts don't suffer the
+/// flush-latency race that delays assistant-side records, so this cache
+/// is essentially always accurate at attribution time.
+#[derive(Debug, Clone)]
+pub struct UserPromptEntry {
+    pub text: String,
+    pub timestamp_ns: i64,
+}
+
 #[derive(Debug, Default)]
 pub struct SessionState {
     pub session_id: String,
@@ -27,6 +38,11 @@ pub struct SessionState {
     /// Chronologically ordered by `timestamp_ns`. Append-only as new tool_calls
     /// surface on each transcript refresh.
     pub tool_calls: Vec<ToolCallEntry>,
+    /// Chronologically ordered user prompts from this session. Same
+    /// append-only growth pattern as `tool_calls`. Looked up by
+    /// `most_recent_user_prompt_before` for the `triggering_prompt`
+    /// field on kernel events.
+    pub user_prompts: Vec<UserPromptEntry>,
     pub identifier_index: IdentifierIndex,
     /// Tracks how many events from the transcript have been folded in. New
     /// refreshes only look at events past this cursor.
@@ -62,19 +78,44 @@ impl SessionState {
             return;
         }
         for ev in &events[self.processed_event_count..] {
-            if let EventKind::ToolCall(tc) = &ev.kind {
-                let ts_ns = parse_rfc3339_ns(&ev.timestamp).unwrap_or(i64::MAX);
-                self.tool_calls.push(ToolCallEntry {
-                    id: tc.tool_call_id.clone(),
-                    name: tc.tool_name.clone(),
-                    input_text: tc.tool_input.to_string(),
-                    timestamp_ns: ts_ns,
-                });
+            match &ev.kind {
+                EventKind::ToolCall(tc) => {
+                    let ts_ns = parse_rfc3339_ns(&ev.timestamp).unwrap_or(i64::MAX);
+                    self.tool_calls.push(ToolCallEntry {
+                        id: tc.tool_call_id.clone(),
+                        name: tc.tool_name.clone(),
+                        input_text: tc.tool_input.to_string(),
+                        timestamp_ns: ts_ns,
+                    });
+                }
+                EventKind::Prompt(p) if matches!(p.role, Role::User) => {
+                    let ts_ns = parse_rfc3339_ns(&ev.timestamp).unwrap_or(i64::MAX);
+                    self.user_prompts.push(UserPromptEntry {
+                        text: p.prompt_text.clone(),
+                        timestamp_ns: ts_ns,
+                    });
+                }
+                _ => {}
             }
         }
         self.tool_calls.sort_by_key(|tc| tc.timestamp_ns);
+        self.user_prompts.sort_by_key(|p| p.timestamp_ns);
         self.identifier_index = fishbowl_transcript::build_identifier_index(events, None);
         self.processed_event_count = events.len();
+    }
+
+    /// Most-recent user prompt with timestamp <= `event_ns`. Returns None
+    /// if no user prompt has been observed in this session yet — uncommon
+    /// for live sessions (the first record is usually a user message) but
+    /// possible during the very-first refresh tick after a fresh start.
+    pub fn most_recent_user_prompt_before(&self, event_ns: i64) -> Option<&UserPromptEntry> {
+        let idx = self
+            .user_prompts
+            .partition_point(|p| p.timestamp_ns <= event_ns);
+        if idx == 0 {
+            return None;
+        }
+        self.user_prompts.get(idx - 1)
     }
 
     /// Most-recent tool_call with timestamp <= `event_ns`. Returns None if no

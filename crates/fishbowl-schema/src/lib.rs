@@ -25,7 +25,19 @@ use serde::{Deserialize, Serialize};
 ///   is still root → immediate parent; PIDs let SIEM rules join the
 ///   chain against `process_exec` events emitted earlier for the same
 ///   ancestors.
-pub const SCHEMA_VERSION: &str = "0.3";
+/// - 0.4: attribution block gains `triggering_command` and
+///   `triggering_prompt` — human-readable denormalizations of "what
+///   tool was Claude asked to run" and "what user prompt led to it".
+///   Both are best-effort: `triggering_command` is null when the
+///   transcript flush race left the engine unable to identify the
+///   triggering tool_call within the confidence window;
+///   `triggering_prompt` is always set when any user prompt exists
+///   before the event (user prompts don't have the flush race that
+///   assistant-side records do). `attributed_tool_call_id` is now also
+///   gated on the same confidence threshold — populated only when the
+///   bound tool_call is recent enough that fishbowl is sure it's the
+///   actual triggering call, null otherwise.
+pub const SCHEMA_VERSION: &str = "0.4";
 
 /// One link in a process's ancestor chain. Same order semantics as the
 /// old `Vec<String>` (root → immediate parent, excludes the event's own
@@ -184,6 +196,26 @@ pub struct Attribution {
 
     /// Milliseconds between the attributed tool call's emit and this event.
     pub time_window_ms: Option<u64>,
+
+    /// Human-readable command from the attributed tool call's input.
+    /// For Bash/PowerShell-style tools this is the literal command
+    /// string the agent typed; for other tools it's the stringified
+    /// tool_input JSON. Null when `attributed_tool_call_id` is null
+    /// (same confidence threshold gates both — see SCHEMA_VERSION
+    /// 0.4 notes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggering_command: Option<String>,
+
+    /// The most recent user-typed prompt in this session before this
+    /// event's timestamp. Always populated when there's any prior user
+    /// prompt — user messages don't have the transcript-flush race
+    /// that delays assistant-side records, so this field is reliable
+    /// even when `attributed_tool_call_id` / `triggering_command` end
+    /// up null. The intent: an analyst reading one event row can see
+    /// the user intent that ultimately led to the kernel observation,
+    /// without doing a SIEM-side temporal join.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggering_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

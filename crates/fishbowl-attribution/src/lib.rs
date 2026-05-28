@@ -398,16 +398,51 @@ impl AttributionEngine {
         let event_ns = session::parse_rfc3339_ns(&event.timestamp).unwrap_or(i64::MAX);
         let tc = session.attribute_at(event_ns);
 
+        // Confidence threshold for tool_call-derived fields. Below this
+        // window the binding is trustworthy; above it, the transcript-
+        // flush race may have left us pointing at a stale prior
+        // tool_call. Make the field semantics honest: populate when
+        // confident, null otherwise. 10s comfortably covers normal
+        // Claude flush cadence (<2s) while still rejecting the
+        // pathological multi-minute cases.
+        const ATTRIBUTION_CONFIDENCE_MS: u64 = 10_000;
+        let (confident_tc, time_window_ms) = match tc {
+            Some(t) => {
+                let win = ((event_ns - t.timestamp_ns).max(0) / 1_000_000) as u64;
+                if win <= ATTRIBUTION_CONFIDENCE_MS {
+                    (Some(t), Some(win))
+                } else {
+                    (None, None)
+                }
+            }
+            None => (None, None),
+        };
+
+        // Most-recent user prompt — always populate when available.
+        // User prompts don't suffer the transcript-flush race that
+        // delays assistant-side records, so this field is reliable
+        // even when the tool_call binding isn't.
+        let triggering_prompt = session
+            .most_recent_user_prompt_before(event_ns)
+            .map(|p| p.text.clone());
+
+        // Extract a human-readable command from the tool_input. For
+        // Bash/PowerShell-style tools that have a `command` field, use
+        // that string; for everything else, the stringified input is
+        // close enough.
+        let triggering_command = confident_tc.map(|t| extract_command(&t.input_text));
+
         match &mut event.kind {
             EventKind::ProcessExec(p) => {
                 let primary_identifier = p.process.cmdline.clone();
-                if let Some(tc) = tc {
+                if let Some(tc) = confident_tc {
                     p.attribution.attributed_tool_call_id = Some(tc.id.clone());
-                    p.attribution.time_window_ms =
-                        Some(((event_ns - tc.timestamp_ns).max(0) / 1_000_000) as u64);
+                    p.attribution.time_window_ms = time_window_ms;
                     p.attribution.requested_by_tool_call =
                         identifiers_appear_in(&primary_identifier, &tc.input_text);
                 }
+                p.attribution.triggering_command = triggering_command;
+                p.attribution.triggering_prompt = triggering_prompt;
                 let origins = session.origins_for_text(&primary_identifier);
                 p.attribution.requested_in_user_message = origins.user_message;
                 p.attribution.requested_in_assistant_message = origins.assistant_message;
@@ -416,13 +451,14 @@ impl AttributionEngine {
             EventKind::CredentialAccess(c) => {
                 let path = c.file_path.clone();
                 let normalized = fishbowl_transcript::normalize(&path, None);
-                if let Some(tc) = tc {
+                if let Some(tc) = confident_tc {
                     c.attribution.attributed_tool_call_id = Some(tc.id.clone());
-                    c.attribution.time_window_ms =
-                        Some(((event_ns - tc.timestamp_ns).max(0) / 1_000_000) as u64);
+                    c.attribution.time_window_ms = time_window_ms;
                     c.attribution.requested_by_tool_call = tc.input_text.contains(&path)
                         || tc.input_text.to_lowercase().contains(&normalized);
                 }
+                c.attribution.triggering_command = triggering_command;
+                c.attribution.triggering_prompt = triggering_prompt;
                 if let Some(entry) = session.identifier_index.entries.get(&normalized) {
                     for o in &entry.origins {
                         match o {
@@ -442,13 +478,14 @@ impl AttributionEngine {
             EventKind::NetworkEgress(n) => {
                 let ip = n.dest_ip.clone();
                 let host = n.dest_host.clone().unwrap_or_default();
-                if let Some(tc) = tc {
+                if let Some(tc) = confident_tc {
                     n.attribution.attributed_tool_call_id = Some(tc.id.clone());
-                    n.attribution.time_window_ms =
-                        Some(((event_ns - tc.timestamp_ns).max(0) / 1_000_000) as u64);
+                    n.attribution.time_window_ms = time_window_ms;
                     n.attribution.requested_by_tool_call = tc.input_text.contains(&ip)
                         || (!host.is_empty() && tc.input_text.contains(&host));
                 }
+                n.attribution.triggering_command = triggering_command;
+                n.attribution.triggering_prompt = triggering_prompt;
                 let mut origins = session.origins_for_text(&ip);
                 if !host.is_empty() {
                     let host_origins = session.origins_for_text(&host);
@@ -550,6 +587,20 @@ fn walk_jsonl(dir: &Path, cb: &mut dyn FnMut(PathBuf)) {
             cb(path);
         }
     }
+}
+
+/// Pull the human-readable command from a tool_call's input. Bash and
+/// PowerShell-style tools nest the command in a `"command"` JSON field;
+/// for everything else, the stringified input is the best we can do.
+/// The intent is `triggering_command` reading as a real command string
+/// for the common case, not as a raw JSON blob.
+fn extract_command(input_text: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(input_text) {
+        if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+            return cmd.to_string();
+        }
+    }
+    input_text.to_string()
 }
 
 /// Extract identifiers from `cmdline` and check whether each appears as a
