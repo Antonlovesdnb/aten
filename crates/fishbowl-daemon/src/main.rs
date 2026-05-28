@@ -19,6 +19,59 @@ use clap::{Parser, Subcommand};
 
 use fishbowl_schema::Platform;
 
+mod config;
+
+/// Merged inputs for a daemon run, after layering CLI flags over the
+/// config file. Returned from `resolve_daemon_inputs` so the two
+/// platform-specific `run_daemon` impls share parsing logic.
+struct DaemonInputs {
+    /// Transcript files + directories the engine will read.
+    transcript_paths: Vec<PathBuf>,
+    /// Image basenames (Windows) or `comm` strings (Linux) to enroll.
+    agents: Vec<String>,
+    /// Where to write the event JSONL. `None` = stdout.
+    out_path: Option<PathBuf>,
+}
+
+/// Merge config file + CLI flags into a single set of daemon inputs.
+/// Precedence: CLI flag > config file > built-in default.
+fn resolve_daemon_inputs(
+    config_path: Option<PathBuf>,
+    cli_transcripts: Vec<PathBuf>,
+    cli_watch_dirs: Vec<PathBuf>,
+    cli_agents: Option<Vec<String>>,
+    cli_out: Option<PathBuf>,
+    default_agents: &[&str],
+) -> Result<DaemonInputs> {
+    let cfg_path = config_path.unwrap_or_else(config::default_config_path);
+    let cfg = config::ConfigFile::load_or_default(&cfg_path)
+        .with_context(|| format!("loading config {}", cfg_path.display()))?;
+
+    let mut transcript_paths: Vec<PathBuf> = Vec::new();
+    transcript_paths.extend(cfg.transcripts.files);
+    transcript_paths.extend(cfg.transcripts.watch_dirs);
+    transcript_paths.extend(cli_transcripts);
+    transcript_paths.extend(cli_watch_dirs);
+
+    let agents = cli_agents
+        .or_else(|| {
+            if cfg.daemon.agents.is_empty() {
+                None
+            } else {
+                Some(cfg.daemon.agents)
+            }
+        })
+        .unwrap_or_else(|| default_agents.iter().map(|s| s.to_string()).collect());
+
+    let out_path = cli_out.or(cfg.output.file_path);
+
+    Ok(DaemonInputs {
+        transcript_paths,
+        agents,
+        out_path,
+    })
+}
+
 #[derive(Parser)]
 #[command(name = "fishbowl", version, about = "fishbowl-v2 daemon CLI")]
 struct Cli {
@@ -78,21 +131,39 @@ enum Command {
     /// On Linux uses eBPF (needs root or CAP_BPF+CAP_PERFMON); on Windows uses
     /// ETW (needs admin). Same subcommand on both platforms; the build picks
     /// the right collector via `cfg(target_os = ...)`.
+    ///
+    /// Transcript sources are merged from three places (later overrides):
+    /// the config file (`[transcripts] watch_dirs = [...]`, `files = [...]`),
+    /// then any `--watch-dir` and `--transcript` flags on the command line.
+    /// All of them are passed to the attribution engine as a single list.
     Daemon {
-        /// Path to a Claude Code session transcript JSONL. The daemon binds
-        /// kernel-side events to this session by matching the agent root
-        /// process's cwd against the transcript's recorded cwd.
+        /// TOML config path. Defaults to the platform install location
+        /// (`%ProgramData%\fishbowl\config.toml` on Windows). Missing
+        /// file is OK — treated as an empty config.
         #[arg(long)]
-        transcript: PathBuf,
-        /// Process names to enroll as agent roots. Comma-separated. On Linux
-        /// matches `comm` (e.g. `claude,cursor,codex`); on Windows matches
-        /// image basename (e.g. `claude.exe,cursor.exe,codex.exe`).
+        config: Option<PathBuf>,
+        /// Add a transcript JSONL file to attribute against. Repeatable.
+        /// Single-session pinning convenience; service mode uses watch
+        /// directories instead.
+        #[arg(long)]
+        transcript: Vec<PathBuf>,
+        /// Add a directory to scan recursively for `*.jsonl` transcripts.
+        /// Repeatable. Use this to point at `~/.claude/projects` and
+        /// `~/.codex/sessions` for ambient multi-session capture.
+        #[arg(long)]
+        watch_dir: Vec<PathBuf>,
+        /// Process names to enroll as agent roots. Comma-separated.
+        /// Overrides config file. On Linux matches `comm` (e.g.
+        /// `claude,cursor,codex`); on Windows matches image basename
+        /// (e.g. `claude.exe,cursor.exe,codex.exe`).
         #[arg(long, value_delimiter = ',')]
         agents: Option<Vec<String>>,
-        /// Stop after this many seconds.
+        /// Stop after this many seconds. Default: run until SIGINT / Ctrl-C.
         #[arg(long)]
         duration_secs: Option<u64>,
-        /// Append emitted events as JSONL to this file. Default: stdout.
+        /// Append emitted events as JSONL to this file. Overrides config
+        /// file. Default if neither is set: stdout (CLI) or the platform
+        /// default events.jsonl path (service mode).
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -120,11 +191,13 @@ fn main() -> Result<()> {
             out,
         } => run_collect_linux(agents, duration_secs, out)?,
         Command::Daemon {
+            config,
             transcript,
+            watch_dir,
             agents,
             duration_secs,
             out,
-        } => run_daemon(transcript, agents, duration_secs, out)?,
+        } => run_daemon(config, transcript, watch_dir, agents, duration_secs, out)?,
         #[cfg(target_os = "windows")]
         Command::CollectWindows {
             agents,
@@ -137,7 +210,9 @@ fn main() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn run_daemon(
-    transcript: PathBuf,
+    config_path: Option<PathBuf>,
+    transcripts: Vec<PathBuf>,
+    watch_dirs: Vec<PathBuf>,
     agents: Option<Vec<String>>,
     duration_secs: Option<u64>,
     out: Option<PathBuf>,
@@ -149,10 +224,17 @@ fn run_daemon(
 
     use fishbowl_attribution::{AttributionEngine, EngineConfig};
 
+    let inputs = resolve_daemon_inputs(
+        config_path,
+        transcripts,
+        watch_dirs,
+        agents,
+        out,
+        &["claude.exe", "cursor.exe", "codex.exe"],
+    )?;
+
     let cfg = fishbowl_collector_windows::CollectorConfig {
-        enrolled_agents: agents.unwrap_or_else(|| {
-            vec!["claude.exe".into(), "cursor.exe".into(), "codex.exe".into()]
-        }),
+        enrolled_agents: inputs.agents.clone(),
         host_id: read_machine_guid_windows(),
     };
 
@@ -166,10 +248,10 @@ fn run_daemon(
     // queryable via /proc) to a transcript session by cwd match.
     let engine = Arc::new(Mutex::new(AttributionEngine::new(EngineConfig {
         cwd_for_pid: windows_cwd_for_pid,
-        dialect: fishbowl_transcript::detect_dialect_from_path(&transcript),
-        transcript_path: transcript.clone(),
+        transcript_paths: inputs.transcript_paths.clone(),
     })));
     engine.lock().expect("engine lock").refresh()?;
+    let loaded = engine.lock().expect("engine lock").session_count();
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -184,16 +266,27 @@ fn run_daemon(
         });
     }
 
-    let sink: Box<dyn Write + Send> = match out {
-        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
+    let sink: Box<dyn Write + Send> = match inputs.out_path {
+        Some(ref path) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            Box::new(std::io::BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            ))
+        }
         None => Box::new(std::io::BufWriter::new(std::io::stdout())),
     };
     let sink = Arc::new(Mutex::new(sink));
 
     eprintln!(
-        "fishbowl daemon starting (agents = {:?}, transcript = {})",
+        "fishbowl daemon starting (agents = {:?}, transcript sources = {}, sessions loaded = {})",
         cfg.enrolled_agents,
-        transcript.display()
+        inputs.transcript_paths.len(),
+        loaded,
     );
 
     let refresh_every = Duration::from_millis(500);
@@ -420,7 +513,9 @@ fn read_machine_id() -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn run_daemon(
-    transcript: PathBuf,
+    config_path: Option<PathBuf>,
+    transcripts: Vec<PathBuf>,
+    watch_dirs: Vec<PathBuf>,
     agents: Option<Vec<String>>,
     duration_secs: Option<u64>,
     out: Option<PathBuf>,
@@ -433,21 +528,28 @@ fn run_daemon(
 
     use fishbowl_attribution::{AttributionEngine, EngineConfig};
 
+    let inputs = resolve_daemon_inputs(
+        config_path,
+        transcripts,
+        watch_dirs,
+        agents,
+        out,
+        &["claude", "cursor", "codex"],
+    )?;
+
     let cfg = fishbowl_collector_linux::CollectorConfig {
-        enrolled_agents: agents.unwrap_or_else(|| {
-            vec!["claude".into(), "cursor".into(), "codex".into()]
-        }),
+        enrolled_agents: inputs.agents.clone(),
         host_id: read_machine_id(),
     };
 
-    // Build the attribution engine and seed it from the transcript.
+    // Build the attribution engine and seed it from the transcript paths.
     let engine = AttributionEngine::new(EngineConfig {
         cwd_for_pid: fishbowl_attribution::default_cwd_for_pid,
-        dialect: fishbowl_transcript::detect_dialect_from_path(&transcript),
-        transcript_path: transcript.clone(),
+        transcript_paths: inputs.transcript_paths.clone(),
     });
     let engine = RefCell::new(engine);
     engine.borrow_mut().refresh()?;
+    let loaded = engine.borrow().session_count();
 
     let stop = Arc::new(AtomicBool::new(false));
     install_signal_handlers(&stop);
@@ -459,8 +561,18 @@ fn run_daemon(
         });
     }
 
-    let sink: Box<dyn Write + Send> = match out {
-        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
+    let sink: Box<dyn Write + Send> = match inputs.out_path {
+        Some(ref path) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            Box::new(std::io::BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            ))
+        }
         None => Box::new(std::io::BufWriter::new(std::io::stdout())),
     };
     let sink = std::sync::Mutex::new(sink);
@@ -469,9 +581,10 @@ fn run_daemon(
     let last_refresh = std::cell::Cell::new(Instant::now());
 
     eprintln!(
-        "fishbowl daemon starting (agents = {:?}, transcript = {})",
+        "fishbowl daemon starting (agents = {:?}, transcript sources = {}, sessions loaded = {})",
         cfg.enrolled_agents,
-        transcript.display()
+        inputs.transcript_paths.len(),
+        loaded,
     );
 
     fishbowl_collector_linux::run_with_tick(

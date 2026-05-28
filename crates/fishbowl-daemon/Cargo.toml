@@ -17,6 +17,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+toml = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fishbowl-collector-linux = { workspace = true }

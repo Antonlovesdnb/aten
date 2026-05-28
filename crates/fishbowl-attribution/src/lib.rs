@@ -1,29 +1,35 @@
 //! fishbowl-v2 attribution engine.
 //!
 //! Stitches transcript-side state (prompts, tool_calls, tool_results,
-//! identifier-origin index) to kernel-side events (process_exec, eventually
-//! credential_access and network_egress) so that each emitted event arrives
+//! identifier-origin index) to kernel-side events (process_exec,
+//! credential_access, network_egress) so that each emitted event arrives
 //! with `attributed_tool_call_id` and the four `requested_*` booleans
 //! populated.
 //!
-//! Operating model for v0.x:
-//! - The engine is configured with a single transcript file (one Claude Code
-//!   session). Multi-session support is deferred — needs file watching and
-//!   per-cwd session resolution that's out of scope for this milestone.
-//! - On startup the engine parses the transcript and builds SessionState.
-//! - `refresh()` is called periodically to fold in new transcript records.
-//! - `attribute(&mut event)` mutates a kernel-side event in place: binds it
-//!   to the session by matching `agent_root_pid`'s `/proc/<pid>/cwd` against
-//!   the session's recorded cwd (cached after first successful match), then
-//!   sets the attribution booleans using the most-recent tool_call's args
-//!   plus the identifier-origin index.
+//! Operating model:
+//! - The engine is configured with a list of transcript *paths* — either
+//!   individual JSONL files or directories that are recursively scanned
+//!   for `*.jsonl`. Both Claude Code (`~/.claude/projects/`) and Codex
+//!   (`~/.codex/sessions/`) directory layouts are supported; dialect is
+//!   auto-detected per file from its path.
+//! - On each `refresh()` tick the engine walks every configured path,
+//!   checks each `.jsonl` file's mtime, and re-parses any that changed.
+//!   Per-session state is keyed by transcript-recorded `session_id` and
+//!   kept in a `HashMap`, so multiple concurrent Claude / Codex sessions
+//!   can be attributed against from the same daemon instance.
+//! - `attribute(&mut event)` mutates a kernel-side event in place: looks
+//!   up the agent_root_pid's cwd via the platform-specific
+//!   `cwd_for_pid` resolver, finds whichever session's cwd matches, then
+//!   sets the attribution booleans from that session's most-recent
+//!   tool_call and identifier-origin index.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use fishbowl_schema::{Event, EventKind};
-use fishbowl_transcript::TranscriptDialect;
+use fishbowl_transcript::{detect_dialect_from_path, TranscriptDialect};
 
 pub mod session;
 
@@ -31,7 +37,18 @@ use session::SessionState;
 
 #[derive(Clone)]
 pub struct EngineConfig {
-    pub transcript_path: PathBuf,
+    /// One or more transcript sources. Each entry can be either:
+    /// - A path to a single transcript JSONL file (single-session mode,
+    ///   used by the legacy `--transcript` daemon flag and the
+    ///   `fishbowl transcript` subcommand)
+    /// - A path to a directory which is recursively scanned for
+    ///   `*.jsonl` files. The service-mode config typically lists
+    ///   `~/.claude/projects/` and `~/.codex/sessions/` here, and the
+    ///   engine picks up every session inside.
+    ///
+    /// Empty vec = no transcripts loaded; the engine still runs (events
+    /// pass through unattributed). Useful for kernel-only deployment.
+    pub transcript_paths: Vec<PathBuf>,
     /// Function used to resolve the cwd of an agent-root process, called
     /// at attribution time. The default implementation reads
     /// `/proc/<pid>/cwd` — correct on Linux, returns `None` on Windows
@@ -39,18 +56,13 @@ pub struct EngineConfig {
     /// PEB-walk-based resolver from `fishbowl_collector_windows::query_cwd`
     /// so the engine stays platform-agnostic.
     pub cwd_for_pid: fn(i32) -> Option<String>,
-    /// Which transcript dialect to parse. The daemon picks this from the
-    /// transcript path (`~/.claude/...` vs `~/.codex/...`); the engine
-    /// itself just dispatches to the right parser.
-    pub dialect: TranscriptDialect,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            transcript_path: PathBuf::new(),
+            transcript_paths: Vec::new(),
             cwd_for_pid: default_cwd_for_pid,
-            dialect: TranscriptDialect::ClaudeCode,
         }
     }
 }
@@ -71,11 +83,19 @@ pub fn default_cwd_for_pid(pid: i32) -> Option<String> {
     }
 }
 
+#[derive(Debug)]
+struct FileMeta {
+    mtime: SystemTime,
+}
+
 pub struct AttributionEngine {
     cfg: EngineConfig,
-    session: Option<SessionState>,
-    /// Resolved agent_root_pid → session_id binding. Populated lazily on the
-    /// first kernel event whose process cwd matches the session's cwd.
+    sessions: HashMap<String, SessionState>,
+    /// File mtime cache. Lets refresh() skip re-reading transcripts whose
+    /// on-disk timestamp hasn't moved since last refresh.
+    file_meta: HashMap<PathBuf, FileMeta>,
+    /// Resolved agent_root_pid → session_id binding. Populated lazily on
+    /// the first kernel event whose process cwd matches a session's cwd.
     pid_bindings: HashMap<i32, String>,
 }
 
@@ -83,47 +103,80 @@ impl AttributionEngine {
     pub fn new(cfg: EngineConfig) -> Self {
         Self {
             cfg,
-            session: None,
+            sessions: HashMap::new(),
+            file_meta: HashMap::new(),
             pid_bindings: HashMap::new(),
         }
     }
 
-    /// Read the transcript, build (or update) the per-session state. Call this
-    /// on startup and on each refresh tick.
+    /// Walk all configured transcript paths, load any new or modified
+    /// JSONL files, fold their events into the matching SessionState.
+    /// Called on startup and on every poll tick (~500 ms in the daemon).
     pub fn refresh(&mut self) -> Result<()> {
-        let (session_id, events) =
-            session::load_sessions_from_file(&self.cfg.transcript_path, self.cfg.dialect)?;
-        if session_id.is_empty() {
-            return Ok(());
+        for path in self.cfg.transcript_paths.clone() {
+            self.refresh_path(&path);
         }
-        let cwd = session::cwd_from_transcript_raw(&self.cfg.transcript_path, self.cfg.dialect);
-        match &mut self.session {
-            Some(state) if state.session_id == session_id => {
+        Ok(())
+    }
+
+    fn refresh_path(&mut self, path: &Path) {
+        match std::fs::metadata(path) {
+            Ok(md) if md.is_file() => {
+                self.refresh_file(path.to_path_buf(), md.modified().ok());
+            }
+            Ok(md) if md.is_dir() => {
+                walk_jsonl(path, &mut |file| {
+                    let mtime = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+                    self.refresh_file(file, mtime);
+                });
+            }
+            _ => {} // path doesn't exist yet — fine, will appear later
+        }
+    }
+
+    fn refresh_file(&mut self, file: PathBuf, mtime: Option<SystemTime>) {
+        // Skip files we've already loaded that haven't changed.
+        if let (Some(meta), Some(mt)) = (self.file_meta.get(&file), mtime) {
+            if meta.mtime >= mt {
+                return;
+            }
+        }
+
+        let dialect = detect_dialect_from_path(&file);
+        let (session_id, events) = match session::load_sessions_from_file(&file, dialect) {
+            Ok(x) => x,
+            Err(_) => return, // unreadable / mid-write — try again next tick
+        };
+        if session_id.is_empty() {
+            return;
+        }
+        let cwd = session::cwd_from_transcript_raw(&file, dialect);
+
+        match self.sessions.get_mut(&session_id) {
+            Some(state) => {
                 state.refresh(&events);
                 if state.cwd.is_none() {
                     state.cwd = cwd;
                 }
             }
-            _ => {
-                self.session = Some(SessionState::from_events(session_id, &events, cwd));
+            None => {
+                self.sessions.insert(
+                    session_id.clone(),
+                    SessionState::from_events(session_id.clone(), &events, cwd),
+                );
             }
         }
-        Ok(())
+        if let Some(mt) = mtime {
+            self.file_meta.insert(file, FileMeta { mtime: mt });
+        }
+        let _ = session_id; // moved into the SessionState above
     }
 
-    /// Mutate a kernel-side event in place to fill in attribution. Currently
-    /// handles `ProcessExec`; the same approach will extend to
-    /// `CredentialAccess`, `NetworkEgress`, and `FileWrite` as those probes
-    /// come online.
+    /// Mutate a kernel-side event in place to fill in attribution. Looks
+    /// up the event's agent_root_pid → session binding, then sets the
+    /// tool_call ID, time window, and four `requested_*` booleans from
+    /// the matched session's state.
     pub fn attribute(&mut self, event: &mut Event) {
-        // Snapshot the bits of session state we need for the binding decision
-        // up front so we don't hold a borrow on `self.session` while we mutate
-        // `self.pid_bindings`. Cheap clones (a Uuid string and an Option<cwd>).
-        let (session_id, session_cwd) = match &self.session {
-            Some(s) => (s.session_id.clone(), s.cwd.clone()),
-            None => return,
-        };
-
         let agent_root_pid = match &event.kind {
             EventKind::ProcessExec(p) => p.process.agent_root_pid,
             EventKind::CredentialAccess(c) => c.process.agent_root_pid,
@@ -132,21 +185,13 @@ impl AttributionEngine {
             _ => None,
         };
 
-        let bound_session = match agent_root_pid {
-            Some(pid) => self.resolve_session_for_pid(pid, &session_id, session_cwd.as_deref()),
-            None => None,
-        };
-
-        let Some(sid) = bound_session else {
-            // Without a session binding, attribution stays empty — we still
-            // emit the event so the join can happen later in the SIEM.
+        let Some(pid) = agent_root_pid else { return };
+        let Some(session_id) = self.resolve_session_for_pid(pid) else {
             return;
         };
-        event.session_id = Some(sid);
+        event.session_id = Some(session_id.clone());
 
-        // Now we can re-borrow `self.session` immutably for the rest of the
-        // attribution work; the binding-cache mutation is done.
-        let Some(session) = &self.session else {
+        let Some(session) = self.sessions.get(&session_id) else {
             return;
         };
 
@@ -169,25 +214,15 @@ impl AttributionEngine {
                 p.attribution.requested_in_tool_result = origins.tool_result;
             }
             EventKind::CredentialAccess(c) => {
-                // For credential_access the primary identifier is the file_path
-                // itself — there's no haystack to extract from. We still run it
-                // through the same normalization used for the origin index so
-                // matches against transcript-side mentions of the same path
-                // (which may have used `~/...` or different casing) hit.
                 let path = c.file_path.clone();
                 let normalized = fishbowl_transcript::normalize(&path, None);
                 if let Some(tc) = tc {
                     c.attribution.attributed_tool_call_id = Some(tc.id.clone());
                     c.attribution.time_window_ms =
                         Some(((event_ns - tc.timestamp_ns).max(0) / 1_000_000) as u64);
-                    // Tool-call args may reference the path verbatim, in ~/
-                    // form, or by relative path. Substring-match in both the
-                    // raw and normalized forms.
                     c.attribution.requested_by_tool_call = tc.input_text.contains(&path)
                         || tc.input_text.to_lowercase().contains(&normalized);
                 }
-                // Identifier-origin lookup: use the normalized path as the key
-                // (origin index stores normalized identifiers).
                 if let Some(entry) = session.identifier_index.entries.get(&normalized) {
                     for o in &entry.origins {
                         match o {
@@ -205,22 +240,14 @@ impl AttributionEngine {
                 }
             }
             EventKind::NetworkEgress(n) => {
-                // Primary identifier for an egress event is the IP and the
-                // hostname (when known). We check whatever's populated: the
-                // tool_call's input or any prompt may reference either form.
-                // Without TLS SNI capture, dest_host is None for v0.x; the
-                // attribution falls back to IP-only matching, which is what
-                // the malicious-npm demo needs (the user's prompt did not
-                // mention the beacon IP).
                 let ip = n.dest_ip.clone();
                 let host = n.dest_host.clone().unwrap_or_default();
                 if let Some(tc) = tc {
                     n.attribution.attributed_tool_call_id = Some(tc.id.clone());
                     n.attribution.time_window_ms =
                         Some(((event_ns - tc.timestamp_ns).max(0) / 1_000_000) as u64);
-                    n.attribution.requested_by_tool_call =
-                        tc.input_text.contains(&ip)
-                            || (!host.is_empty() && tc.input_text.contains(&host));
+                    n.attribution.requested_by_tool_call = tc.input_text.contains(&ip)
+                        || (!host.is_empty() && tc.input_text.contains(&host));
                 }
                 let mut origins = session.origins_for_text(&ip);
                 if !host.is_empty() {
@@ -233,38 +260,69 @@ impl AttributionEngine {
                 n.attribution.requested_in_assistant_message = origins.assistant_message;
                 n.attribution.requested_in_tool_result = origins.tool_result;
             }
-            // FileWrite probe still pending.
             _ => {}
         }
     }
 
-    fn resolve_session_for_pid(
-        &mut self,
-        agent_root_pid: i32,
-        session_id: &str,
-        session_cwd: Option<&str>,
-    ) -> Option<String> {
+    /// Resolve which session an agent_root_pid belongs to by matching the
+    /// process's cwd (queried via the platform-specific resolver) against
+    /// each loaded session's recorded cwd. Caches the answer on success
+    /// so subsequent events from the same pid take the fast path.
+    ///
+    /// Normalization (lowercase + forward-slash) absorbs case / separator
+    /// differences between the live cwd and the transcript cwd —
+    /// `C:\Users\…` vs `c:\users\…` vs `C:/Users/…` all match.
+    fn resolve_session_for_pid(&mut self, agent_root_pid: i32) -> Option<String> {
         if let Some(sid) = self.pid_bindings.get(&agent_root_pid) {
             return Some(sid.clone());
         }
-        let session_cwd = session_cwd?;
-        if session_cwd.is_empty() {
+        let proc_cwd = (self.cfg.cwd_for_pid)(agent_root_pid)?;
+        let a = norm_cwd(&proc_cwd);
+        if a.is_empty() {
             return None;
         }
-        let proc_cwd = (self.cfg.cwd_for_pid)(agent_root_pid)?;
-        // Match either exact or one is a path prefix of the other to absorb
-        // symlink resolution variance on Linux, and to absorb minor case /
-        // separator differences on Windows where DosPath may come back with
-        // a different case than the transcript-recorded cwd. Simple string
-        // compare in lowercase for cross-platform robustness.
-        let a = proc_cwd.to_lowercase().replace('\\', "/");
-        let b = session_cwd.to_lowercase().replace('\\', "/");
-        if a == b || a.starts_with(&b) || b.starts_with(&a) {
-            self.pid_bindings
-                .insert(agent_root_pid, session_id.to_string());
-            Some(session_id.to_string())
-        } else {
-            None
+        for (sid, state) in &self.sessions {
+            let Some(cwd) = state.cwd.as_deref() else {
+                continue;
+            };
+            let b = norm_cwd(cwd);
+            if b.is_empty() {
+                continue;
+            }
+            if a == b || a.starts_with(&b) || b.starts_with(&a) {
+                self.pid_bindings.insert(agent_root_pid, sid.clone());
+                return Some(sid.clone());
+            }
+        }
+        None
+    }
+
+    /// How many transcript sessions are currently loaded. Useful for
+    /// service startup logging.
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+}
+
+fn norm_cwd(s: &str) -> String {
+    s.to_lowercase().replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+/// Recursively walk `dir`, invoking `cb` for every `*.jsonl` file. No
+/// follow-symlinks. Errors (permission denied on a subdir, etc.) are
+/// swallowed silently — the daemon-tick loop should be robust to
+/// transient filesystem hiccups.
+fn walk_jsonl(dir: &Path, cb: &mut dyn FnMut(PathBuf)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            walk_jsonl(&path, cb);
+        } else if ft.is_file() && path.extension().map_or(false, |e| e == "jsonl") {
+            cb(path);
         }
     }
 }
@@ -301,5 +359,12 @@ mod tests {
             "cat /home/anton/.aws/credentials",
             r#"{"command": "npm install lodash"}"#,
         ));
+    }
+
+    #[test]
+    fn cwd_normalization_absorbs_case_and_separator() {
+        assert_eq!(norm_cwd(r"C:\Users\Anton\Proj"), "c:/users/anton/proj");
+        assert_eq!(norm_cwd("/home/anton/proj/"), "/home/anton/proj");
+        assert_eq!(norm_cwd("C:/Users/Anton/Proj/"), "c:/users/anton/proj");
     }
 }
