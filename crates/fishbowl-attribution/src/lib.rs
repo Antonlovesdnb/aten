@@ -371,6 +371,14 @@ impl AttributionEngine {
     /// Normalization (lowercase + forward-slash) absorbs case / separator
     /// differences between the live cwd and the transcript cwd —
     /// `C:\Users\…` vs `c:\users\…` vs `C:/Users/…` all match.
+    ///
+    /// **Tie-break when multiple sessions match the same cwd**: this is
+    /// common in practice because users open Claude Code multiple times
+    /// in the same project directory; the old transcript files stay
+    /// around on disk. The active session (the one actually generating
+    /// kernel events right now) is identified by having the most-recent
+    /// tool_call timestamp. We pick that one; sessions with no tool_calls
+    /// at all are treated as least-recent (effectively "stale").
     fn resolve_session_for_pid(&mut self, agent_root_pid: i32) -> Option<String> {
         if let Some(sid) = self.pid_bindings.get(&agent_root_pid) {
             return Some(sid.clone());
@@ -380,6 +388,11 @@ impl AttributionEngine {
         if a.is_empty() {
             return None;
         }
+
+        // Collect every session whose cwd matches, paired with its
+        // latest tool_call timestamp. i64::MIN sorts sessions-with-no-
+        // tool_calls last so they only win when nothing else matches.
+        let mut candidates: Vec<(&String, i64)> = Vec::new();
         for (sid, state) in &self.sessions {
             let Some(cwd) = state.cwd.as_deref() else {
                 continue;
@@ -389,11 +402,23 @@ impl AttributionEngine {
                 continue;
             }
             if a == b || a.starts_with(&b) || b.starts_with(&a) {
-                self.pid_bindings.insert(agent_root_pid, sid.clone());
-                return Some(sid.clone());
+                let latest_tc = state
+                    .tool_calls
+                    .last()
+                    .map(|tc| tc.timestamp_ns)
+                    .unwrap_or(i64::MIN);
+                candidates.push((sid, latest_tc));
             }
         }
-        None
+
+        // Pick the session whose latest tool_call is most recent. Stable
+        // tie-break by session_id so behavior is deterministic if two
+        // sessions happen to have identical latest-tool_call timestamps
+        // (rare but possible — multi-record transcripts can share ns).
+        candidates.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0)));
+        let winner = candidates.first().map(|(sid, _)| (*sid).clone())?;
+        self.pid_bindings.insert(agent_root_pid, winner.clone());
+        Some(winner)
     }
 
     /// How many transcript sessions are currently loaded. Useful for
