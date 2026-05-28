@@ -97,44 +97,73 @@ pub struct AttributionEngine {
     /// Resolved agent_root_pid → session_id binding. Populated lazily on
     /// the first kernel event whose process cwd matches a session's cwd.
     pid_bindings: HashMap<i32, String>,
+    /// Engine creation time (RFC 3339 ns). Transcript events with a
+    /// timestamp older than this are loaded into SessionState for
+    /// attribution context but NOT returned from `refresh()` — the
+    /// daemon only wants to emit prompts / tool_calls / tool_results
+    /// that happened *while it was running*, not the historical record
+    /// of every session that existed on disk at startup.
+    start_time_ns: i64,
 }
 
 impl AttributionEngine {
     pub fn new(cfg: EngineConfig) -> Self {
+        let start_time_ns = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(i64::MIN);
         Self {
             cfg,
             sessions: HashMap::new(),
             file_meta: HashMap::new(),
             pid_bindings: HashMap::new(),
+            start_time_ns,
         }
     }
 
     /// Walk all configured transcript paths, load any new or modified
     /// JSONL files, fold their events into the matching SessionState.
     /// Called on startup and on every poll tick (~500 ms in the daemon).
-    pub fn refresh(&mut self) -> Result<()> {
+    ///
+    /// Returns transcript events that are both **new since the previous
+    /// refresh of that file** and **newer than the engine's start time**.
+    /// The daemon emits these to its output sink alongside kernel events,
+    /// giving a unified prompt-and-syscall stream. Historic transcript
+    /// content (sessions that already existed on disk at startup) is
+    /// silently absorbed into SessionState for attribution context but
+    /// not re-emitted — restarting the service shouldn't replay history.
+    pub fn refresh(&mut self) -> Result<Vec<Event>> {
+        let mut new_events: Vec<Event> = Vec::new();
         for path in self.cfg.transcript_paths.clone() {
-            self.refresh_path(&path);
+            self.refresh_path(&path, &mut new_events);
         }
-        Ok(())
+        Ok(new_events)
     }
 
-    fn refresh_path(&mut self, path: &Path) {
+    fn refresh_path(&mut self, path: &Path, new_events: &mut Vec<Event>) {
         match std::fs::metadata(path) {
             Ok(md) if md.is_file() => {
-                self.refresh_file(path.to_path_buf(), md.modified().ok());
+                self.refresh_file(path.to_path_buf(), md.modified().ok(), new_events);
             }
             Ok(md) if md.is_dir() => {
+                let mut files: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
                 walk_jsonl(path, &mut |file| {
                     let mtime = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
-                    self.refresh_file(file, mtime);
+                    files.push((file, mtime));
                 });
+                for (file, mtime) in files {
+                    self.refresh_file(file, mtime, new_events);
+                }
             }
             _ => {} // path doesn't exist yet — fine, will appear later
         }
     }
 
-    fn refresh_file(&mut self, file: PathBuf, mtime: Option<SystemTime>) {
+    fn refresh_file(
+        &mut self,
+        file: PathBuf,
+        mtime: Option<SystemTime>,
+        new_events: &mut Vec<Event>,
+    ) {
         // Skip files we've already loaded that haven't changed.
         if let (Some(meta), Some(mt)) = (self.file_meta.get(&file), mtime) {
             if meta.mtime >= mt {
@@ -151,6 +180,14 @@ impl AttributionEngine {
             return;
         }
         let cwd = session::cwd_from_transcript_raw(&file, dialect);
+
+        // Capture the "previous cursor" before mutating SessionState, so
+        // we can slice out events that are new in *this* refresh tick.
+        let prev_cursor = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.processed_event_count)
+            .unwrap_or(0);
 
         match self.sessions.get_mut(&session_id) {
             Some(state) => {
@@ -169,7 +206,19 @@ impl AttributionEngine {
         if let Some(mt) = mtime {
             self.file_meta.insert(file, FileMeta { mtime: mt });
         }
-        let _ = session_id; // moved into the SessionState above
+
+        // Emit only the events past the prior cursor AND newer than the
+        // engine's startup time. The startup-time filter is what makes a
+        // service restart cheap: existing transcripts get folded into
+        // SessionState but their historical contents don't replay to the
+        // output sink.
+        for ev in events.iter().skip(prev_cursor) {
+            if let Some(ts_ns) = session::parse_rfc3339_ns(&ev.timestamp) {
+                if ts_ns >= self.start_time_ns {
+                    new_events.push(ev.clone());
+                }
+            }
+        }
     }
 
     /// Mutate a kernel-side event in place to fill in attribution. Looks

@@ -301,7 +301,10 @@ pub(crate) fn run_daemon_loop_windows(
         cwd_for_pid: windows_cwd_for_pid,
         transcript_paths: inputs.transcript_paths.clone(),
     })));
-    engine.lock().expect("engine lock").refresh()?;
+    // Initial refresh: load every transcript file on disk into SessionState
+    // for attribution context. The returned Vec is empty because every
+    // event's timestamp is older than the engine's just-set start_time_ns.
+    let _ = engine.lock().expect("engine lock").refresh()?;
     let loaded = engine.lock().expect("engine lock").session_count();
 
     let sink: Box<dyn Write + Send> = match inputs.out_path {
@@ -348,8 +351,19 @@ pub(crate) fn run_daemon_loop_windows(
         },
         || {
             if last_refresh.get().elapsed() >= refresh_every {
-                if let Err(e) = engine.lock().expect("engine lock").refresh() {
-                    eprintln!("transcript refresh failed: {e}");
+                match engine.lock().expect("engine lock").refresh() {
+                    Ok(new_events) => {
+                        if !new_events.is_empty() {
+                            let mut s = sink.lock().expect("sink lock");
+                            for ev in new_events {
+                                if let Ok(line) = serde_json::to_string(&ev) {
+                                    let _ = writeln!(s, "{line}");
+                                }
+                            }
+                            let _ = s.flush();
+                        }
+                    }
+                    Err(e) => eprintln!("transcript refresh failed: {e}"),
                 }
                 last_refresh.set(Instant::now());
             }
@@ -429,6 +443,16 @@ fn windows_cwd_for_pid(pid: i32) -> Option<String> {
 fn read_machine_guid_windows() -> Option<String> {
     // HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid. Returns None if the
     // registry call fails (e.g. unusual ACLs); the envelope just stays empty.
+    //
+    // `reg query` output looks like:
+    //   <blank>
+    //   HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography
+    //       MachineGuid    REG_SZ    a1b2c3d4-...
+    //
+    // Find the value line specifically (the one containing both the value
+    // name and the type marker) and pull the last whitespace-separated
+    // token. A previous version naïvely returned the first ">30 char" token
+    // it saw — which was the registry KEY path on line 2, not the GUID.
     std::process::Command::new("reg")
         .args([
             "query",
@@ -441,7 +465,8 @@ fn read_machine_guid_windows() -> Option<String> {
         .and_then(|out| {
             let text = String::from_utf8_lossy(&out.stdout);
             text.lines()
-                .find_map(|l| l.split_whitespace().last().map(str::to_string))
+                .find(|l| l.contains("MachineGuid") && l.contains("REG_SZ"))
+                .and_then(|l| l.split_whitespace().last().map(str::to_string))
                 .filter(|s| s.len() > 30)
         })
 }
@@ -586,7 +611,10 @@ fn run_daemon(
         transcript_paths: inputs.transcript_paths.clone(),
     });
     let engine = RefCell::new(engine);
-    engine.borrow_mut().refresh()?;
+    // Initial refresh — loads transcript history into SessionState for
+    // attribution; returned Vec is empty (every event is older than
+    // start_time_ns).
+    let _ = engine.borrow_mut().refresh()?;
     let loaded = engine.borrow().session_count();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -638,8 +666,19 @@ fn run_daemon(
         },
         || {
             if last_refresh.get().elapsed() >= refresh_every {
-                if let Err(e) = engine.borrow_mut().refresh() {
-                    eprintln!("transcript refresh failed: {e}");
+                match engine.borrow_mut().refresh() {
+                    Ok(new_events) => {
+                        if !new_events.is_empty() {
+                            let mut s = sink.lock().expect("sink lock");
+                            for ev in new_events {
+                                if let Ok(line) = serde_json::to_string(&ev) {
+                                    let _ = writeln!(s, "{line}");
+                                }
+                            }
+                            let _ = s.flush();
+                        }
+                    }
+                    Err(e) => eprintln!("transcript refresh failed: {e}"),
                 }
                 last_refresh.set(Instant::now());
             }
