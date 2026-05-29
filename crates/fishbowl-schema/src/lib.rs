@@ -76,6 +76,7 @@ pub struct Event {
 pub enum Platform {
     Linux,
     Windows,
+    Macos,
 }
 
 /// Debug-only provenance — never read by detection logic.

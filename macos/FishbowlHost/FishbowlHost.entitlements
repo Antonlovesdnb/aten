@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Host-app entitlements. `system-extension.install` lets the app submit an
+     OSSystemExtensionRequest. The networkextension entitlement lets it own the
+     NEFilterManager content-filter configuration. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.system-extension.install</key>
+    <true/>
+    <key>com.apple.developer.networking.networkextension</key>
+    <array>
+        <string>content-filter-provider</string>
+    </array>
+</dict>
+</plist>

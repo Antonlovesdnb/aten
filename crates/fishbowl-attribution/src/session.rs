@@ -180,6 +180,8 @@ pub fn load_sessions_from_file(
 ) -> anyhow::Result<(String, Vec<Event>)> {
     let platform = if cfg!(target_os = "windows") {
         fishbowl_schema::Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        fishbowl_schema::Platform::Macos
     } else {
         fishbowl_schema::Platform::Linux
     };

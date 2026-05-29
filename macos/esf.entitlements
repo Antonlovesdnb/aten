@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Entitlement applied to the `fishbowl` daemon binary so it can create an
+     EndpointSecurity client. `es_new_client` returns ES_NEW_CLIENT_RESULT_ERR_
+     NOT_PERMITTED without it.
+
+     On a paid Apple Developer Program account this entitlement must be granted
+     by Apple (a special request) and embedded via a provisioning profile. In
+     free-account dev mode it is honored when the binary is ad-hoc signed AND
+     the host has SIP disabled + amfi_get_out_of_my_way=1 (see devsetup.sh).
+     Apply with macos/sign-daemon.sh. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.endpoint-security.client</key>
+    <true/>
+</dict>
+</plist>

@@ -147,10 +147,26 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Run the macOS collector. Needs root + the EndpointSecurity client
+    /// entitlement (see macos/devsetup.md). Subscribes to ESF NOTIFY_EXEC /
+    /// NOTIFY_OPEN for `ProcessExec` / `CredentialAccess`, and listens on a
+    /// Unix-domain socket for `NetworkEgress` flow records from the
+    /// NEFilterDataProvider system extension.
+    #[cfg(target_os = "macos")]
+    CollectMacos {
+        /// Process basenames to enroll as agent roots (e.g. claude,codex).
+        #[arg(long, value_delimiter = ',')]
+        agents: Option<Vec<String>>,
+        #[arg(long)]
+        duration_secs: Option<u64>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Run the full daemon: kernel collector + transcript reader + attribution.
     /// On Linux uses eBPF (needs root or CAP_BPF+CAP_PERFMON); on Windows uses
-    /// ETW (needs admin). Same subcommand on both platforms; the build picks
-    /// the right collector via `cfg(target_os = ...)`.
+    /// ETW (needs admin); on macOS uses EndpointSecurity + a NetworkExtension
+    /// system extension (needs root + entitlements). Same subcommand on every
+    /// platform; the build picks the right collector via `cfg(target_os = ...)`.
     ///
     /// Transcript sources are merged from three places (later overrides):
     /// the config file (`[transcripts] watch_dirs = [...]`, `files = [...]`),
@@ -230,6 +246,12 @@ fn main() -> Result<()> {
             duration_secs,
             out,
         } => run_collect_windows(agents, duration_secs, out)?,
+        #[cfg(target_os = "macos")]
+        Command::CollectMacos {
+            agents,
+            duration_secs,
+            out,
+        } => run_collect_macos(agents, duration_secs, out)?,
     }
     Ok(())
 }
@@ -858,7 +880,7 @@ fn run_daemon(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn install_signal_handlers(stop: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
     use std::sync::atomic::{AtomicBool, Ordering};
     let stop = stop.clone();
@@ -881,9 +903,267 @@ fn install_signal_handlers(stop: &std::sync::Arc<std::sync::atomic::AtomicBool>)
     std::mem::forget(stop);
 }
 
+// ===========================================================================
+// macOS
+//
+// Structurally identical to the Linux daemon — same collector contract, same
+// attribution engine, same buffering — differing only in the collector crate
+// (`fishbowl_collector_macos`), the host_id source, the cwd/user resolvers, and
+// the state path. Kept as a parallel block (rather than sharing code with the
+// Linux path) to match the repo's existing per-OS split and avoid touching the
+// Linux/Windows daemons.
+// ===========================================================================
+
+/// Stable host identifier for the envelope. Uses the hostname for v0.x;
+/// `IOPlatformUUID` (via `ioreg -d2 -c IOPlatformExpertDevice`) is a more
+/// durable refinement.
+#[cfg(target_os = "macos")]
+fn macos_host_id() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes a NUL-terminated name into our buffer.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// macOS analog of `linux_user_for_transcript` — the transcript file's owner
+/// username, so `user_id` on transcript events lines up with kernel events.
+#[cfg(target_os = "macos")]
+fn macos_user_for_transcript(path: &std::path::Path) -> Option<String> {
+    fishbowl_collector_macos::file_owner(path)
+}
+
+/// Adapter so the attribution engine's `cwd_for_pid` fn-pointer can reach the
+/// macOS collector's libproc-based cwd lookup.
+#[cfg(target_os = "macos")]
+fn macos_cwd_for_pid(pid: i32) -> Option<String> {
+    fishbowl_collector_macos::query_cwd(pid as u32)
+}
+
+/// One-shot macOS collector (`fishbowl collect-macos`): emits raw events to a
+/// sink with no attribution. Mirrors `run_collect_linux`.
+#[cfg(target_os = "macos")]
+fn run_collect_macos(
+    agents: Option<Vec<String>>,
+    duration_secs: Option<u64>,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let cfg = fishbowl_collector_macos::CollectorConfig {
+        enrolled_agents: agents
+            .unwrap_or_else(|| vec!["claude".into(), "cursor".into(), "codex".into()]),
+        host_id: macos_host_id(),
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    install_signal_handlers(&stop);
+    if let Some(secs) = duration_secs {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+
+    let sink: Box<dyn Write + Send> = match out {
+        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    let sink = std::sync::Mutex::new(sink);
+
+    eprintln!(
+        "fishbowl collector starting (agents = {:?})",
+        cfg.enrolled_agents
+    );
+
+    fishbowl_collector_macos::run(cfg, stop, move |event| {
+        let mut s = sink.lock().expect("sink lock");
+        if let Ok(line) = serde_json::to_string(&event) {
+            let _ = writeln!(s, "{line}");
+            let _ = s.flush();
+        }
+    })?;
+
+    eprintln!("fishbowl collector stopped");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_daemon(
+    config_path: Option<PathBuf>,
+    transcripts: Vec<PathBuf>,
+    watch_dirs: Vec<PathBuf>,
+    agents: Option<Vec<String>>,
+    duration_secs: Option<u64>,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    use std::cell::RefCell;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use fishbowl_attribution::{AttributionEngine, EngineConfig};
+
+    let inputs = resolve_daemon_inputs(
+        config_path,
+        transcripts,
+        watch_dirs,
+        agents,
+        out,
+        &["claude", "cursor", "codex"],
+    )?;
+
+    let cfg = fishbowl_collector_macos::CollectorConfig {
+        enrolled_agents: inputs.agents.clone(),
+        host_id: macos_host_id(),
+    };
+
+    let engine = AttributionEngine::new(EngineConfig {
+        cwd_for_pid: macos_cwd_for_pid,
+        transcript_paths: inputs.transcript_paths.clone(),
+        host_id: macos_host_id(),
+        user_for_transcript: macos_user_for_transcript,
+        state_path: Some(std::path::PathBuf::from(
+            "/Library/Application Support/fishbowl/state.json",
+        )),
+    });
+    let engine = RefCell::new(engine);
+    let _ = engine.borrow_mut().refresh()?;
+    let loaded = engine.borrow().session_count();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    install_signal_handlers(&stop);
+    if let Some(secs) = duration_secs {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+
+    let sink: Box<dyn Write + Send> = match inputs.out_path {
+        Some(ref path) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            Box::new(std::io::BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            ))
+        }
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    let sink = std::sync::Mutex::new(sink);
+
+    // Same 100ms refresh / 2s attribution buffer as the Linux daemon — see the
+    // rationale in `run_daemon` (linux). Kernel events can fire concurrently
+    // with the transcript write, so we buffer briefly before attributing.
+    let refresh_every = Duration::from_millis(100);
+    let attribution_delay = Duration::from_millis(2000);
+    let last_refresh = std::cell::Cell::new(Instant::now());
+    let pending: std::cell::RefCell<std::collections::VecDeque<(Instant, fishbowl_schema::Event)>> =
+        std::cell::RefCell::new(std::collections::VecDeque::new());
+
+    eprintln!(
+        "fishbowl daemon starting (agents = {:?}, transcript sources = {}, sessions loaded = {})",
+        cfg.enrolled_agents,
+        inputs.transcript_paths.len(),
+        loaded,
+    );
+
+    fishbowl_collector_macos::run_with_tick(
+        cfg,
+        stop,
+        move |event| {
+            pending.borrow_mut().push_back((Instant::now(), event));
+        },
+        || {
+            if last_refresh.get().elapsed() >= refresh_every {
+                let result = {
+                    let mut eng = engine.borrow_mut();
+                    let r = eng.refresh();
+                    let _ = eng.save_state();
+                    r
+                };
+                if let Ok(new_events) = result {
+                    if !new_events.is_empty() {
+                        let mut s = sink.lock().expect("sink lock");
+                        for ev in new_events {
+                            if let Ok(line) = serde_json::to_string(&ev) {
+                                let _ = writeln!(s, "{line}");
+                            }
+                        }
+                        let _ = s.flush();
+                    }
+                }
+                last_refresh.set(Instant::now());
+            }
+
+            let now = Instant::now();
+            let mut drained: Vec<fishbowl_schema::Event> = Vec::new();
+            {
+                let mut q = pending.borrow_mut();
+                while let Some((t, _)) = q.front() {
+                    if now.duration_since(*t) >= attribution_delay {
+                        if let Some((_, ev)) = q.pop_front() {
+                            drained.push(ev);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if !drained.is_empty() {
+                let mut eng = engine.borrow_mut();
+                let mut s = sink.lock().expect("sink lock");
+                for mut ev in drained {
+                    eng.attribute(&mut ev);
+                    if let Ok(line) = serde_json::to_string(&ev) {
+                        let _ = writeln!(s, "{line}");
+                    }
+                }
+                let _ = s.flush();
+            }
+        },
+    )?;
+
+    let remaining: Vec<fishbowl_schema::Event> =
+        pending.borrow_mut().drain(..).map(|(_, ev)| ev).collect();
+    if !remaining.is_empty() {
+        let mut eng = engine.borrow_mut();
+        let mut s = sink.lock().expect("sink lock");
+        for mut ev in remaining {
+            eng.attribute(&mut ev);
+            if let Ok(line) = serde_json::to_string(&ev) {
+                let _ = writeln!(s, "{line}");
+            }
+        }
+        let _ = s.flush();
+    }
+
+    eprintln!("fishbowl daemon stopped");
+    Ok(())
+}
+
 fn detect_platform() -> Platform {
     if cfg!(target_os = "windows") {
         Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        Platform::Macos
     } else {
         Platform::Linux
     }

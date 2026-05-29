@@ -1,0 +1,56 @@
+# XcodeGen spec for the macOS network-egress components.
+#
+# Two targets:
+#   FishbowlHost   — the .app that activates the system extension and installs
+#                    the content-filter configuration.
+#   FishbowlNetExt — the NEFilterDataProvider system extension, embedded into
+#                    the host's Contents/Library/SystemExtensions.
+#
+# Generate + build with ./build.sh (which runs `xcodegen generate` then
+# `xcodebuild`). Paths are relative to this file (the macos/ directory).
+#
+# Signing is ad-hoc ("-") for free-account dev mode; see devsetup.md. On a paid
+# Developer Program account, set DEVELOPMENT_TEAM and a real CODE_SIGN_IDENTITY.
+
+name: Fishbowl
+options:
+  bundleIdPrefix: ai.fishbowl
+  deploymentTarget:
+    macOS: "11.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"        # ad-hoc; dev mode honors entitlements w/ SIP off
+    DEVELOPMENT_TEAM: ""
+    SWIFT_VERSION: "5.0"
+    ENABLE_HARDENED_RUNTIME: YES
+
+targets:
+  FishbowlHost:
+    type: application
+    platform: macOS
+    sources:
+      - path: FishbowlHost
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.fishbowl.host
+        PRODUCT_NAME: FishbowlHost
+        INFOPLIST_FILE: FishbowlHost/Info.plist
+        CODE_SIGN_ENTITLEMENTS: FishbowlHost/FishbowlHost.entitlements
+    dependencies:
+      - target: FishbowlNetExt
+        embed: true            # → Contents/Library/SystemExtensions
+
+  FishbowlNetExt:
+    type: system-extension
+    platform: macOS
+    sources:
+      - path: FishbowlNetExt
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.fishbowl.netext
+        PRODUCT_NAME: FishbowlNetExt
+        INFOPLIST_FILE: FishbowlNetExt/Info.plist
+        CODE_SIGN_ENTITLEMENTS: FishbowlNetExt/FishbowlNetExt.entitlements

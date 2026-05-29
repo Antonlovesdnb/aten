@@ -1,0 +1,9 @@
+# Files that must keep LF endings regardless of host. Shell scripts with CRLF
+# fail on macOS/Linux ("bad interpreter: .../bash\r"); Swift/plist/yml are built
+# on macOS where LF is expected. The repo is developed on Windows, so without
+# this Git would rewrite these to CRLF on checkout.
+*.sh        text eol=lf
+*.swift     text eol=lf
+*.plist     text eol=lf
+*.entitlements text eol=lf
+*.yml       text eol=lf

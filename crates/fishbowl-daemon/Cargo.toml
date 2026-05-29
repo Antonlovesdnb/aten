@@ -30,3 +30,8 @@ fishbowl-collector-windows = { workspace = true }
 fishbowl-attribution = { workspace = true }
 windows = { version = "0.62", features = ["Win32_System_Console", "Win32_Foundation"] }
 windows-service = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fishbowl-collector-macos = { workspace = true }
+fishbowl-attribution = { workspace = true }
+libc = "0.2"

@@ -1,0 +1,42 @@
+[package]
+name = "fishbowl-collector-macos"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "macOS EndpointSecurity + NetworkExtension collector for fishbowl-v2"
+
+[lib]
+name = "fishbowl_collector_macos"
+path = "src/lib.rs"
+
+[dependencies]
+fishbowl-schema = { workspace = true }
+fishbowl-collector-linux = { workspace = true }  # enroll/credentials/network (cross-platform)
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+
+# macOS-only deps. The crate is a no-op on non-macOS hosts (every module is
+# `cfg(target_os = "macos")`-gated, exactly like the Linux crate gates its
+# eBPF), so the workspace still builds on Windows/Linux without pulling these.
+[target.'cfg(target_os = "macos")'.dependencies]
+# HarfangLab's safe ESF bindings — NOTIFY_EXEC / NOTIFY_OPEN.
+endpoint-sec = "0.4"
+# proc_pidpath / proc_pidinfo (BSDInfo, VnodePathInfo) — the libproc analog of
+# the Linux crate's /proc reads, used to enrich network flows (bare pid) and to
+# back the query_cwd / file_owner daemon bridges.
+libproc = "0.14"
+# getpwuid_r, stat, gethostname — reused via the same patterns as proc.rs.
+libc = "0.2"
+
+[features]
+# The ESF path needs the com.apple.developer.endpoint-security.client
+# entitlement; es_new_client returns NOT_PERMITTED without it. Default-on, but
+# can be disabled so the collector still runs the netflow-IPC path alone on a
+# box where the entitlement isn't available (free-account dev mode).
+default = ["esf"]
+esf = []
