@@ -149,6 +149,10 @@ struct SharedState {
     /// we use the ETW event's timestamp converted to filetime as the
     /// disambiguator.
     pid_to_key: std::collections::HashMap<u32, ProcessKey>,
+    /// Process identity captured at ProcessStart (see `ProcInfo`). Lets the
+    /// file/network handlers populate name/path/cmdline/user without racing
+    /// process exit.
+    proc_info: std::collections::HashMap<i32, ProcInfo>,
     events_emitted: u64,
 }
 
@@ -157,8 +161,55 @@ impl SharedState {
         Self {
             table: EnrollmentTable::new(),
             pid_to_key: std::collections::HashMap::new(),
+            proc_info: std::collections::HashMap::new(),
             events_emitted: 0,
         }
+    }
+}
+
+/// Process identity captured at ProcessStart, while the process is guaranteed
+/// alive. The Kernel-File and Kernel-Network events only carry a PID, and a
+/// short-lived agent child (e.g. `powershell -c "... | Out-Null"`) often exits
+/// before the file/network ETW event is processed — a live PEB/token query then
+/// returns blanks. Reading these from the cache fixes the empty
+/// name/path/cmdline (and gives a real start_time) on those events.
+#[derive(Clone, Default)]
+struct ProcInfo {
+    name: String,
+    /// Already NT-path-normalized image path.
+    image_path: String,
+    cmdline: String,
+    user: String,
+    start_time_ticks: u64,
+}
+
+/// Resolve a process's identity for a Kernel-File / Kernel-Network event:
+/// prefer the ProcessStart cache (populated while the process was alive), else
+/// fall back to a live Win32 query (which may return blanks if the process
+/// already exited). Returns `(name, normalized_image_path, cmdline, user,
+/// start_time_ticks)`.
+fn resolve_proc_identity(pid: u32, cached: Option<ProcInfo>) -> (String, String, String, String, u64) {
+    match cached {
+        Some(pi) => (pi.name, pi.image_path, pi.cmdline, pi.user, pi.start_time_ticks),
+        None => {
+            let image_path = enrich::query_image(pid);
+            (
+                image_basename(&image_path),
+                enrich::normalize_nt_path(&image_path),
+                enrich::query_cmdline(pid),
+                enrich::query_user(pid),
+                0,
+            )
+        }
+    }
+}
+
+/// Render `start_time_ticks` (0 = unknown) as the schema's string field.
+fn start_time_string(ticks: u64) -> String {
+    if ticks == 0 {
+        String::new()
+    } else {
+        ticks.to_string()
     }
 }
 
@@ -349,6 +400,9 @@ fn handle_etw_event(
     let pid: u32 = parser.try_parse("ProcessID").unwrap_or(0);
     let ppid: u32 = parser.try_parse("ParentProcessID").unwrap_or(0);
     let image_name: String = parser.try_parse("ImageName").unwrap_or_default();
+    // The ProcessStart event carries the command line directly — authoritative
+    // and available while the process is alive, unlike a later PEB query.
+    let cmdline_evt: String = parser.try_parse("CommandLine").unwrap_or_default();
 
     if pid == 0 {
         return Ok(());
@@ -376,21 +430,21 @@ fn handle_etw_event(
         .iter()
         .any(|n| n.eq_ignore_ascii_case(&basename));
 
-    let mut state = state.lock().expect("state lock");
+    let mut guard = state.lock().expect("state lock");
     let parent_enrolled = match parent_key {
-        Some(pk) => state.pid_to_key.get(&(pk.pid as u32)).and_then(|k| state.table.get(*k)),
+        Some(pk) => guard.pid_to_key.get(&(pk.pid as u32)).and_then(|k| guard.table.get(*k)),
         None => None,
     };
 
     let record_enrollment: Option<EnrollmentRecord> = if is_agent_root {
-        Some(state.table.enroll(process_key, None))
+        Some(guard.table.enroll(process_key, None))
     } else if parent_enrolled.is_some() {
         // Re-derive parent_key with the real key from the pid_to_key cache.
         let resolved_parent_key = parent_key
-            .and_then(|pk| state.pid_to_key.get(&(pk.pid as u32)).copied());
-        Some(state.table.enroll(process_key, resolved_parent_key))
+            .and_then(|pk| guard.pid_to_key.get(&(pk.pid as u32)).copied());
+        Some(guard.table.enroll(process_key, resolved_parent_key))
     } else {
-        state.pid_to_key.remove(&pid);
+        guard.pid_to_key.remove(&pid);
         None
     };
 
@@ -398,17 +452,22 @@ fn handle_etw_event(
         return Ok(());
     };
 
-    state.pid_to_key.insert(pid, process_key);
+    guard.pid_to_key.insert(pid, process_key);
     let agent_root_pid = Some(rec.agent_root.pid);
     let attributed_by_descent = !is_agent_root;
-    state.events_emitted += 1;
-    drop(state);
+    guard.events_emitted += 1;
+    drop(guard);
 
     // Per-event enrichment via Win32. Only runs for enrolled processes
     // (we returned early above if record_enrollment was None), so the cost
     // is bounded by agent activity, not by total system process churn.
-    let cmdline = enrich::query_cmdline(pid);
+    let cmdline = if !cmdline_evt.is_empty() {
+        cmdline_evt
+    } else {
+        enrich::query_cmdline(pid)
+    };
     let user = enrich::query_user(pid);
+    let image_path_norm = enrich::normalize_nt_path(&image_name);
     // schema §3 caps parent_chain at 16. The chain returned excludes the
     // current process to match the Linux collector's contract.
     let parent_chain = if ppid != 0 {
@@ -416,6 +475,23 @@ fn handle_etw_event(
     } else {
         Vec::new()
     };
+
+    // Cache this process's identity (captured while it's alive) so later
+    // Kernel-File / Kernel-Network events for the same PID can populate
+    // name/path/cmdline/user/start_time without a live query that races exit.
+    {
+        let mut st = state.lock().expect("state lock");
+        st.proc_info.insert(
+            pid as i32,
+            ProcInfo {
+                name: basename.clone(),
+                image_path: image_path_norm.clone(),
+                cmdline: cmdline.clone(),
+                user: user.clone(),
+                start_time_ticks: process_key.start_time_ticks,
+            },
+        );
+    }
 
     let event = Event {
         schema_version: SCHEMA_VERSION.to_string(),
@@ -442,7 +518,7 @@ fn handle_etw_event(
                 ppid: ppid as i32,
                 start_time: process_key.start_time_ticks.to_string(),
                 name: basename,
-                path: enrich::normalize_nt_path(&image_name),
+                path: image_path_norm,
                 cmdline,
                 cwd: String::new(),
                 user,
@@ -553,16 +629,18 @@ fn handle_file_event(
         return Ok(());
     }
 
+    // Grab the cached identity (from ProcessStart) before releasing the lock.
+    let cached = st.proc_info.get(&(pid as i32)).cloned();
     st.events_emitted += 1;
     drop(st);
 
     // Enrichment runs outside the Mutex — these calls can each take tens of
     // microseconds and there's no need to block the other ETW handler on
-    // them.
-    let cmdline = enrich::query_cmdline(pid);
-    let user = enrich::query_user(pid);
-    let image_path = enrich::query_image(pid);
-    let process_name = image_basename(&image_path);
+    // them. Prefer the ProcessStart cache so a short-lived child that has
+    // already exited still gets name/path/cmdline/user (a live query would
+    // race the exit and return blanks).
+    let (process_name, image_path, cmdline, user, start_time_ticks) =
+        resolve_proc_identity(pid, cached);
     let immediate_parent = enrich::ancestor_pids(pid, 1).first().copied().unwrap_or(0);
     let parent_chain = if immediate_parent != 0 {
         enrich::parent_chain(immediate_parent, 16)
@@ -600,9 +678,9 @@ fn handle_file_event(
                 // for v0.x; queries that need PID-reuse disambiguation can
                 // join on (pid, parent_chain) which is unique enough on a
                 // single host within a sane time window.
-                start_time: String::new(),
+                start_time: start_time_string(start_time_ticks),
                 name: process_name,
-                path: enrich::normalize_nt_path(&image_path),
+                path: image_path,
                 cmdline,
                 cwd: String::new(),
                 user,
@@ -719,13 +797,14 @@ fn handle_network_event(
     };
     let agent_root_pid = Some(rec.agent_root.pid);
     let is_agent_root = rec.agent_root.pid == pid as i32;
+    let cached = st.proc_info.get(&(pid as i32)).cloned();
     st.events_emitted += 1;
     drop(st);
 
-    let cmdline = enrich::query_cmdline(pid);
-    let user = enrich::query_user(pid);
-    let image_path = enrich::query_image(pid);
-    let process_name = image_basename(&image_path);
+    // Prefer the ProcessStart cache (see the file handler) over a live query
+    // that would race a short-lived child's exit.
+    let (process_name, image_path, cmdline, user, start_time_ticks) =
+        resolve_proc_identity(pid, cached);
     let immediate_parent = enrich::ancestor_pids(pid, 1).first().copied().unwrap_or(0);
     let parent_chain = if immediate_parent != 0 {
         enrich::parent_chain(immediate_parent, 16)
@@ -762,9 +841,9 @@ fn handle_network_event(
             process: Process {
                 pid: pid as i32,
                 ppid: immediate_parent as i32,
-                start_time: String::new(),
+                start_time: start_time_string(start_time_ticks),
                 name: process_name,
-                path: enrich::normalize_nt_path(&image_path),
+                path: image_path,
                 cmdline,
                 cwd: String::new(),
                 user,
