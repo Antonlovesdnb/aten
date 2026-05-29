@@ -22,6 +22,7 @@ use fishbowl_schema::Platform;
 mod config;
 #[cfg(target_os = "windows")]
 mod service;
+mod sink;
 
 /// Merged inputs for a daemon run, after layering CLI flags over the
 /// config file. Returned from `resolve_daemon_inputs` so the two
@@ -33,6 +34,9 @@ pub(crate) struct DaemonInputs {
     pub agents: Vec<String>,
     /// Where to write the event JSONL. `None` = stdout.
     pub out_path: Option<PathBuf>,
+    /// Which sink(s) to write to. Honored on the Windows path; the Linux/macOS
+    /// daemons always write JSONL.
+    pub sink_kind: sink::SinkKind,
 }
 
 /// Merge config file + CLI flags into a single set of daemon inputs.
@@ -43,6 +47,7 @@ pub(crate) fn resolve_daemon_inputs(
     cli_watch_dirs: Vec<PathBuf>,
     cli_agents: Option<Vec<String>>,
     cli_out: Option<PathBuf>,
+    cli_sink: Option<String>,
     default_agents: &[&str],
 ) -> Result<DaemonInputs> {
     let cfg_path = config_path.unwrap_or_else(config::default_config_path);
@@ -67,11 +72,27 @@ pub(crate) fn resolve_daemon_inputs(
 
     let out_path = cli_out.or(cfg.output.file_path);
 
+    // Sink: CLI override > config > default (jsonl).
+    let sink_kind = parse_sink_arg(cli_sink.or(cfg.output.sink));
+
     Ok(DaemonInputs {
         transcript_paths,
         agents,
         out_path,
+        sink_kind,
     })
+}
+
+/// Parse an `output.sink` / `--sink` value to a `SinkKind`. Unrecognised
+/// strings warn and fall back to the default (jsonl) rather than failing.
+pub(crate) fn parse_sink_arg(s: Option<String>) -> sink::SinkKind {
+    s.map(|s| {
+        sink::SinkKind::parse(&s).unwrap_or_else(|| {
+            eprintln!("fishbowl: unrecognised output sink '{s}'; using jsonl");
+            sink::SinkKind::default()
+        })
+    })
+    .unwrap_or_default()
 }
 
 #[derive(Parser)]
@@ -146,6 +167,11 @@ enum Command {
         duration_secs: Option<u64>,
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Output sink: `jsonl` | `eventlog` | `both`. `eventlog`/`both`
+        /// write to the Windows Event Log channel `Fishbowl/Operational`
+        /// (needs the manifest registered via `fishbowl install`).
+        #[arg(long)]
+        sink: Option<String>,
     },
     /// Run the macOS collector. Needs root + the EndpointSecurity client
     /// entitlement (see macos/devsetup.md). Subscribes to ESF NOTIFY_EXEC /
@@ -202,6 +228,11 @@ enum Command {
         /// default events.jsonl path (service mode).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Output sink: `jsonl` | `eventlog` | `both`. Overrides config.
+        /// `eventlog`/`both` write to the Windows Event Log channel
+        /// `Fishbowl/Operational` (Windows only; needs `fishbowl install`).
+        #[arg(long)]
+        sink: Option<String>,
     },
 }
 
@@ -233,7 +264,8 @@ fn main() -> Result<()> {
             agents,
             duration_secs,
             out,
-        } => run_daemon(config, transcript, watch_dir, agents, duration_secs, out)?,
+            sink,
+        } => run_daemon(config, transcript, watch_dir, agents, duration_secs, out, sink)?,
         #[cfg(target_os = "windows")]
         Command::Install => service::install_service()?,
         #[cfg(target_os = "windows")]
@@ -245,7 +277,8 @@ fn main() -> Result<()> {
             agents,
             duration_secs,
             out,
-        } => run_collect_windows(agents, duration_secs, out)?,
+            sink,
+        } => run_collect_windows(agents, duration_secs, out, parse_sink_arg(sink))?,
         #[cfg(target_os = "macos")]
         Command::CollectMacos {
             agents,
@@ -264,6 +297,7 @@ fn run_daemon(
     agents: Option<Vec<String>>,
     duration_secs: Option<u64>,
     out: Option<PathBuf>,
+    sink: Option<String>,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -274,6 +308,7 @@ fn run_daemon(
         watch_dirs,
         agents,
         out,
+        sink,
         &["claude.exe", "cursor.exe", "codex.exe"],
     )?;
 
@@ -304,7 +339,6 @@ pub(crate) fn run_daemon_loop_windows(
     inputs: DaemonInputs,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
-    use std::io::Write;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -333,20 +367,7 @@ pub(crate) fn run_daemon_loop_windows(
     let _ = engine.lock().expect("engine lock").refresh()?;
     let loaded = engine.lock().expect("engine lock").session_count();
 
-    let sink: Box<dyn Write + Send> = match inputs.out_path {
-        Some(ref path) => {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            Box::new(std::io::BufWriter::new(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?,
-            ))
-        }
-        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
-    };
+    let sink = sink::build_sink(inputs.sink_kind, inputs.out_path.as_deref())?;
     let sink = Arc::new(Mutex::new(sink));
 
     eprintln!(
@@ -415,11 +436,9 @@ pub(crate) fn run_daemon_loop_windows(
                     if !new_events.is_empty() {
                         let mut s = sink_tick.lock().expect("sink lock");
                         for ev in new_events {
-                            if let Ok(line) = serde_json::to_string(&ev) {
-                                let _ = writeln!(s, "{line}");
-                            }
+                            s.emit(&ev);
                         }
-                        let _ = s.flush();
+                        s.flush();
                     }
                 }
                 last_refresh.set(Instant::now());
@@ -450,11 +469,9 @@ pub(crate) fn run_daemon_loop_windows(
                 let mut s = sink_tick.lock().expect("sink lock");
                 for mut ev in drained {
                     eng.attribute(&mut ev);
-                    if let Ok(line) = serde_json::to_string(&ev) {
-                        let _ = writeln!(s, "{line}");
-                    }
+                    s.emit(&ev);
                 }
-                let _ = s.flush();
+                s.flush();
             }
         },
     )?;
@@ -471,11 +488,9 @@ pub(crate) fn run_daemon_loop_windows(
         let mut s = sink.lock().expect("sink lock");
         for mut ev in remaining {
             eng.attribute(&mut ev);
-            if let Ok(line) = serde_json::to_string(&ev) {
-                let _ = writeln!(s, "{line}");
-            }
+            s.emit(&ev);
         }
-        let _ = s.flush();
+        s.flush();
     }
 
     eprintln!("fishbowl daemon stopped");
@@ -487,8 +502,8 @@ fn run_collect_windows(
     agents: Option<Vec<String>>,
     duration_secs: Option<u64>,
     out: Option<PathBuf>,
+    sink_kind: sink::SinkKind,
 ) -> Result<()> {
-    use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -512,24 +527,19 @@ fn run_collect_windows(
         });
     }
 
-    let sink: Box<dyn Write + Send> = match out {
-        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
-        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
-    };
+    let sink = sink::build_sink(sink_kind, out.as_deref())?;
     let sink = std::sync::Arc::new(std::sync::Mutex::new(sink));
     let sink_for_emit = sink.clone();
 
     eprintln!(
-        "fishbowl windows collector starting (agents = {:?})",
-        cfg.enrolled_agents
+        "fishbowl windows collector starting (agents = {:?}, sink = {:?})",
+        cfg.enrolled_agents, sink_kind
     );
 
     fishbowl_collector_windows::run(cfg, stop, move |event| {
         let mut s = sink_for_emit.lock().expect("sink lock");
-        if let Ok(line) = serde_json::to_string(&event) {
-            let _ = writeln!(s, "{line}");
-            let _ = s.flush();
-        }
+        s.emit(&event);
+        s.flush();
     })?;
 
     eprintln!("fishbowl windows collector stopped");
@@ -712,6 +722,7 @@ fn run_daemon(
     agents: Option<Vec<String>>,
     duration_secs: Option<u64>,
     out: Option<PathBuf>,
+    sink: Option<String>,
 ) -> Result<()> {
     use std::cell::RefCell;
     use std::io::Write;
@@ -727,6 +738,7 @@ fn run_daemon(
         watch_dirs,
         agents,
         out,
+        sink,
         &["claude", "cursor", "codex"],
     )?;
 
@@ -1007,6 +1019,7 @@ fn run_daemon(
     agents: Option<Vec<String>>,
     duration_secs: Option<u64>,
     out: Option<PathBuf>,
+    sink: Option<String>,
 ) -> Result<()> {
     use std::cell::RefCell;
     use std::io::Write;
@@ -1022,6 +1035,7 @@ fn run_daemon(
         watch_dirs,
         agents,
         out,
+        sink,
         &["claude", "cursor", "codex"],
     )?;
 

@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  fishbowl-v2 ETW instrumentation manifest.
+
+  Declares the "Fishbowl" ETW provider and a dedicated Operational channel,
+  "Fishbowl/Operational", that surfaces in Event Viewer under
+  Applications and Services Logs and is collectable by Windows Event Forwarding
+  and SIEM agents — the same shape Sysmon uses for
+  Microsoft-Windows-Sysmon/Operational.
+
+  A provider only routes events into the Event Log because this manifest
+  declares a channel; an unmanifested ETW provider feeds trace sessions only.
+
+  The provider GUID, channel value (16), and per-event IDs MUST stay in sync
+  with crates/fishbowl-collector-windows/src/eventlog.rs (a unit test there
+  asserts the IDs). Build the resource DLL with build-manifest.ps1, then register
+  with: wevtutil im fishbowl.man /rf:<dll> /mf:<dll>   (admin).
+-->
+<instrumentationManifest
+    xmlns="http://schemas.microsoft.com/win/2004/08/events"
+    xmlns:win="http://manifests.microsoft.com/win/2004/08/windows/events"
+    xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <instrumentation>
+    <events>
+      <provider
+          name="Fishbowl"
+          guid="{0e28e4c0-89f9-4b9d-9f35-bd497b26c397}"
+          symbol="FISHBOWL_PROVIDER"
+          resourceFileName="C:\ProgramData\fishbowl\fishbowl_events.dll"
+          messageFileName="C:\ProgramData\fishbowl\fishbowl_events.dll">
+
+        <channels>
+          <!-- value="16": Operational channel ids start at 16 (0-15 reserved).
+               This byte is what eventlog.rs stamps into EVENT_DESCRIPTOR.Channel. -->
+          <channel name="Fishbowl/Operational"
+                   chid="Operational"
+                   symbol="FISHBOWL_CHANNEL_OPERATIONAL"
+                   type="Operational"
+                   enabled="true"
+                   value="16"/>
+        </channels>
+
+        <templates>
+          <!-- One template shared by every event. EventJson is the full
+               fishbowl_schema::Event as JSON; the other three are promoted for
+               at-a-glance reading in Event Viewer's General tab. -->
+          <template tid="t_event">
+            <data name="EventJson" inType="win:UnicodeString" outType="xs:string"/>
+            <data name="Pid"       inType="win:Int32"         outType="xs:int"/>
+            <data name="AgentId"   inType="win:UnicodeString" outType="xs:string"/>
+            <data name="HostId"    inType="win:UnicodeString" outType="xs:string"/>
+          </template>
+        </templates>
+
+        <events>
+          <!-- IDs mirror eventlog::event_id_for. Kernel/agent-behaviour events
+               that matter most for detection (credential access, network
+               egress) are Warning; the rest are Informational. -->
+          <event symbol="EVT_PROCESS_EXEC"      value="1"  version="0" channel="Operational" level="win:Informational" template="t_event" message="$(string.evt.process_exec)"/>
+          <event symbol="EVT_PROCESS_EXIT"      value="2"  version="0" channel="Operational" level="win:Informational" template="t_event" message="$(string.evt.process_exit)"/>
+          <event symbol="EVT_CREDENTIAL_ACCESS" value="3"  version="0" channel="Operational" level="win:Warning"       template="t_event" message="$(string.evt.credential_access)"/>
+          <event symbol="EVT_NETWORK_EGRESS"    value="4"  version="0" channel="Operational" level="win:Warning"       template="t_event" message="$(string.evt.network_egress)"/>
+          <event symbol="EVT_FILE_WRITE"        value="5"  version="0" channel="Operational" level="win:Informational" template="t_event" message="$(string.evt.file_write)"/>
+          <event symbol="EVT_PROMPT"            value="10" version="0" channel="Operational" level="win:Informational" template="t_event" message="$(string.evt.prompt)"/>
+          <event symbol="EVT_TOOL_CALL"         value="11" version="0" channel="Operational" level="win:Informational" template="t_event" message="$(string.evt.tool_call)"/>
+          <event symbol="EVT_TOOL_RESULT"       value="12" version="0" channel="Operational" level="win:Informational" template="t_event" message="$(string.evt.tool_result)"/>
+        </events>
+      </provider>
+    </events>
+  </instrumentation>
+
+  <localization>
+    <resources culture="en-US">
+      <stringTable>
+        <string id="evt.process_exec"      value="AI agent process exec (pid %2, agent %3): %1"/>
+        <string id="evt.process_exit"      value="AI agent process exit (pid %2, agent %3): %1"/>
+        <string id="evt.credential_access" value="AI agent credential access (pid %2, agent %3): %1"/>
+        <string id="evt.network_egress"    value="AI agent network egress (pid %2, agent %3): %1"/>
+        <string id="evt.file_write"        value="AI agent file write (pid %2, agent %3): %1"/>
+        <string id="evt.prompt"            value="AI agent prompt (agent %3): %1"/>
+        <string id="evt.tool_call"         value="AI agent tool call (agent %3): %1"/>
+        <string id="evt.tool_result"       value="AI agent tool result (agent %3): %1"/>
+      </stringTable>
+    </resources>
+  </localization>
+</instrumentationManifest>

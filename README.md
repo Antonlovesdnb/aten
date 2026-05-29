@@ -2,7 +2,7 @@
 
 Always-on, cross-platform telemetry daemon for AI agent activity. *Sysmon for AI agents.*
 
-Captures **prompts + tool calls + endpoint syscalls** and joins them by session and process tree, so detections fire on the join — not on either layer alone. Linux (eBPF) and Windows (ETW), one unified event schema, SIEM-shaped output.
+Captures **prompts + tool calls + endpoint syscalls** and joins them by session and process tree, so detections fire on the join — not on either layer alone. Linux (eBPF) and Windows (ETW), one unified event schema, SIEM-shaped output. On Windows, events can be written to a dedicated Sysmon-style Event Log channel (`Fishbowl/Operational`) for WEF/SIEM collection, JSONL, or both (`output.sink`).
 
 ## Status
 

@@ -47,4 +47,7 @@ windows = { version = "0.62", features = [
     # device paths (`\Device\HarddiskVolume9\...`) to Win32 drive letters
     # (`C:\...`) for screenshot-quality `file_path` output on credacc events.
     "Win32_Storage_FileSystem",
+    # EventRegister/EventWrite/EventUnregister — the Event Log sink writes
+    # events to the manifest-declared Fishbowl/Operational ETW channel.
+    "Win32_System_Diagnostics_Etw",
 ] }

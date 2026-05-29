@@ -58,6 +58,10 @@ pub struct OutputSection {
     /// `%ProgramData%\fishbowl\events.jsonl`. CLI test runs typically
     /// override to a temp path.
     pub file_path: Option<PathBuf>,
+    /// Which sink(s) to write to: `jsonl` | `eventlog` | `both`. Defaults to
+    /// `jsonl`. `eventlog`/`both` are Windows-only (the Fishbowl/Operational
+    /// ETW channel); off Windows they fall back to `jsonl` with a warning.
+    pub sink: Option<String>,
 }
 
 impl ConfigFile {

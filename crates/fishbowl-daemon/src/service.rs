@@ -51,6 +51,18 @@ const SERVICE_DESCRIPTION: &str =
      (Claude Code, Codex) via ETW kernel providers. Logs to \
      %ProgramData%\\fishbowl\\events.jsonl.";
 
+/// The ETW instrumentation manifest, embedded so `install` can write a fresh
+/// copy to %ProgramData% and register it without shipping the source file. Its
+/// resourceFileName/messageFileName point at
+/// `%ProgramData%\fishbowl\fishbowl_events.dll` — exactly where install copies
+/// the compiled resource DLL.
+const EVENT_MANIFEST: &str =
+    include_str!("../../fishbowl-collector-windows/eventlog/fishbowl.man");
+
+/// Filenames inside `%ProgramData%\fishbowl`.
+const MANIFEST_FILE: &str = "fishbowl.man";
+const EVENT_DLL_FILE: &str = "fishbowl_events.dll";
+
 // ===== Service-mode logging ===================================================
 
 static SERVICE_LOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
@@ -148,6 +160,7 @@ fn service_main_impl() -> Result<()> {
         Vec::new(),
         None,
         None,
+        None, // sink: service mode reads output.sink from the config file
         &["claude.exe", "cursor.exe", "codex.exe"],
     )?;
     // Service mode defaults to writing the events JSONL to ProgramData
@@ -186,6 +199,85 @@ fn service_main_impl() -> Result<()> {
 }
 
 // ===== Install / uninstall ====================================================
+
+/// Register the Fishbowl Event Log channel: write the manifest to ProgramData,
+/// copy the compiled resource DLL next to it, and `wevtutil im` it. Best-effort
+/// — a failure (e.g. the DLL wasn't built yet) is logged and non-fatal, so the
+/// service still installs and the daemon can fall back to the JSONL sink.
+///
+/// The DLL is located next to the installed binary (deploy convention) or, for
+/// dev runs from a cargo target dir, in the collector crate's `eventlog/` dir.
+fn register_event_manifest(dir: &std::path::Path) -> Result<()> {
+    let man_path = dir.join(MANIFEST_FILE);
+    let dll_dst = dir.join(EVENT_DLL_FILE);
+    std::fs::write(&man_path, EVENT_MANIFEST)
+        .with_context(|| format!("write {}", man_path.display()))?;
+
+    let Some(dll_src) = locate_event_dll() else {
+        eprintln!(
+            "[fishbowl install] {EVENT_DLL_FILE} not found next to the binary — \
+             skipping Event Log registration. Build it with \
+             crates/fishbowl-collector-windows/eventlog/build-manifest.ps1 and \
+             place it beside fishbowl.exe, then re-run install. JSONL output is unaffected."
+        );
+        return Ok(());
+    };
+    std::fs::copy(&dll_src, &dll_dst)
+        .with_context(|| format!("copy {} -> {}", dll_src.display(), dll_dst.display()))?;
+
+    let status = std::process::Command::new("wevtutil")
+        .arg("im")
+        .arg(&man_path)
+        .arg(format!("/rf:{}", dll_dst.display()))
+        .arg(format!("/mf:{}", dll_dst.display()))
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!("[fishbowl install] registered Event Log channel Fishbowl/Operational");
+        }
+        Ok(s) => eprintln!(
+            "[fishbowl install] wevtutil im exited with {s}; Event Log channel not registered \
+             (run as admin). JSONL output is unaffected."
+        ),
+        Err(e) => eprintln!("[fishbowl install] could not run wevtutil ({e}); skipping channel"),
+    }
+    Ok(())
+}
+
+/// Best-effort unregister of the Event Log channel. The manifest copy in
+/// ProgramData is what `wevtutil um` needs; leave it on disk afterward.
+fn unregister_event_manifest(dir: &std::path::Path) {
+    let man_path = dir.join(MANIFEST_FILE);
+    if !man_path.exists() {
+        return;
+    }
+    match std::process::Command::new("wevtutil")
+        .arg("um")
+        .arg(&man_path)
+        .status()
+    {
+        Ok(s) if s.success() => {
+            eprintln!("[fishbowl uninstall] removed Event Log channel Fishbowl/Operational")
+        }
+        Ok(s) => eprintln!("[fishbowl uninstall] wevtutil um exited with {s} (non-fatal)"),
+        Err(e) => eprintln!("[fishbowl uninstall] could not run wevtutil ({e}) (non-fatal)"),
+    }
+}
+
+/// Find the compiled resource DLL: next to the running binary first (deploy
+/// layout), then the collector crate's `eventlog/` dir relative to the binary
+/// (cargo `target/<profile>/` dev layout: ../../crates/.../eventlog).
+fn locate_event_dll() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let candidates = [
+        exe_dir.join(EVENT_DLL_FILE),
+        exe_dir.join(format!(
+            "../../crates/fishbowl-collector-windows/eventlog/{EVENT_DLL_FILE}"
+        )),
+    ];
+    candidates.into_iter().find(|p| p.exists())
+}
 
 pub fn install_service() -> Result<()> {
     let mgr = ServiceManager::local_computer(
@@ -249,6 +341,9 @@ pub fn install_service() -> Result<()> {
              ]\n\
              \n\
              [output]\n\
+             # sink: jsonl | eventlog | both. 'both' writes the Fishbowl/Operational\n\
+             # Event Log channel AND a JSONL backup file.\n\
+             sink = \"both\"\n\
              file_path = \"{out}\"\n",
             INDENT = "    ",
             claude = claude_dir.replace('\\', "\\\\"),
@@ -259,6 +354,13 @@ pub fn install_service() -> Result<()> {
         eprintln!("[fishbowl install] wrote default config to {}", cfg_path.display());
     } else {
         eprintln!("[fishbowl install] preserved existing config {}", cfg_path.display());
+    }
+
+    // Register the Event Log channel (best-effort; non-fatal if the resource
+    // DLL hasn't been built). Done before starting the service so the channel
+    // exists when the daemon's eventlog sink registers its provider.
+    if let Err(e) = register_event_manifest(&dir) {
+        eprintln!("[fishbowl install] Event Log registration error (non-fatal): {e:#}");
     }
 
     // Start it now. If start fails, the service is still registered and
@@ -302,6 +404,9 @@ pub fn uninstall_service() -> Result<()> {
 
     service.delete().with_context(|| "delete service")?;
     eprintln!("[fishbowl uninstall] service '{SERVICE_NAME}' removed");
+
+    // Best-effort removal of the Event Log channel.
+    unregister_event_manifest(&config::windows_program_data_dir());
     eprintln!(
         "[fishbowl uninstall] left in place: {} (config + events log)",
         config::windows_program_data_dir().display()

@@ -1,0 +1,9 @@
+# Build artifacts produced by build-manifest.ps1 (mc.exe -> rc.exe -> link.exe).
+# Not committed — rebuild from fishbowl.man with build-manifest.ps1. Only the
+# manifest and the build script are source.
+fishbowl.h
+fishbowl.rc
+fishbowl.res
+*.bin
+*.BIN
+fishbowl_events.dll

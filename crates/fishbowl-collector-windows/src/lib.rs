@@ -20,10 +20,18 @@
 #[cfg(target_os = "windows")]
 mod enrich;
 #[cfg(target_os = "windows")]
+mod eventlog;
+#[cfg(target_os = "windows")]
 mod windows_impl;
 
 #[cfg(target_os = "windows")]
 pub use windows_impl::{run, run_with_tick, CollectorConfig};
+
+/// Windows Event Log sink: writes events to the manifest-declared
+/// `Fishbowl/Operational` ETW channel. Re-exported so the daemon can select it
+/// via `output.sink = eventlog|both` without taking a direct ETW dependency.
+#[cfg(target_os = "windows")]
+pub use eventlog::EventLogSink;
 
 /// Query the working directory of an arbitrary running process by walking
 /// its PEB. Re-exported so the daemon can inject a Windows cwd resolver
