@@ -1,6 +1,7 @@
-# Session-only files (kept locally, not published)
-memory.md
-scenarios.md
+# Docs / notes are local-only working files, not published. README is the
+# sole exception — it's the repo's public entry point.
+*.md
+!README.md
 
 # Python
 __pycache__/
