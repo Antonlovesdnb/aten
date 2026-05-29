@@ -1,18 +1,17 @@
 //! Windows Event Log sink — writes fishbowl events to the manifest-declared
 //! ETW channel `Fishbowl/Operational`.
 //!
-//! This is the runtime counterpart of `eventlog/fishbowl.man`. The provider GUID
-//! and channel value here MUST match the manifest, and `event_id_for` MUST match
-//! the per-event `value="…"` in the manifest (the `event_ids_match_manifest`
-//! test guards the IDs).
+//! This is the runtime counterpart of `eventlog/fishbowl.man`. The provider
+//! GUID, channel value, per-event IDs, Task values, and — critically — the
+//! field ORDER of every event MUST match the manifest. Each event kind has its
+//! own template of typed, named fields (so Event Viewer renders native
+//! `<EventData>` and SIEM/WEF can address fields by XPath), with a trailing
+//! `RawJson` field carrying the whole event for anything not promoted.
 //!
-//! Because the manifest declares an Operational channel, `EventWrite` routes
-//! each event into the Windows Event Log (visible in Event Viewer, collectable
-//! by WEF / SIEM agents) — an unmanifested provider would only feed live trace
-//! sessions. The channel + message resources are registered separately at
-//! install time (`wevtutil im`); writing requires admin and a registered
-//! provider, but degrades silently (events are simply dropped by the OS if the
-//! provider/channel isn't enabled).
+//! Booleans are emitted as `"true"`/`"false"` strings to dodge ETW boolean
+//! width ambiguity; numeric ids/ports are `Int32`. The `fields_for_*` builders
+//! and the templates in fishbowl.man are a hand-maintained contract — the
+//! `field_counts_match_templates` test guards the field counts.
 
 use std::io;
 
@@ -26,7 +25,6 @@ use windows::Win32::System::Diagnostics::Etw::{
 pub const PROVIDER_GUID: GUID = GUID::from_u128(0x0e28e4c0_89f9_4b9d_9f35_bd497b26c397);
 
 /// Operational channel id — the `value="16"` on `<channel>` in fishbowl.man.
-/// Stamped into every EVENT_DESCRIPTOR.Channel so the event routes to the log.
 const CHANNEL_OPERATIONAL: u8 = 16;
 
 // ETW level constants (winmeta). Match the per-event `level=` in the manifest.
@@ -35,6 +33,7 @@ const LEVEL_INFORMATIONAL: u8 = 4;
 
 /// Map an event kind to its manifest Event ID. Kept in lockstep with the
 /// `value="…"` attributes in fishbowl.man (asserted by the unit test below).
+/// The manifest Task value is the same number, so this doubles as the Task.
 pub fn event_id_for(kind: &EventKind) -> u16 {
     match kind {
         EventKind::ProcessExec(_) => 1,
@@ -55,8 +54,7 @@ fn level_for(kind: &EventKind) -> u8 {
     }
 }
 
-/// The `process.pid` promoted into the event's `Pid` field, or 0 for the
-/// transcript-derived kinds that have no process.
+/// The `process.pid` for the generic-template kinds, or 0.
 fn pid_for(kind: &EventKind) -> i32 {
     match kind {
         EventKind::ProcessExec(p) => p.process.pid,
@@ -69,7 +67,6 @@ fn pid_for(kind: &EventKind) -> i32 {
 }
 
 /// A registered ETW provider that writes events to `Fishbowl/Operational`.
-/// `EventRegister` on `new`, `EventUnregister` on `Drop`.
 pub struct EventLogSink {
     handle: REGHANDLE,
 }
@@ -79,7 +76,6 @@ impl EventLogSink {
         let mut handle = REGHANDLE::default();
         // SAFETY: standard EventRegister call; `handle` is a valid out-param.
         let rc = unsafe { EventRegister(&PROVIDER_GUID, None, None, &mut handle) };
-        // EventRegister returns a Win32 error code; 0 == ERROR_SUCCESS.
         if rc != 0 {
             return Err(io::Error::from_raw_os_error(rc as i32));
         }
@@ -97,26 +93,25 @@ impl EventLogSink {
             Channel: CHANNEL_OPERATIONAL,
             Level: level_for(&ev.kind),
             Opcode: 0,
-            Task: 0,
+            Task: id, // manifest Task value == Event ID
             Keyword: 0,
         };
 
-        // Field order matches template `t_event`: EventJson, Pid, AgentId, HostId.
         let json = serde_json::to_string(ev).unwrap_or_default();
-        let json_w = utf16z(&json);
-        let pid = pid_for(&ev.kind);
-        let agent_w = utf16z(&ev.agent_id);
-        let host_w = utf16z(ev.host_id.as_deref().unwrap_or(""));
+        let fields = fields_for(ev, &json);
 
-        let data = [
-            desc_str(&json_w),
-            desc_i32(&pid),
-            desc_str(&agent_w),
-            desc_str(&host_w),
-        ];
+        // `fields` owns the backing buffers; the descriptors borrow into it and
+        // it stays alive across the EventWrite call below.
+        let data: Vec<EVENT_DATA_DESCRIPTOR> = fields
+            .iter()
+            .map(|f| match f {
+                Field::S(v) => desc_str(v),
+                Field::I(i) => desc_i32(i),
+            })
+            .collect();
 
-        // SAFETY: `data` outlives the call; each descriptor points at a live
-        // buffer with a correct byte length.
+        // SAFETY: every descriptor points at a live buffer in `fields` with a
+        // correct byte length; `data` and `fields` outlive the call.
         unsafe {
             let _ = EventWrite(self.handle, &desc, Some(&data));
         }
@@ -137,6 +132,131 @@ impl Drop for EventLogSink {
 // EventLogSink is safe to move across threads — the REGHANDLE is just a u64 and
 // EventWrite is internally synchronised by ETW.
 unsafe impl Send for EventLogSink {}
+
+/// One template field: an already-encoded UTF-16 string, or an i32.
+enum Field {
+    S(Vec<u16>),
+    I(i32),
+}
+
+fn s(v: &str) -> Field {
+    Field::S(utf16z(v))
+}
+fn so(v: Option<&str>) -> Field {
+    Field::S(utf16z(v.unwrap_or("")))
+}
+fn b(v: bool) -> Field {
+    Field::S(utf16z(if v { "true" } else { "false" }))
+}
+fn iv(v: i32) -> Field {
+    Field::I(v)
+}
+
+/// Serialize a serde enum to its wire string (e.g. `aws_credentials`, `tcp`)
+/// by stripping the JSON quotes.
+fn enum_str<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_string(v)
+        .ok()
+        .map(|s| s.trim_matches('"').to_string())
+        .unwrap_or_default()
+}
+
+/// Fields 1-15 shared by the kernel templates (t_proc_exec / t_cred / t_net).
+fn kernel_common(
+    ev: &Event,
+    p: &fishbowl_schema::Process,
+    a: &fishbowl_schema::Attribution,
+) -> Vec<Field> {
+    vec![
+        s(&ev.timestamp),
+        so(ev.host_id.as_deref()),
+        s(&ev.agent_id),
+        so(ev.user_id.as_deref()),
+        iv(p.pid),
+        iv(p.ppid),
+        s(&p.name),
+        s(&p.path),
+        s(&p.cmdline),
+        s(&p.user),
+        iv(p.agent_root_pid.unwrap_or(0)),
+        b(a.attributed_by_descent),
+        b(a.requested_in_tool_result),
+        so(a.triggering_command.as_deref()),
+        so(a.triggering_prompt.as_deref()),
+    ]
+}
+
+/// Envelope prefix (fields 1-5) shared by the transcript templates.
+fn envelope5(ev: &Event) -> Vec<Field> {
+    vec![
+        s(&ev.timestamp),
+        so(ev.host_id.as_deref()),
+        s(&ev.agent_id),
+        so(ev.user_id.as_deref()),
+        so(ev.session_id.as_deref()),
+    ]
+}
+
+/// Build the typed field list for `ev`, in the exact order of the matching
+/// template in fishbowl.man. `RawJson` is always last.
+fn fields_for(ev: &Event, json: &str) -> Vec<Field> {
+    match &ev.kind {
+        EventKind::ProcessExec(p) => {
+            let mut f = kernel_common(ev, &p.process, &p.attribution);
+            f.push(s(&p.exec_args.join(" ")));
+            f.push(s(json));
+            f
+        }
+        EventKind::CredentialAccess(p) => {
+            let mut f = kernel_common(ev, &p.process, &p.attribution);
+            f.push(s(&p.file_path));
+            f.push(s(&enum_str(&p.credential_class)));
+            f.push(s(&enum_str(&p.access_type)));
+            f.push(s(json));
+            f
+        }
+        EventKind::NetworkEgress(p) => {
+            let mut f = kernel_common(ev, &p.process, &p.attribution);
+            f.push(s(&p.dest_ip));
+            f.push(iv(p.dest_port as i32));
+            f.push(s(&enum_str(&p.protocol)));
+            f.push(so(p.dest_host.as_deref()));
+            f.push(s(json));
+            f
+        }
+        EventKind::Prompt(p) => {
+            let mut f = envelope5(ev);
+            f.push(s(&enum_str(&p.role)));
+            f.push(s(&p.prompt_summary));
+            f.push(s(json));
+            f
+        }
+        EventKind::ToolCall(p) => {
+            let mut f = envelope5(ev);
+            f.push(s(&p.tool_name));
+            f.push(s(&p.tool_call_id));
+            f.push(s(&p.tool_input_summary));
+            f.push(s(json));
+            f
+        }
+        EventKind::ToolResult(p) => {
+            let mut f = envelope5(ev);
+            f.push(s(&p.tool_call_id));
+            f.push(s(&enum_str(&p.result_status)));
+            f.push(s(&p.result_summary));
+            f.push(s(json));
+            f
+        }
+        // t_generic: Timestamp, HostId, AgentId, Pid, RawJson.
+        EventKind::ProcessExit(_) | EventKind::FileWrite(_) => vec![
+            s(&ev.timestamp),
+            so(ev.host_id.as_deref()),
+            s(&ev.agent_id),
+            iv(pid_for(&ev.kind)),
+            s(json),
+        ],
+    }
+}
 
 /// UTF-16, NUL-terminated (ETW UnicodeString fields include the terminator).
 fn utf16z(s: &str) -> Vec<u16> {
@@ -163,8 +283,8 @@ fn desc_i32(v: &i32) -> EVENT_DATA_DESCRIPTOR {
 mod tests {
     use super::*;
     use fishbowl_schema::{
-        Attribution, CredentialAccessPayload, CredentialClass, AccessType, NetworkEgressPayload,
-        ProcessExecPayload, Process, Protocol,
+        AccessType, Attribution, CredentialAccessPayload, CredentialClass, NetworkEgressPayload,
+        Process, ProcessExecPayload, PromptPayload, Protocol, Role, ToolCallPayload,
     };
 
     fn proc() -> Process {
@@ -195,10 +315,28 @@ mod tests {
             triggering_prompt: None,
         }
     }
+    fn ev(kind: EventKind) -> Event {
+        Event {
+            schema_version: "0.4".into(),
+            event_id: "id".into(),
+            timestamp: "2026-05-29T00:00:00Z".into(),
+            monotonic_ns: None,
+            platform: fishbowl_schema::Platform::Windows,
+            host_id: Some("host".into()),
+            agent_id: "claude.exe".into(),
+            session_id: None,
+            user_id: Some("u".into()),
+            source: fishbowl_schema::Source {
+                collector: "windows_etw".into(),
+                probe: "x".into(),
+                host_pid: Some(4242),
+            },
+            kind,
+        }
+    }
 
     #[test]
     fn event_ids_match_manifest() {
-        // These literals are the contract with fishbowl.man's value="…".
         let exec = EventKind::ProcessExec(ProcessExecPayload {
             process: proc(),
             attribution: attr(),
@@ -217,24 +355,73 @@ mod tests {
         });
         assert_eq!(event_id_for(&cred), 3);
         assert_eq!(level_for(&cred), LEVEL_WARNING);
-
-        let net = EventKind::NetworkEgress(NetworkEgressPayload {
-            process: proc(),
-            attribution: attr(),
-            dest_ip: "203.0.113.9".into(),
-            dest_port: 443,
-            dest_host: None,
-            protocol: Protocol::Tcp,
-            tls_sni: None,
-        });
-        assert_eq!(event_id_for(&net), 4);
-        assert_eq!(level_for(&net), LEVEL_WARNING);
-        assert_eq!(pid_for(&net), 4242);
     }
 
     #[test]
     fn utf16z_terminates() {
-        let v = utf16z("hi");
-        assert_eq!(v, vec![0x68, 0x69, 0x00]);
+        assert_eq!(utf16z("hi"), vec![0x68, 0x69, 0x00]);
+    }
+
+    #[test]
+    fn enum_str_strips_quotes() {
+        assert_eq!(enum_str(&CredentialClass::AwsCredentials), "aws_credentials");
+        assert_eq!(enum_str(&Protocol::Tcp), "tcp");
+        assert_eq!(enum_str(&AccessType::Open), "open");
+    }
+
+    /// The field count of each builder MUST equal its template's `<data>` count
+    /// in fishbowl.man, or Event Viewer renders garbage / truncates.
+    #[test]
+    fn field_counts_match_templates() {
+        let cred = ev(EventKind::CredentialAccess(CredentialAccessPayload {
+            process: proc(),
+            attribution: attr(),
+            file_path: "p".into(),
+            access_type: AccessType::Open,
+            credential_class: CredentialClass::AwsCredentials,
+            bytes_read: None,
+        }));
+        // t_cred: 15 common + FilePath + CredentialClass + AccessType + RawJson.
+        assert_eq!(fields_for(&cred, "{}").len(), 19);
+
+        let net = ev(EventKind::NetworkEgress(NetworkEgressPayload {
+            process: proc(),
+            attribution: attr(),
+            dest_ip: "1.2.3.4".into(),
+            dest_port: 443,
+            dest_host: None,
+            protocol: Protocol::Tcp,
+            tls_sni: None,
+        }));
+        // t_net: 15 common + DestIp + DestPort + Protocol + DestHost + RawJson.
+        assert_eq!(fields_for(&net, "{}").len(), 20);
+
+        let exec = ev(EventKind::ProcessExec(ProcessExecPayload {
+            process: proc(),
+            attribution: attr(),
+            exec_args: vec!["a".into()],
+            exec_envp_summary: String::new(),
+        }));
+        // t_proc_exec: 15 common + ExecArgs + RawJson.
+        assert_eq!(fields_for(&exec, "{}").len(), 17);
+
+        let prompt = ev(EventKind::Prompt(PromptPayload {
+            role: Role::User,
+            prompt_text: "hi".into(),
+            prompt_summary: "hi".into(),
+            message_id: None,
+        }));
+        // t_prompt: 5 envelope + Role + PromptSummary + RawJson.
+        assert_eq!(fields_for(&prompt, "{}").len(), 8);
+
+        let call = ev(EventKind::ToolCall(ToolCallPayload {
+            tool_call_id: "t".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+            tool_input_summary: "x".into(),
+            parent_message_id: None,
+        }));
+        // t_tool_call: 5 envelope + ToolName + ToolCallId + ToolInputSummary + RawJson.
+        assert_eq!(fields_for(&call, "{}").len(), 9);
     }
 }
