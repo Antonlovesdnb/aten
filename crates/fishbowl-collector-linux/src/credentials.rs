@@ -90,6 +90,21 @@ pub fn classify(path: &str) -> CredentialClass {
     CredentialClass::None
 }
 
+/// True when `path` is an AI agent's *own* configuration dotenv —
+/// `~/.claude/.env` or `~/.codex/.env`. The agent process loading its own
+/// config at startup is expected behavior, not credential access, and it
+/// otherwise dominates the `credential_access` stream (observed at ~89% of
+/// all such events, every one a self-read by the agent root).
+///
+/// Callers suppress these **only when the reader is the agent root itself**.
+/// A descendant reading the same file (e.g. a prompt-injected `cat
+/// ~/.claude/.env` run through the agent's shell tool) arrives with
+/// `descent=true` and is a genuine exfil signal — it is NOT suppressed.
+pub fn is_agent_config_dotenv(path: &str) -> bool {
+    let p = path.to_lowercase().replace('\\', "/");
+    p.ends_with("/.claude/.env") || p.ends_with("/.codex/.env")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +166,25 @@ mod tests {
         );
         assert_eq!(
             classify("/home/anton/proj/.env.production"),
+            CredentialClass::GenericDotenv
+        );
+    }
+
+    #[test]
+    fn agent_config_dotenv_detected() {
+        // The agent's own config dotenv, both path forms.
+        assert!(is_agent_config_dotenv("/home/anton/.claude/.env"));
+        assert!(is_agent_config_dotenv(r"C:\Users\anton\.claude\.env"));
+        assert!(is_agent_config_dotenv("/home/anton/.codex/.env"));
+        // A project `.env` is NOT the agent's own config — must stay a
+        // credential so descendant reads of it are still caught.
+        assert!(!is_agent_config_dotenv("/home/anton/proj/.env"));
+        // A descendant copy elsewhere isn't the agent config dotenv.
+        assert!(!is_agent_config_dotenv("/tmp/.env"));
+        // It is still classified as a credential by `classify` — the
+        // suppression is the caller's job, gated on agent-root identity.
+        assert_eq!(
+            classify(r"C:\Users\anton\.claude\.env"),
             CredentialClass::GenericDotenv
         );
     }

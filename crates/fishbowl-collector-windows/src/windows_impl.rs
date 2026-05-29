@@ -507,6 +507,17 @@ fn handle_file_event(
         return Ok(());
     }
 
+    // Reject FileName values that aren't well-formed paths *before*
+    // classifying. The kernel logs Create events for failed opens too, so a
+    // shell that tries to open an unexpanded `$env:USERPROFILE\.aws\...`
+    // (or any relative/garbage path), plus the occasional multi-KB corrupt
+    // FileName from ETW parse misalignment, would otherwise match a
+    // credential substring and emit a false `credential_access`. A real
+    // credential path always passes this check.
+    if !enrich::is_wellformed_file_path(&file_name) {
+        return Ok(());
+    }
+
     // Classify before doing anything PID-related — the vast majority of
     // file-create events aren't credentials and we want to drop them with
     // the minimum possible work (no Mutex acquisition, no Win32 calls).
@@ -531,6 +542,17 @@ fn handle_file_event(
     };
     let agent_root_pid = Some(rec.agent_root.pid);
     let is_agent_root = rec.agent_root.pid == pid as i32;
+
+    // Suppress the agent reading its OWN config dotenv (e.g. ~/.claude/.env)
+    // at startup. That's expected behavior, not credential access, and it
+    // was ~89% of all credential_access events — every one a self-read by
+    // the agent root. A *descendant* reading the same file is real exfil and
+    // still emits, because is_agent_root is false there. The early return
+    // drops the MutexGuard without counting the event as emitted.
+    if is_agent_root && credentials::is_agent_config_dotenv(&file_name) {
+        return Ok(());
+    }
+
     st.events_emitted += 1;
     drop(st);
 

@@ -421,6 +421,14 @@ where
     let is_agent_root = record.agent_root.pid == pid;
     let attributed_by_descent = !is_agent_root;
 
+    // Suppress the agent reading its OWN config dotenv (e.g. ~/.claude/.env)
+    // at startup — expected behavior, not credential access. Only when the
+    // reader IS the agent root; a descendant reading the same file is real
+    // exfil (descent=true) and still emits. Mirrors the Windows collector.
+    if is_agent_root && credentials::is_agent_config_dotenv(&abs_path) {
+        return Ok(());
+    }
+
     let process_name = if !snap.comm.is_empty() {
         snap.comm.clone()
     } else {

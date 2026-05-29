@@ -554,6 +554,82 @@ pub fn normalize_nt_path(nt_path: &str) -> String {
     nt_path.to_string()
 }
 
+/// True when `raw` (an ETW Kernel-File `FileName`, *before* NT-path
+/// normalization) looks like a real, well-formed path the kernel would
+/// deliver for an actual file open. Used to gate the credential-access
+/// handler so junk FileName values never reach the classifier and get
+/// emitted as bogus `credential_access` events.
+///
+/// Two distinct classes of junk have been observed reaching the handler,
+/// both producing false credential alerts because the classifier matched
+/// a `.aws`/`.ssh` substring inside the garbage:
+///
+///  1. **Failed opens of unexpanded / relative paths.** A shell that opens
+///     a literal `$env:USERPROFILE\.aws\credentials` (variable never
+///     expanded) or any relative path triggers a Kernel-File Create event
+///     for a path that doesn't resolve to a real file. These carry a
+///     mid-path `:` (or other character illegal in a Windows filename),
+///     which a genuine path never has past the drive letter.
+///
+///  2. **MSYS2/Cygwin failed opens.** Git Bash makes real (failing)
+///     `CreateFile` calls on garbage paths during command/path resolution —
+///     e.g. the entire `bash -c "..."` argument string resolved against the
+///     shell's cwd. MSYS2 encodes characters illegal in Windows filenames
+///     (`< > : " | ? *` and control chars like newline) into the Unicode
+///     Private Use Area by adding `0xF000`, so these strings carry
+///     `U+F000..=U+F0FF` code points no real path ever contains. Caught by
+///     both the PUA check and the length ceiling (observed cases are 0.5–1.7
+///     KB; a real credential path is well under MAX_PATH/260).
+///
+/// A legitimate credential path — NT-device form
+/// (`\Device\HarddiskVolumeN\Users\...\.aws\credentials`) or a drive-letter
+/// form — always passes.
+pub fn is_wellformed_file_path(raw: &str) -> bool {
+    // A real credential path is short. MAX_PATH is 260; the deepest
+    // well-known credential location (`...\AppData\Roaming\gcloud\
+    // application_default_credentials.json`) stays under ~150 even in NT
+    // form. 400 leaves generous headroom while still rejecting the
+    // multi-KB MSYS2-mangled command strings.
+    if raw.is_empty() || raw.len() > 400 {
+        return false;
+    }
+
+    // Any Cygwin/MSYS2 Private-Use-Area char (an illegal-filename char
+    // remapped by +0xF000) means this came from a shell's failed open of a
+    // non-path string, not a real file. Checked across the whole string,
+    // independent of length, so a short mangled path can't slip the ceiling.
+    if raw.chars().any(|c| matches!(c as u32, 0xF000..=0xF0FF)) {
+        return false;
+    }
+
+    // Locate the path "body" so the legitimate drive-letter colon in
+    // `C:\...` isn't itself flagged as an illegal mid-path colon.
+    let body = if is_drive_prefixed(raw) {
+        &raw[2..] // skip the "C:" drive designator
+    } else if raw.starts_with('\\') {
+        // NT-device (`\Device\...`) or UNC (`\\server\share`) form — no
+        // drive colon to skip.
+        raw
+    } else {
+        // No drive letter and no leading separator: not an absolute path
+        // the kernel emits for a real file. Reject.
+        return false;
+    };
+
+    // Past the drive letter, a real path contains none of the characters
+    // Windows forbids in filenames, nor any control character. Both junk
+    // classes that aren't already caught by length violate this.
+    !body
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || (c as u32) < 0x20)
+}
+
+/// `true` for strings beginning with a `X:\` or `X:/` drive designator.
+fn is_drive_prefixed(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
 /// Look up the owner of a file on disk and return `DOMAIN\username`.
 /// Used by the daemon to stamp `user_id` on transcript-derived events
 /// (Claude Code / Codex JSONLs live in a user's home dir; the file
@@ -844,5 +920,62 @@ mod tests {
         // The first entry should be our direct parent, matching what
         // get_own_ppid returns.
         assert_eq!(chain[0], get_own_ppid());
+    }
+
+    #[test]
+    fn wellformed_path_accepts_real_credential_paths() {
+        // Drive-letter form.
+        assert!(is_wellformed_file_path(r"C:\Users\aovru\.aws\credentials"));
+        assert!(is_wellformed_file_path(r"C:\Users\aovru\.ssh\fishbowl_vm_ed25519"));
+        // NT-device form (what the kernel actually delivers pre-normalize).
+        assert!(is_wellformed_file_path(
+            r"\Device\HarddiskVolume9\Users\aovru\.aws\credentials"
+        ));
+        // Deep but legitimate location stays well under the length cap.
+        assert!(is_wellformed_file_path(
+            r"\Device\HarddiskVolume9\Users\aovru\AppData\Roaming\gcloud\application_default_credentials.json"
+        ));
+        // Legitimate spaces in a directory name must not trip the filter.
+        assert!(is_wellformed_file_path(
+            r"C:\Program Files\Some App\.aws\credentials"
+        ));
+    }
+
+    #[test]
+    fn wellformed_path_rejects_unexpanded_variable() {
+        // bug #3: PowerShell opened a literal, unexpanded path. The mid-path
+        // ':' in "$env:" is illegal in a real Windows filename.
+        assert!(!is_wellformed_file_path(
+            r"C:\Users\aovru\Desktop\fishbowl-v2\$env:USERPROFILE\.aws\credentials"
+        ));
+    }
+
+    #[test]
+    fn wellformed_path_rejects_corrupt_overlong_filename() {
+        // bug #2: MSYS2 bash's failed open of a multi-KB command string.
+        // The real capture was 1748 chars; any path past the ceiling is junk.
+        let corrupt = format!(r"C:\Users\aovru\Desktop\fishbowl-v2\{}", "a/".repeat(400));
+        assert!(corrupt.len() > 400);
+        assert!(!is_wellformed_file_path(&corrupt));
+    }
+
+    #[test]
+    fn wellformed_path_rejects_cygwin_pua_chars() {
+        // bug #2 root cause: MSYS2 maps illegal-filename chars into the PUA
+        // (+0xF000). A SHORT such path must still be rejected, independent of
+        // the length ceiling. U+F03A is ':' (0x3A) remapped.
+        let mangled = format!("C:\\Users\\aovru\\x{}y\\.aws\\credentials", '\u{F03A}');
+        assert!(mangled.len() <= 400);
+        assert!(!is_wellformed_file_path(&mangled));
+    }
+
+    #[test]
+    fn wellformed_path_rejects_control_chars_and_relatives() {
+        // Embedded control character (e.g. a newline from a captured here-doc).
+        assert!(!is_wellformed_file_path("C:\\Users\\aovru\\cred\nentials"));
+        // Not absolute: no drive letter, no leading separator.
+        assert!(!is_wellformed_file_path(r"relative\.aws\credentials"));
+        // Empty.
+        assert!(!is_wellformed_file_path(""));
     }
 }
