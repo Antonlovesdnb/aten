@@ -161,7 +161,7 @@ fn enum_str<T: serde::Serialize>(v: &T) -> String {
         .unwrap_or_default()
 }
 
-/// Fields 1-15 shared by the kernel templates (t_proc_exec / t_cred / t_net).
+/// Fields 1-16 shared by the kernel templates (t_proc_exec / t_cred / t_net).
 fn kernel_common(
     ev: &Event,
     p: &fishbowl_schema::Process,
@@ -183,7 +183,18 @@ fn kernel_common(
         b(a.requested_in_tool_result),
         so(a.triggering_command.as_deref()),
         so(a.triggering_prompt.as_deref()),
+        s(&parent_chain_str(&p.parent_chain)),
     ]
+}
+
+/// Flatten the process ancestry to `root(pid) > … > parent(pid)` for the
+/// ParentChain field. Matches the schema's root → immediate-parent order.
+fn parent_chain_str(chain: &[fishbowl_schema::ParentChainEntry]) -> String {
+    chain
+        .iter()
+        .map(|e| format!("{}({})", e.name, e.pid))
+        .collect::<Vec<_>>()
+        .join(" > ")
 }
 
 /// Envelope prefix (fields 1-5) shared by the transcript templates.
@@ -363,6 +374,17 @@ mod tests {
     }
 
     #[test]
+    fn parent_chain_flattens() {
+        use fishbowl_schema::ParentChainEntry;
+        let chain = vec![
+            ParentChainEntry { pid: 100, name: "explorer.exe".into() },
+            ParentChainEntry { pid: 200, name: "claude.exe".into() },
+        ];
+        assert_eq!(parent_chain_str(&chain), "explorer.exe(100) > claude.exe(200)");
+        assert_eq!(parent_chain_str(&[]), "");
+    }
+
+    #[test]
     fn enum_str_strips_quotes() {
         assert_eq!(enum_str(&CredentialClass::AwsCredentials), "aws_credentials");
         assert_eq!(enum_str(&Protocol::Tcp), "tcp");
@@ -381,8 +403,8 @@ mod tests {
             credential_class: CredentialClass::AwsCredentials,
             bytes_read: None,
         }));
-        // t_cred: 15 common + FilePath + CredentialClass + AccessType + RawJson.
-        assert_eq!(fields_for(&cred, "{}").len(), 19);
+        // t_cred: 16 common + FilePath + CredentialClass + AccessType + RawJson.
+        assert_eq!(fields_for(&cred, "{}").len(), 20);
 
         let net = ev(EventKind::NetworkEgress(NetworkEgressPayload {
             process: proc(),
@@ -393,8 +415,8 @@ mod tests {
             protocol: Protocol::Tcp,
             tls_sni: None,
         }));
-        // t_net: 15 common + DestIp + DestPort + Protocol + DestHost + RawJson.
-        assert_eq!(fields_for(&net, "{}").len(), 20);
+        // t_net: 16 common + DestIp + DestPort + Protocol + DestHost + RawJson.
+        assert_eq!(fields_for(&net, "{}").len(), 21);
 
         let exec = ev(EventKind::ProcessExec(ProcessExecPayload {
             process: proc(),
@@ -402,8 +424,8 @@ mod tests {
             exec_args: vec!["a".into()],
             exec_envp_summary: String::new(),
         }));
-        // t_proc_exec: 15 common + ExecArgs + RawJson.
-        assert_eq!(fields_for(&exec, "{}").len(), 17);
+        // t_proc_exec: 16 common + ExecArgs + RawJson.
+        assert_eq!(fields_for(&exec, "{}").len(), 18);
 
         let prompt = ev(EventKind::Prompt(PromptPayload {
             role: Role::User,

@@ -60,11 +60,12 @@
         </tasks>
 
         <templates>
-          <!-- Common kernel prefix (fields 1-15) is identical across
+          <!-- Common kernel prefix (fields 1-16) is identical across
                t_proc_exec / t_cred / t_net so the message %-indices line up and
-               eventlog.rs can share one builder. RawJson is always the last
-               field. Booleans are emitted as "true"/"false" strings to avoid
-               ETW boolean width ambiguity. -->
+               eventlog.rs can share one builder. ParentChain is the flattened
+               "name(pid) > …" ancestry. RawJson is always the last field.
+               Booleans are emitted as "true"/"false" strings to avoid ETW
+               boolean width ambiguity. -->
           <template tid="t_proc_exec">
             <data name="Timestamp"             inType="win:UnicodeString"/>
             <data name="HostId"                inType="win:UnicodeString"/>
@@ -81,6 +82,7 @@
             <data name="RequestedInToolResult" inType="win:UnicodeString"/>
             <data name="TriggeringCommand"     inType="win:UnicodeString"/>
             <data name="TriggeringPrompt"      inType="win:UnicodeString"/>
+            <data name="ParentChain"           inType="win:UnicodeString"/>
             <data name="ExecArgs"              inType="win:UnicodeString"/>
             <data name="RawJson"               inType="win:UnicodeString"/>
           </template>
@@ -101,6 +103,7 @@
             <data name="RequestedInToolResult" inType="win:UnicodeString"/>
             <data name="TriggeringCommand"     inType="win:UnicodeString"/>
             <data name="TriggeringPrompt"      inType="win:UnicodeString"/>
+            <data name="ParentChain"           inType="win:UnicodeString"/>
             <data name="FilePath"              inType="win:UnicodeString"/>
             <data name="CredentialClass"       inType="win:UnicodeString"/>
             <data name="AccessType"            inType="win:UnicodeString"/>
@@ -123,6 +126,7 @@
             <data name="RequestedInToolResult" inType="win:UnicodeString"/>
             <data name="TriggeringCommand"     inType="win:UnicodeString"/>
             <data name="TriggeringPrompt"      inType="win:UnicodeString"/>
+            <data name="ParentChain"           inType="win:UnicodeString"/>
             <data name="DestIp"                inType="win:UnicodeString"/>
             <data name="DestPort"              inType="win:Int32"/>
             <data name="Protocol"              inType="win:UnicodeString"/>
@@ -211,8 +215,8 @@
              %8=ProcessPath throughout. -->
         <string id="evt.process_exec"      value="AI agent process exec by %7 (pid %5): %8"/>
         <string id="evt.process_exit"      value="AI agent process exit (pid %4)"/>
-        <string id="evt.credential_access" value="AI agent credential access by %7 (pid %5): %16 [%17]"/>
-        <string id="evt.network_egress"    value="AI agent network egress by %7 (pid %5) to %16:%17 (%18)"/>
+        <string id="evt.credential_access" value="AI agent credential access by %7 (pid %5): %17 [%18]"/>
+        <string id="evt.network_egress"    value="AI agent network egress by %7 (pid %5) to %17:%18 (%19)"/>
         <string id="evt.file_write"        value="AI agent file write (pid %4)"/>
         <string id="evt.prompt"            value="AI agent prompt (%6): %7"/>
         <string id="evt.tool_call"         value="AI agent tool call: %6"/>
