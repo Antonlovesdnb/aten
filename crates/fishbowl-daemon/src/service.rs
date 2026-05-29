@@ -62,6 +62,9 @@ const EVENT_MANIFEST: &str =
 /// Filenames inside `%ProgramData%\fishbowl`.
 const MANIFEST_FILE: &str = "fishbowl.man";
 const EVENT_DLL_FILE: &str = "fishbowl_events.dll";
+/// ETW provider name (matches `<provider name=…>` in fishbowl.man). Used to
+/// detect an existing registration on the upgrade path.
+const PROVIDER_NAME: &str = "Fishbowl";
 
 // ===== Service-mode logging ===================================================
 
@@ -200,16 +203,46 @@ fn service_main_impl() -> Result<()> {
 
 // ===== Install / uninstall ====================================================
 
-/// Register the Fishbowl Event Log channel: write the manifest to ProgramData,
-/// copy the compiled resource DLL next to it, and `wevtutil im` it. Best-effort
-/// — a failure (e.g. the DLL wasn't built yet) is logged and non-fatal, so the
-/// service still installs and the daemon can fall back to the JSONL sink.
+/// Run `wevtutil` with `args`, suppressing its console output (we narrate via
+/// our own `[fishbowl …]` lines). `Some(true)` = exit 0, `Some(false)` = ran
+/// but failed, `None` = couldn't spawn (wevtutil missing).
+fn wevtutil(args: &[&std::ffi::OsStr]) -> Option<bool> {
+    std::process::Command::new("wevtutil")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()
+        .map(|s| s.success())
+}
+
+/// True if the Fishbowl publisher is already registered (`wevtutil gp` succeeds
+/// only for an installed publisher) — i.e. this install is an upgrade.
+fn publisher_registered() -> bool {
+    matches!(
+        wevtutil(&[
+            std::ffi::OsStr::new("gp"),
+            std::ffi::OsStr::new(PROVIDER_NAME),
+        ]),
+        Some(true)
+    )
+}
+
+/// Register (or re-register) the Fishbowl Event Log channel.
 ///
-/// The DLL is located next to the installed binary (deploy convention) or, for
-/// dev runs from a cargo target dir, in the collector crate's `eventlog/` dir.
+/// Upgrade path is the tricky part: once the channel is registered, the
+/// Windows Event Log service maps the resource DLL and keeps a handle on it, so
+/// overwriting the canonical `fishbowl_events.dll` in place fails with a sharing
+/// violation. We therefore (1) `wevtutil um` any existing registration to drop
+/// the publisher, then (2) try to stage the new DLL at the canonical name and,
+/// if that's still locked, fall back to a fresh versioned filename and register
+/// *that* — sidestepping the lock without force-restarting the EventLog service
+/// (which would cycle its dependents). Stale DLLs are pruned best-effort.
+///
+/// Best-effort throughout: any failure is logged and non-fatal so the service
+/// still installs and the daemon can fall back to the JSONL sink.
 fn register_event_manifest(dir: &std::path::Path) -> Result<()> {
     let man_path = dir.join(MANIFEST_FILE);
-    let dll_dst = dir.join(EVENT_DLL_FILE);
     std::fs::write(&man_path, EVENT_MANIFEST)
         .with_context(|| format!("write {}", man_path.display()))?;
 
@@ -222,46 +255,111 @@ fn register_event_manifest(dir: &std::path::Path) -> Result<()> {
         );
         return Ok(());
     };
-    std::fs::copy(&dll_src, &dll_dst)
-        .with_context(|| format!("copy {} -> {}", dll_src.display(), dll_dst.display()))?;
 
-    let status = std::process::Command::new("wevtutil")
-        .arg("im")
-        .arg(&man_path)
-        .arg(format!("/rf:{}", dll_dst.display()))
-        .arg(format!("/mf:{}", dll_dst.display()))
-        .status();
-    match status {
-        Ok(s) if s.success() => {
-            eprintln!("[fishbowl install] registered Event Log channel Fishbowl/Operational");
+    // Upgrade: unregister the previous publisher first so the EventLog service
+    // releases its handle on the old resource DLL.
+    let upgrading = publisher_registered();
+    if upgrading {
+        let _ = wevtutil(&[std::ffi::OsStr::new("um"), man_path.as_os_str()]);
+        eprintln!("[fishbowl install] upgrade: unregistered previous Event Log publisher");
+    }
+
+    let Some(dll_dst) = stage_event_dll(dir, &dll_src) else {
+        eprintln!(
+            "[fishbowl install] {EVENT_DLL_FILE} is in use and no writable fallback name was \
+             available — left the existing Event Log channel registered. A reboot (or EventLog \
+             service restart) frees the old DLL; JSONL output is unaffected meanwhile."
+        );
+        return Ok(());
+    };
+
+    let ok = wevtutil(&[
+        std::ffi::OsStr::new("im"),
+        man_path.as_os_str(),
+        std::ffi::OsStr::new(&format!("/rf:{}", dll_dst.display())),
+        std::ffi::OsStr::new(&format!("/mf:{}", dll_dst.display())),
+    ]);
+    match ok {
+        Some(true) => {
+            let verb = if upgrading { "updated" } else { "registered" };
+            eprintln!(
+                "[fishbowl install] {verb} Event Log channel Fishbowl/Operational (resources: {})",
+                dll_dst.file_name().unwrap_or_default().to_string_lossy()
+            );
+            if upgrading {
+                eprintln!(
+                    "[fishbowl install] note: already-open Event Viewer windows cache the old \
+                     schema — reopen Event Viewer to see the updated fields."
+                );
+            }
         }
-        Ok(s) => eprintln!(
-            "[fishbowl install] wevtutil im exited with {s}; Event Log channel not registered \
+        Some(false) => eprintln!(
+            "[fishbowl install] wevtutil im failed; Event Log channel not registered \
              (run as admin). JSONL output is unaffected."
         ),
-        Err(e) => eprintln!("[fishbowl install] could not run wevtutil ({e}); skipping channel"),
+        None => eprintln!("[fishbowl install] could not run wevtutil; skipping channel"),
     }
+
+    prune_stale_event_dlls(dir, &dll_dst);
     Ok(())
 }
 
-/// Best-effort unregister of the Event Log channel. The manifest copy in
-/// ProgramData is what `wevtutil um` needs; leave it on disk afterward.
+/// Copy the resource DLL into `dir`. Prefer the canonical name; if it's locked
+/// (an active registration still maps the previous copy), stage under a fresh
+/// `fishbowl_events.<millis>.dll` and return that. `None` if neither works.
+fn stage_event_dll(dir: &std::path::Path, src: &std::path::Path) -> Option<std::path::PathBuf> {
+    let canonical = dir.join(EVENT_DLL_FILE);
+    if std::fs::copy(src, &canonical).is_ok() {
+        return Some(canonical);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let versioned = dir.join(format!("fishbowl_events.{stamp}.dll"));
+    if std::fs::copy(src, &versioned).is_ok() {
+        return Some(versioned);
+    }
+    None
+}
+
+/// Remove `fishbowl_events*.dll` files in `dir` other than `keep`. Best-effort:
+/// the currently-registered DLL (and any still mapped by the EventLog service)
+/// is locked and silently skipped.
+fn prune_stale_event_dlls(dir: &std::path::Path, keep: &std::path::Path) {
+    let keep_name = keep.file_name().unwrap_or_default().to_os_string();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == keep_name {
+            continue;
+        }
+        let s = name.to_string_lossy();
+        if s.starts_with("fishbowl_events") && s.ends_with(".dll") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Best-effort unregister of the Event Log channel + prune of staged resource
+/// DLLs. The manifest copy in ProgramData is what `wevtutil um` needs.
 fn unregister_event_manifest(dir: &std::path::Path) {
     let man_path = dir.join(MANIFEST_FILE);
     if !man_path.exists() {
         return;
     }
-    match std::process::Command::new("wevtutil")
-        .arg("um")
-        .arg(&man_path)
-        .status()
-    {
-        Ok(s) if s.success() => {
+    match wevtutil(&[std::ffi::OsStr::new("um"), man_path.as_os_str()]) {
+        Some(true) => {
             eprintln!("[fishbowl uninstall] removed Event Log channel Fishbowl/Operational")
         }
-        Ok(s) => eprintln!("[fishbowl uninstall] wevtutil um exited with {s} (non-fatal)"),
-        Err(e) => eprintln!("[fishbowl uninstall] could not run wevtutil ({e}) (non-fatal)"),
+        Some(false) => eprintln!("[fishbowl uninstall] wevtutil um failed (non-fatal)"),
+        None => eprintln!("[fishbowl uninstall] could not run wevtutil (non-fatal)"),
     }
+    // After um the service releases the DLL handles; drop the staged DLLs.
+    // (keep = a non-existent sentinel so all fishbowl_events*.dll are pruned.)
+    prune_stale_event_dlls(dir, &dir.join("__none__"));
 }
 
 /// Find the compiled resource DLL: next to the running binary first (deploy
@@ -305,13 +403,34 @@ pub fn install_service() -> Result<()> {
         account_password: None,
     };
 
-    let service = mgr
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
-        .with_context(|| "create_service")?;
+    // Idempotent: if the service already exists (an upgrade / re-run), open and
+    // update it instead of erroring out. Need STOP + QUERY_STATUS too so we can
+    // restart it at the end to pick up the new binary/config.
+    let access = ServiceAccess::CHANGE_CONFIG
+        | ServiceAccess::START
+        | ServiceAccess::STOP
+        | ServiceAccess::QUERY_STATUS;
+    let (service, upgrading) = match mgr.open_service(SERVICE_NAME, access) {
+        Ok(svc) => {
+            eprintln!("[fishbowl install] service '{SERVICE_NAME}' already exists — upgrading");
+            // Point the existing registration at the current binary/launch args
+            // in case the install location changed.
+            if let Err(e) = svc.change_config(&info) {
+                eprintln!("[fishbowl install] could not update service config (non-fatal): {e}");
+            }
+            (svc, true)
+        }
+        Err(_) => {
+            let svc = mgr
+                .create_service(&info, access)
+                .with_context(|| "create_service")?;
+            eprintln!("[fishbowl install] registered service '{SERVICE_NAME}'");
+            (svc, false)
+        }
+    };
     service
         .set_description(SERVICE_DESCRIPTION)
         .ok(); // non-fatal if it fails
-    eprintln!("[fishbowl install] registered service '{SERVICE_NAME}'");
 
     // Drop a default config if none exists yet. Discovers the *current
     // user's* Claude/Codex transcript dirs by looking at USERPROFILE,
@@ -361,6 +480,25 @@ pub fn install_service() -> Result<()> {
     // exists when the daemon's eventlog sink registers its provider.
     if let Err(e) = register_event_manifest(&dir) {
         eprintln!("[fishbowl install] Event Log registration error (non-fatal): {e:#}");
+    }
+
+    // On upgrade the old binary may still be running — stop it first so the
+    // restart below launches the new one. (Fresh install: it's already stopped.)
+    if upgrading {
+        if let Ok(status) = service.query_status() {
+            if status.current_state != ServiceState::Stopped {
+                let _ = service.stop();
+                for _ in 0..20 {
+                    std::thread::sleep(Duration::from_millis(250));
+                    if matches!(
+                        service.query_status().map(|s| s.current_state),
+                        Ok(ServiceState::Stopped)
+                    ) {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     // Start it now. If start fails, the service is still registered and
