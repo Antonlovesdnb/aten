@@ -8,10 +8,10 @@ Captures **prompts + tool calls + endpoint syscalls** and joins them by session 
 
 Planning + prototype phase. No deployable build yet.
 
-- [`plan.md`](./plan.md) — direction, positioning, scope, effort estimate
-- [`schema.md`](./schema.md) — unified cross-platform event schema (v0.2), attribution model, killer detection
-- [`scenario-prompt-injection.md`](./scenario-prompt-injection.md) — second-scenario walkthrough that pressure-tested the schema
-- [`landscape.md`](./landscape.md) — prior art (AgentSight, Sysdig, ARMO), unoccupied lanes
+Design docs (direction/scope, the unified event schema + attribution model,
+scenario walkthroughs, and the prior-art landscape) live as local working notes
+in the repo root and aren't published.
+
 - [`prototypes/transcript_reader/`](./prototypes/transcript_reader/) — Python prototype that reads Claude Code transcripts and emits schema-v0.2 events
 
 ## Relation to v1
