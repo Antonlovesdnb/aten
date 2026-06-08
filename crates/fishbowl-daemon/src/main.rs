@@ -22,6 +22,8 @@ use fishbowl_schema::Platform;
 mod config;
 #[cfg(target_os = "windows")]
 mod service;
+#[cfg(target_os = "linux")]
+mod service_linux;
 mod sink;
 
 /// Merged inputs for a daemon run, after layering CLI flags over the
@@ -134,16 +136,17 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Register the daemon as a Windows service (`fishbowlsvc`). Drops a
-    /// default config.toml in `%ProgramData%\fishbowl\` if none exists,
-    /// pointing at the current user's Claude/Codex transcript dirs.
-    /// Service runs as LocalSystem and auto-starts on boot. Needs admin.
-    #[cfg(target_os = "windows")]
+    /// Install fishbowl as a system service so it survives reboots. On Windows:
+    /// the `fishbowlsvc` SCM service (LocalSystem, auto-start) + the
+    /// `Fishbowl/Operational` Event Log channel. On Linux: writes
+    /// `/etc/systemd/system/fishbowl.service` and `systemctl enable --now`s it.
+    /// Drops a default config if none exists. Needs admin/root. Re-running
+    /// upgrades an existing install in place.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     Install,
-    /// Stop and unregister the `fishbowlsvc` service. Leaves config and
-    /// the events JSONL on disk so you can inspect them after the
-    /// service is gone. Needs admin.
-    #[cfg(target_os = "windows")]
+    /// Stop and remove the fishbowl service (SCM service on Windows, systemd
+    /// unit on Linux). Leaves config + event log on disk. Needs admin/root.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     Uninstall,
     /// Service entry point. Invoked by SCM (not by humans typing).
     /// `fishbowl install` registers this subcommand as the service's
@@ -272,6 +275,10 @@ fn main() -> Result<()> {
         Command::Uninstall => service::uninstall_service()?,
         #[cfg(target_os = "windows")]
         Command::Service => service::run_service_dispatcher()?,
+        #[cfg(target_os = "linux")]
+        Command::Install => service_linux::install_service()?,
+        #[cfg(target_os = "linux")]
+        Command::Uninstall => service_linux::uninstall_service()?,
         #[cfg(target_os = "windows")]
         Command::CollectWindows {
             agents,
