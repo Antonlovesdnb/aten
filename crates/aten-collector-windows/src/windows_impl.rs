@@ -630,19 +630,23 @@ fn handle_file_event(
     // The Kernel-File Create event packs the NtCreateFile *disposition* in the
     // high byte of CreateOptions (the long-standing FileIo convention):
     // 0=SUPERSEDE 1=OPEN 2=CREATE 3=OPEN_IF 4=OVERWRITE 5=OVERWRITE_IF. We
-    // treat SUPERSEDE/CREATE/OVERWRITE/OVERWRITE_IF as write-intent. OPEN_IF
-    // (3) is read-or-create and too ambiguous to count as a write.
+    // treat everything except plain OPEN(1) as write-intent — including OPEN_IF
+    // (3), which is what Win32 `OPEN_ALWAYS` maps to and is the common
+    // open-or-create-then-write disposition.
+    //
+    // KNOWN GAP: the Create event carries no access mask (DesiredAccess), so a
+    // pure OPEN(1) of an *existing* file followed by a write (Win32
+    // OPEN_EXISTING + GENERIC_WRITE — modify-in-place) is indistinguishable
+    // here from a read and is NOT flagged as a write. Closing that needs the
+    // Kernel-File Write event + a FileObject->name cache (a separate probe).
     //
     // Safety / non-regression: if CreateOptions can't be parsed it comes back
     // 0, which makes `write_intent` false, so the event falls through to the
-    // unchanged credential-read path. A write to a credential-class path is
-    // therefore reported as file_write{Credential} (planting), while a read of
-    // one stays credential_access (exfil) — see handle_dns_event's sibling
-    // VERIFY note: the disposition packing is the field most worth a live
-    // smoke-test on first run.
+    // unchanged credential path; credential paths are owned by
+    // credential_access regardless (filewrite::classify returns None for them).
     let create_options: u32 = parser.try_parse("CreateOptions").unwrap_or(0);
     let disposition = (create_options >> 24) & 0xFF;
-    let write_intent = create_options != 0 && matches!(disposition, 0 | 2 | 4 | 5);
+    let write_intent = create_options != 0 && matches!(disposition, 0 | 2 | 3 | 4 | 5);
 
     if write_intent {
         if let Some(write_class) = filewrite::classify(&file_name) {
@@ -1060,6 +1064,28 @@ fn handle_dns_event(
         return Ok(());
     }
 
+    // Enrollment gate FIRST — before the schema lookup and per-field parse. The
+    // DNS-Client provider fires for every host DNS resolution, the vast
+    // majority from non-enrolled processes; doing the expensive parse for all
+    // of them inside the latency-budgeted ETW callback risks the session
+    // dropping the cred/exec events that actually matter. The PID is in the
+    // event header (same as Kernel-File Create), so it's cheap to check first.
+    let pid: u32 = record.process_id();
+    if pid == 0 {
+        return Ok(());
+    }
+
+    let (agent_root_pid, is_agent_root, cached) = {
+        let mut st = state.lock().expect("state lock");
+        let Some(rec) = resolve_enrollment_for_pid(pid, &mut st) else {
+            return Ok(());
+        };
+        let cached = st.proc_info.get(&(pid as i32)).cloned();
+        st.events_emitted += 1;
+        (Some(rec.agent_root.pid), rec.agent_root.pid == pid as i32, cached)
+    };
+
+    // Only now — for an enrolled process — do the costly schema lookup + parse.
     let schema = locator
         .event_schema(record)
         .map_err(|e| anyhow!("schema lookup: {e:?}"))?;
@@ -1071,23 +1097,6 @@ fn handle_dns_event(
     }
     let qtype: u32 = parser.try_parse("QueryType").unwrap_or(0);
     let query_results: String = parser.try_parse("QueryResults").unwrap_or_default();
-
-    // DNS-Client events carry the requesting PID in the event header, not the
-    // payload (same as Kernel-File Create).
-    let pid: u32 = record.process_id();
-    if pid == 0 {
-        return Ok(());
-    }
-
-    let mut st = state.lock().expect("state lock");
-    let Some(rec) = resolve_enrollment_for_pid(pid, &mut st) else {
-        return Ok(());
-    };
-    let agent_root_pid = Some(rec.agent_root.pid);
-    let is_agent_root = rec.agent_root.pid == pid as i32;
-    let cached = st.proc_info.get(&(pid as i32)).cloned();
-    st.events_emitted += 1;
-    drop(st);
 
     let (process_name, image_path, cmdline, user, start_time_ticks) =
         resolve_proc_identity(pid, cached);

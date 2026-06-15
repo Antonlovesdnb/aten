@@ -456,7 +456,7 @@ impl AttributionEngine {
                     c.attribution.attributed_tool_call_id = Some(tc.id.clone());
                     c.attribution.time_window_ms = time_window_ms;
                     c.attribution.requested_by_tool_call = tc.input_text.contains(&path)
-                        || tc.input_text.to_lowercase().contains(&normalized);
+                        || tc.input_text_lower.contains(&normalized);
                 }
                 c.attribution.triggering_command = triggering_command;
                 c.attribution.triggering_prompt = triggering_prompt;
@@ -506,11 +506,11 @@ impl AttributionEngine {
                 if let Some(tc) = confident_tc {
                     d.attribution.attributed_tool_call_id = Some(tc.id.clone());
                     d.attribution.time_window_ms = time_window_ms;
-                    // query_name is already lowercased by the collectors; the
-                    // tool input is not, so lowercase it before matching (a
-                    // `curl HTTPS://Host` would otherwise miss).
+                    // query_name is already lowercased by the collectors; match
+                    // against the precomputed lowercased tool input (a
+                    // `curl HTTPS://Host` would otherwise miss on case).
                     d.attribution.requested_by_tool_call =
-                        tc.input_text.to_lowercase().contains(&name);
+                        tc.input_text_lower.contains(&name);
                 }
                 d.attribution.triggering_command = triggering_command;
                 d.attribution.triggering_prompt = triggering_prompt;
@@ -537,7 +537,7 @@ impl AttributionEngine {
                     f.attribution.attributed_tool_call_id = Some(tc.id.clone());
                     f.attribution.time_window_ms = time_window_ms;
                     f.attribution.requested_by_tool_call = tc.input_text.contains(&path)
-                        || tc.input_text.to_lowercase().contains(&normalized);
+                        || tc.input_text_lower.contains(&normalized);
                 }
                 f.attribution.triggering_command = triggering_command;
                 f.attribution.triggering_prompt = triggering_prompt;

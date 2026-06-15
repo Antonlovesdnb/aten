@@ -27,6 +27,13 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 
+// bpf_copy_from_user_str's pad flag. Defined in newer uapi/linux/bpf.h as
+// (1ULL << 0); define it here in case the headers this builds against predate
+// it (the kfunc itself, kernel >= 6.11, accepts the flag at runtime).
+#ifndef BPF_F_PAD_ZEROS
+#define BPF_F_PAD_ZEROS (1ULL << 0)
+#endif
+
 #define TASK_COMM_LEN 16
 #define MAX_QNAME_LEN 256
 
@@ -122,7 +129,12 @@ int handle_getaddrinfo(struct pt_regs *ctx) {
     e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
-    long n = bpf_copy_from_user_str(e->qname, sizeof(e->qname), node, 0);
+    // BPF_F_PAD_ZEROS zeroes the tail after the NUL. bpf_ringbuf_reserve hands
+    // back uninitialized memory that may hold a prior record's hostname, so
+    // without padding the unused tail of qname would carry stale bytes through
+    // the ringbuf — a latent info-leak the moment anything reads the whole
+    // [u8; 256] instead of stopping at the NUL.
+    long n = bpf_copy_from_user_str(e->qname, sizeof(e->qname), node, BPF_F_PAD_ZEROS);
     if (n < 0) {
         bpf_ringbuf_discard(e, 0); // unreadable pointer — drop, don't emit ""
         return 0;

@@ -717,7 +717,9 @@ where
         .map_err(|_| anyhow!("ringbuf record size mismatch"))?;
 
     let pid = raw.pid as i32;
-    let qname = nul_str(&raw.qname).trim_end_matches('.').to_lowercase();
+    let qname = nul_str_lossy(&raw.qname)
+        .trim_end_matches('.')
+        .to_lowercase();
     if qname.is_empty() {
         return Ok(());
     }
@@ -1006,6 +1008,15 @@ fn libc_path() -> Option<String> {
 fn nul_str(buf: &[u8]) -> &str {
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     std::str::from_utf8(&buf[..len]).unwrap_or("")
+}
+
+/// Like `nul_str` but lossily decodes invalid UTF-8 (→ U+FFFD) instead of
+/// collapsing to "". Used for the DNS hostname, which is attacker-controlled:
+/// a deliberately non-UTF-8 byte in `node` must not make the whole query vanish
+/// from telemetry (it would, since the handler drops empty query_names).
+fn nul_str_lossy(buf: &[u8]) -> String {
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
 fn argv_from_cmdline(cmdline: &str) -> Vec<String> {

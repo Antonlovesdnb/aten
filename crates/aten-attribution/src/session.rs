@@ -17,6 +17,11 @@ pub struct ToolCallEntry {
     pub id: String,
     pub name: String,
     pub input_text: String,
+    /// Lowercased `input_text`, precomputed once at construction. Attribution
+    /// matches the (already-lowercased) primary identifier against this on
+    /// every kernel event attributed to this tool call; computing it here
+    /// avoids re-lowercasing the (potentially multi-KB) input per event.
+    pub input_text_lower: String,
     pub timestamp_ns: i64,
 }
 
@@ -81,10 +86,12 @@ impl SessionState {
             match &ev.kind {
                 EventKind::ToolCall(tc) => {
                     let ts_ns = parse_rfc3339_ns(&ev.timestamp).unwrap_or(i64::MAX);
+                    let input_text = tc.tool_input.to_string();
                     self.tool_calls.push(ToolCallEntry {
                         id: tc.tool_call_id.clone(),
                         name: tc.tool_name.clone(),
-                        input_text: tc.tool_input.to_string(),
+                        input_text_lower: input_text.to_lowercase(),
+                        input_text,
                         timestamp_ns: ts_ns,
                     });
                 }
@@ -237,9 +244,9 @@ mod tests {
     fn attribute_at_picks_most_recent_le() {
         let s = SessionState {
             tool_calls: vec![
-                ToolCallEntry { id: "t1".into(), name: "Bash".into(), input_text: "".into(), timestamp_ns: 100 },
-                ToolCallEntry { id: "t2".into(), name: "Bash".into(), input_text: "".into(), timestamp_ns: 200 },
-                ToolCallEntry { id: "t3".into(), name: "Bash".into(), input_text: "".into(), timestamp_ns: 300 },
+                ToolCallEntry { id: "t1".into(), name: "Bash".into(), input_text: "".into(), input_text_lower: "".into(), timestamp_ns: 100 },
+                ToolCallEntry { id: "t2".into(), name: "Bash".into(), input_text: "".into(), input_text_lower: "".into(), timestamp_ns: 200 },
+                ToolCallEntry { id: "t3".into(), name: "Bash".into(), input_text: "".into(), input_text_lower: "".into(), timestamp_ns: 300 },
             ],
             ..Default::default()
         };

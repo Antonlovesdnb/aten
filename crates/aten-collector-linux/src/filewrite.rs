@@ -31,8 +31,11 @@ use aten_schema::FileWriteClass;
 /// Best-effort classification of a written path. Returns `None` for ordinary
 /// writes the collector should drop *and* for credential paths (owned by
 /// `credential_access`). Priority is AgentConfig → Executable.
+///
+/// Runs in the hot path (every write-intent open), so it normalizes in a single
+/// allocation rather than `to_lowercase().replace()` (which allocated twice).
 pub fn classify(path: &str) -> Option<FileWriteClass> {
-    let p = path.to_lowercase().replace('\\', "/");
+    let p = normalize(path);
 
     if is_agent_config(&p) {
         return Some(FileWriteClass::AgentConfig);
@@ -41,6 +44,21 @@ pub fn classify(path: &str) -> Option<FileWriteClass> {
         return Some(FileWriteClass::Executable);
     }
     None
+}
+
+/// Lowercase + backslash→forward-slash in one pass / one allocation.
+fn normalize(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c == '\\' {
+            out.push('/');
+        } else {
+            for lc in c.to_lowercase() {
+                out.push(lc);
+            }
+        }
+    }
+    out
 }
 
 /// The agent's own configuration surface — the high-signal subset of an agent
