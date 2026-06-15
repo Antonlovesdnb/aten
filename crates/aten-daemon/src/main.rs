@@ -1231,6 +1231,7 @@ fn run_transcript(
             aten_schema::EventKind::ProcessExit(_) => "process_exit",
             aten_schema::EventKind::CredentialAccess(_) => "credential_access",
             aten_schema::EventKind::NetworkEgress(_) => "network_egress",
+            aten_schema::EventKind::DnsQuery(_) => "dns_query",
             aten_schema::EventKind::FileWrite(_) => "file_write",
         };
         *by_type.entry(key).or_insert(0) += 1;

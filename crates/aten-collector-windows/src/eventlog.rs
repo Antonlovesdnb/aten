@@ -41,6 +41,7 @@ pub fn event_id_for(kind: &EventKind) -> u16 {
         EventKind::CredentialAccess(_) => 3,
         EventKind::NetworkEgress(_) => 4,
         EventKind::FileWrite(_) => 5,
+        EventKind::DnsQuery(_) => 6,
         EventKind::Prompt(_) => 10,
         EventKind::ToolCall(_) => 11,
         EventKind::ToolResult(_) => 12,
@@ -49,7 +50,11 @@ pub fn event_id_for(kind: &EventKind) -> u16 {
 
 fn level_for(kind: &EventKind) -> u8 {
     match kind {
-        EventKind::CredentialAccess(_) | EventKind::NetworkEgress(_) => LEVEL_WARNING,
+        EventKind::CredentialAccess(_)
+        | EventKind::NetworkEgress(_)
+        | EventKind::FileWrite(_) => LEVEL_WARNING,
+        // A DNS query on its own is benign (agents resolve their own API
+        // hosts constantly); the SIEM rule elevates it by joining to origin.
         _ => LEVEL_INFORMATIONAL,
     }
 }
@@ -62,6 +67,7 @@ fn pid_for(kind: &EventKind) -> i32 {
         EventKind::CredentialAccess(p) => p.process.pid,
         EventKind::NetworkEgress(p) => p.process.pid,
         EventKind::FileWrite(p) => p.process.pid,
+        EventKind::DnsQuery(p) => p.process.pid,
         EventKind::Prompt(_) | EventKind::ToolCall(_) | EventKind::ToolResult(_) => 0,
     }
 }
@@ -258,8 +264,27 @@ fn fields_for(ev: &Event, json: &str) -> Vec<Field> {
             f.push(s(json));
             f
         }
+        EventKind::FileWrite(p) => {
+            let mut f = kernel_common(ev, &p.process, &p.attribution);
+            f.push(s(&p.file_path));
+            f.push(s(&enum_str(&p.write_class)));
+            // BytesWritten as a string: the number, or "" when the probe only
+            // saw the open-for-write (Option::None).
+            f.push(s(&p.bytes_written.map(|n| n.to_string()).unwrap_or_default()));
+            f.push(s(json));
+            f
+        }
+        EventKind::DnsQuery(p) => {
+            let mut f = kernel_common(ev, &p.process, &p.attribution);
+            f.push(s(&p.query_name));
+            f.push(s(&enum_str(&p.query_type)));
+            // Answers flattened comma-separated; "" when only the query was seen.
+            f.push(s(&p.answers.join(",")));
+            f.push(s(json));
+            f
+        }
         // t_generic: Timestamp, HostId, AgentId, Pid, RawJson.
-        EventKind::ProcessExit(_) | EventKind::FileWrite(_) => vec![
+        EventKind::ProcessExit(_) => vec![
             s(&ev.timestamp),
             so(ev.host_id.as_deref()),
             s(&ev.agent_id),
@@ -445,5 +470,28 @@ mod tests {
         }));
         // t_tool_call: 5 envelope + ToolName + ToolCallId + ToolInputSummary + RawJson.
         assert_eq!(fields_for(&call, "{}").len(), 9);
+
+        let file = ev(EventKind::FileWrite(aten_schema::FileWritePayload {
+            process: proc(),
+            attribution: attr(),
+            file_path: "C:\\x\\.claude\\settings.json".into(),
+            bytes_written: Some(128),
+            write_class: aten_schema::FileWriteClass::AgentConfig,
+        }));
+        // t_file: 16 common + FilePath + WriteClass + BytesWritten + RawJson.
+        assert_eq!(fields_for(&file, "{}").len(), 20);
+        assert_eq!(event_id_for(&file.kind), 5);
+        assert_eq!(level_for(&file.kind), LEVEL_WARNING);
+
+        let dns = ev(EventKind::DnsQuery(aten_schema::DnsQueryPayload {
+            process: proc(),
+            attribution: attr(),
+            query_name: "research.attacker.com".into(),
+            query_type: aten_schema::DnsQueryType::Txt,
+            answers: vec!["1.2.3.4".into()],
+        }));
+        // t_dns: 16 common + QueryName + QueryType + Answers + RawJson.
+        assert_eq!(fields_for(&dns, "{}").len(), 20);
+        assert_eq!(event_id_for(&dns.kind), 6);
     }
 }

@@ -77,6 +77,111 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "aten-attribution"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aten-schema",
+ "aten-transcript",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "aten-collector-linux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aten-schema",
+ "libbpf-cargo",
+ "libbpf-rs",
+ "libc",
+ "plain",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "aten-collector-macos"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aten-collector-linux",
+ "aten-schema",
+ "chrono",
+ "endpoint-sec",
+ "libc",
+ "libproc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "aten-collector-windows"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aten-collector-linux",
+ "aten-schema",
+ "chrono",
+ "ferrisetw",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "aten-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aten-attribution",
+ "aten-collector-linux",
+ "aten-collector-macos",
+ "aten-collector-windows",
+ "aten-schema",
+ "aten-transcript",
+ "chrono",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "toml",
+ "windows 0.62.2",
+ "windows-service",
+]
+
+[[package]]
+name = "aten-schema"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "aten-transcript"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aten-schema",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -347,111 +452,6 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
-
-[[package]]
-name = "aten-attribution"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "aten-schema",
- "aten-transcript",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "aten-collector-linux"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aten-schema",
- "libbpf-cargo",
- "libbpf-rs",
- "libc",
- "plain",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
-name = "aten-collector-macos"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "endpoint-sec",
- "aten-collector-linux",
- "aten-schema",
- "libc",
- "libproc",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
-name = "aten-collector-windows"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "ferrisetw",
- "aten-collector-linux",
- "aten-schema",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
- "windows 0.62.2",
-]
-
-[[package]]
-name = "aten-daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "aten-attribution",
- "aten-collector-linux",
- "aten-collector-macos",
- "aten-collector-windows",
- "aten-schema",
- "aten-transcript",
- "libc",
- "serde",
- "serde_json",
- "toml",
- "windows 0.62.2",
- "windows-service",
-]
-
-[[package]]
-name = "aten-schema"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "aten-transcript"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aten-schema",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
-]
 
 [[package]]
 name = "foldhash"

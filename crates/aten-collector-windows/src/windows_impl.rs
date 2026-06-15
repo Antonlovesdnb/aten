@@ -76,13 +76,15 @@ use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::UserTrace;
 use ferrisetw::EventRecord;
 use aten_schema::{
-    AccessType, Attribution, CredentialAccessPayload, CredentialClass, Event, EventKind,
-    NetworkEgressPayload, Platform, Process, ProcessExecPayload, Protocol, Source, SCHEMA_VERSION,
+    AccessType, Attribution, CredentialAccessPayload, CredentialClass, DnsQueryPayload,
+    DnsQueryType, Event, EventKind, FileWriteClass, FileWritePayload, NetworkEgressPayload,
+    Platform, Process, ProcessExecPayload, Protocol, Source, SCHEMA_VERSION,
 };
 use serde::Deserialize;
 
 use aten_collector_linux::credentials;
 use aten_collector_linux::enroll::{EnrollmentRecord, EnrollmentTable, ProcessKey};
+use aten_collector_linux::filewrite;
 use aten_collector_linux::network::{is_uninteresting, Endpoint};
 
 use crate::enrich;
@@ -97,6 +99,12 @@ const KERNEL_FILE_GUID: &str = "EDD08927-9CC4-4E65-B970-C2560FB5C289";
 /// Microsoft-Windows-Kernel-Network provider GUID. Publishes TCP and UDP
 /// I/O events; we filter to TcpIp/Connect (V4 + V6) only.
 const KERNEL_NETWORK_GUID: &str = "7DD42A49-5329-4832-8DFD-43D979153A88";
+
+/// Microsoft-Windows-DNS-Client provider GUID. The resolver-level view —
+/// fires for every name resolution the DNS Client service performs on behalf
+/// of a process, with the query name, type, and (on Event 3008) the resolved
+/// results. Far cleaner than parsing UDP :53 off Kernel-Network.
+const DNS_CLIENT_GUID: &str = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D";
 
 /// Event IDs published by Microsoft-Windows-Kernel-Process. Only the ones we
 /// currently care about are named here.
@@ -113,6 +121,12 @@ const EVENT_ID_FILE_CREATE: u16 = 12;
 /// doc for the failed-connect follow-up.
 const EVENT_ID_TCP_CONNECT_V4: u16 = 12;
 const EVENT_ID_TCP_CONNECT_V6: u16 = 28;
+
+/// Microsoft-Windows-DNS-Client "DNS query completed" event. Carries
+/// QueryName, QueryType (numeric qtype), QueryStatus, and QueryResults (a
+/// semicolon-delimited string of resolved addresses / CNAME targets). The
+/// query-*sent* event (3006) lacks results, so we key off completion.
+const EVENT_ID_DNS_QUERY_COMPLETE: u16 = 3008;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollectorConfig {
@@ -350,6 +364,24 @@ where
         })
         .build();
 
+    let state_dns = state.clone();
+    let emit_dns = emit_sink.clone();
+    let host_id_dns = config.host_id.clone();
+    let dns_provider = Provider::by_guid(DNS_CLIENT_GUID)
+        .any(ALL_KEYWORDS)
+        .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
+            if let Err(e) = handle_dns_event(
+                record,
+                locator,
+                host_id_dns.as_deref(),
+                &state_dns,
+                &emit_dns,
+            ) {
+                eprintln!("aten-etw: dns-callback error: {e}");
+            }
+        })
+        .build();
+
     eprintln!(
         "aten-etw: trace starting. enrollment rundown seeded {rundown_count} \
          pre-existing agent process(es); new starts will enroll via ProcessStart."
@@ -360,6 +392,7 @@ where
         .enable(process_provider)
         .enable(file_provider)
         .enable(network_provider)
+        .enable(dns_provider)
         .start_and_process()
         .map_err(|e| anyhow!("start ETW user trace: {e:?}"))?;
 
@@ -594,6 +627,29 @@ fn handle_file_event(
         return Ok(());
     }
 
+    // The Kernel-File Create event packs the NtCreateFile *disposition* in the
+    // high byte of CreateOptions (the long-standing FileIo convention):
+    // 0=SUPERSEDE 1=OPEN 2=CREATE 3=OPEN_IF 4=OVERWRITE 5=OVERWRITE_IF. We
+    // treat SUPERSEDE/CREATE/OVERWRITE/OVERWRITE_IF as write-intent. OPEN_IF
+    // (3) is read-or-create and too ambiguous to count as a write.
+    //
+    // Safety / non-regression: if CreateOptions can't be parsed it comes back
+    // 0, which makes `write_intent` false, so the event falls through to the
+    // unchanged credential-read path. A write to a credential-class path is
+    // therefore reported as file_write{Credential} (planting), while a read of
+    // one stays credential_access (exfil) — see handle_dns_event's sibling
+    // VERIFY note: the disposition packing is the field most worth a live
+    // smoke-test on first run.
+    let create_options: u32 = parser.try_parse("CreateOptions").unwrap_or(0);
+    let disposition = (create_options >> 24) & 0xFF;
+    let write_intent = create_options != 0 && matches!(disposition, 0 | 2 | 4 | 5);
+
+    if write_intent {
+        if let Some(write_class) = filewrite::classify(&file_name) {
+            return emit_file_write(record, &file_name, write_class, host_id, state, emit);
+        }
+    }
+
     // Classify before doing anything PID-related — the vast majority of
     // file-create events aren't credentials and we want to drop them with
     // the minimum possible work (no Mutex acquisition, no Win32 calls).
@@ -707,6 +763,99 @@ fn handle_file_event(
             // Parity with Linux — bytes_read is always None on both
             // platforms in v0.x. Read-event byte counting is a follow-up.
             bytes_read: None,
+        }),
+    };
+
+    let mut emit = emit.lock().expect("emit lock");
+    (emit)(event);
+    Ok(())
+}
+
+/// Emit a `FileWrite` for a write-intent Kernel-File Create whose path the
+/// `filewrite` classifier flagged as sensitive. Shares the same enrollment +
+/// identity plumbing as the credential handler; `bytes_written` is None because
+/// the Create event we hook is the open, not the write itself.
+fn emit_file_write(
+    record: &EventRecord,
+    file_name: &str,
+    write_class: FileWriteClass,
+    host_id: Option<&str>,
+    state: &Arc<Mutex<SharedState>>,
+    emit: &Arc<Mutex<Box<dyn FnMut(Event) + Send>>>,
+) -> Result<()> {
+    let pid: u32 = record.process_id();
+    if pid == 0 {
+        return Ok(());
+    }
+
+    let mut st = state.lock().expect("state lock");
+    let Some(rec) = resolve_enrollment_for_pid(pid, &mut st) else {
+        return Ok(());
+    };
+    let agent_root_pid = Some(rec.agent_root.pid);
+    let is_agent_root = rec.agent_root.pid == pid as i32;
+    let cached = st.proc_info.get(&(pid as i32)).cloned();
+    st.events_emitted += 1;
+    drop(st);
+
+    let (process_name, image_path, cmdline, user, start_time_ticks) =
+        resolve_proc_identity(pid, cached);
+    let immediate_parent = enrich::ancestor_pids(pid, 1).first().copied().unwrap_or(0);
+    let parent_chain = if immediate_parent != 0 {
+        enrich::parent_chain(immediate_parent, 16)
+    } else {
+        Vec::new()
+    };
+
+    let event = Event {
+        schema_version: SCHEMA_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: filetime_to_rfc3339(record.raw_timestamp() as u64),
+        monotonic_ns: Some(record.raw_timestamp() as u64),
+        platform: Platform::Windows,
+        host_id: host_id.map(str::to_string),
+        agent_id: if is_agent_root {
+            "agent-root".to_string()
+        } else {
+            "agent-descendant".to_string()
+        },
+        session_id: None,
+        user_id: if user.is_empty() { None } else { Some(user.clone()) },
+        source: Source {
+            collector: "windows_etw".to_string(),
+            probe: "Microsoft-Windows-Kernel-File/Create".to_string(),
+            host_pid: Some(pid as i32),
+        },
+        kind: EventKind::FileWrite(FileWritePayload {
+            process: Process {
+                pid: pid as i32,
+                ppid: immediate_parent as i32,
+                start_time: start_time_string(start_time_ticks),
+                name: process_name,
+                path: image_path,
+                cmdline,
+                cwd: String::new(),
+                user,
+                integrity_level: enrich::query_integrity_level(pid),
+                parent_chain,
+                agent_root_pid,
+            },
+            attribution: Attribution {
+                attributed_tool_call_id: None,
+                attributed_by_descent: !is_agent_root,
+                requested_by_tool_call: false,
+                requested_in_user_message: false,
+                requested_in_assistant_message: false,
+                requested_in_tool_result: false,
+                time_window_ms: None,
+                triggering_command: None,
+                triggering_prompt: None,
+            },
+            file_path: enrich::normalize_nt_path(file_name),
+            // The Create event is the open, not the write — byte count would
+            // require the Write event + a FileObject→name cache (backlog).
+            bytes_written: None,
+            write_class,
         }),
     };
 
@@ -880,6 +1029,159 @@ fn handle_network_event(
     Ok(())
 }
 
+/// Handler for Microsoft-Windows-DNS-Client events. Filters to Event 3008
+/// (query completed), which carries the query name, numeric qtype, and the
+/// resolved results. Same hot-path order as the other kernel handlers:
+/// event_id filter → parse → enrollment (PID via the event header) → release
+/// Mutex → enrich → emit a schema `DnsQuery`.
+///
+/// VERIFY (first live run): the exact field names ("QueryName", "QueryType",
+/// "QueryResults") and the QueryResults delimiter format are from the
+/// DNS-Client manifest; confirm against a real capture and adjust
+/// `parse_dns_results` if the separator differs across Windows builds.
+fn handle_dns_event(
+    record: &EventRecord,
+    locator: &SchemaLocator,
+    host_id: Option<&str>,
+    state: &Arc<Mutex<SharedState>>,
+    emit: &Arc<Mutex<Box<dyn FnMut(Event) + Send>>>,
+) -> Result<()> {
+    if record.event_id() != EVENT_ID_DNS_QUERY_COMPLETE {
+        return Ok(());
+    }
+
+    let schema = locator
+        .event_schema(record)
+        .map_err(|e| anyhow!("schema lookup: {e:?}"))?;
+    let parser = Parser::create(record, &schema);
+
+    let query_name_raw: String = parser.try_parse("QueryName").unwrap_or_default();
+    if query_name_raw.is_empty() {
+        return Ok(());
+    }
+    let qtype: u32 = parser.try_parse("QueryType").unwrap_or(0);
+    let query_results: String = parser.try_parse("QueryResults").unwrap_or_default();
+
+    // DNS-Client events carry the requesting PID in the event header, not the
+    // payload (same as Kernel-File Create).
+    let pid: u32 = record.process_id();
+    if pid == 0 {
+        return Ok(());
+    }
+
+    let mut st = state.lock().expect("state lock");
+    let Some(rec) = resolve_enrollment_for_pid(pid, &mut st) else {
+        return Ok(());
+    };
+    let agent_root_pid = Some(rec.agent_root.pid);
+    let is_agent_root = rec.agent_root.pid == pid as i32;
+    let cached = st.proc_info.get(&(pid as i32)).cloned();
+    st.events_emitted += 1;
+    drop(st);
+
+    let (process_name, image_path, cmdline, user, start_time_ticks) =
+        resolve_proc_identity(pid, cached);
+    let immediate_parent = enrich::ancestor_pids(pid, 1).first().copied().unwrap_or(0);
+    let parent_chain = if immediate_parent != 0 {
+        enrich::parent_chain(immediate_parent, 16)
+    } else {
+        Vec::new()
+    };
+
+    let query_name = query_name_raw.trim_end_matches('.').to_lowercase();
+    let answers = parse_dns_results(&query_results);
+
+    let event = Event {
+        schema_version: SCHEMA_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: filetime_to_rfc3339(record.raw_timestamp() as u64),
+        monotonic_ns: Some(record.raw_timestamp() as u64),
+        platform: Platform::Windows,
+        host_id: host_id.map(str::to_string),
+        agent_id: if is_agent_root {
+            "agent-root".to_string()
+        } else {
+            "agent-descendant".to_string()
+        },
+        session_id: None,
+        user_id: if user.is_empty() { None } else { Some(user.clone()) },
+        source: Source {
+            collector: "windows_etw".to_string(),
+            probe: "Microsoft-Windows-DNS-Client/QueryComplete".to_string(),
+            host_pid: Some(pid as i32),
+        },
+        kind: EventKind::DnsQuery(DnsQueryPayload {
+            process: Process {
+                pid: pid as i32,
+                ppid: immediate_parent as i32,
+                start_time: start_time_string(start_time_ticks),
+                name: process_name,
+                path: image_path,
+                cmdline,
+                cwd: String::new(),
+                user,
+                integrity_level: enrich::query_integrity_level(pid),
+                parent_chain,
+                agent_root_pid,
+            },
+            attribution: Attribution {
+                attributed_tool_call_id: None,
+                attributed_by_descent: !is_agent_root,
+                requested_by_tool_call: false,
+                requested_in_user_message: false,
+                requested_in_assistant_message: false,
+                requested_in_tool_result: false,
+                time_window_ms: None,
+                triggering_command: None,
+                triggering_prompt: None,
+            },
+            query_name,
+            query_type: dns_qtype(qtype),
+            answers,
+        }),
+    };
+
+    let mut emit = emit.lock().expect("emit lock");
+    (emit)(event);
+    Ok(())
+}
+
+/// Map a numeric DNS qtype to the schema enum. Covers the common record types;
+/// everything else collapses to `Other` (raw qtype stays in RawJson).
+fn dns_qtype(qtype: u32) -> DnsQueryType {
+    match qtype {
+        1 => DnsQueryType::A,
+        28 => DnsQueryType::Aaaa,
+        5 => DnsQueryType::Cname,
+        16 => DnsQueryType::Txt,
+        15 => DnsQueryType::Mx,
+        2 => DnsQueryType::Ns,
+        12 => DnsQueryType::Ptr,
+        33 => DnsQueryType::Srv,
+        6 => DnsQueryType::Soa,
+        _ => DnsQueryType::Other,
+    }
+}
+
+/// Parse the DNS-Client `QueryResults` blob into resolved answers. The field is
+/// a `;`-delimited list whose entries are either a bare address or a
+/// `type: <n> <data>` form (CNAME chains carry the type prefix). We take the
+/// last whitespace-separated token of each non-empty entry.
+fn parse_dns_results(results: &str) -> Vec<String> {
+    results
+        .split(';')
+        .filter_map(|seg| {
+            let seg = seg.trim();
+            if seg.is_empty() {
+                return None;
+            }
+            // "type:  5 cname.example.com" → "cname.example.com"; a bare
+            // "93.184.216.34" → itself.
+            Some(seg.split_whitespace().last().unwrap_or(seg).to_string())
+        })
+        .collect()
+}
+
 /// Resolve enrollment for a PID seen on a kernel-side event (file/network),
 /// mirroring `resolve_enrollment` on the Linux side.
 ///
@@ -947,5 +1249,31 @@ mod tests {
         assert_eq!(image_basename(r"C:\Windows\System32\notepad.exe"), "notepad.exe");
         assert_eq!(image_basename(r"\Device\HarddiskVolume3\notepad.exe"), "notepad.exe");
         assert_eq!(image_basename("notepad.exe"), "notepad.exe");
+    }
+
+    #[test]
+    fn dns_qtype_maps_common_types() {
+        assert_eq!(dns_qtype(1), DnsQueryType::A);
+        assert_eq!(dns_qtype(28), DnsQueryType::Aaaa);
+        assert_eq!(dns_qtype(16), DnsQueryType::Txt);
+        assert_eq!(dns_qtype(5), DnsQueryType::Cname);
+        assert_eq!(dns_qtype(999), DnsQueryType::Other);
+    }
+
+    #[test]
+    fn dns_results_parse_both_forms() {
+        // Bare addresses.
+        assert_eq!(
+            parse_dns_results("93.184.216.34;93.184.216.35;"),
+            vec!["93.184.216.34", "93.184.216.35"]
+        );
+        // CNAME-chain "type: n data" entries — take the trailing token.
+        assert_eq!(
+            parse_dns_results("type:  5 cdn.example.com;type:  1 93.184.216.34;"),
+            vec!["cdn.example.com", "93.184.216.34"]
+        );
+        // Empty / whitespace-only → no answers.
+        assert!(parse_dns_results("").is_empty());
+        assert!(parse_dns_results(";  ;").is_empty());
     }
 }

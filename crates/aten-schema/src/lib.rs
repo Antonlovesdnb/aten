@@ -37,7 +37,20 @@ use serde::{Deserialize, Serialize};
 ///   gated on the same confidence threshold — populated only when the
 ///   bound tool_call is recent enough that aten is sure it's the
 ///   actual triggering call, null otherwise.
-pub const SCHEMA_VERSION: &str = "0.4";
+/// - 0.5: two action-layer events go live. `dns_query` is a new
+///   `EventKind` (process resolved a name — `query_name`, `query_type`,
+///   best-effort `answers`); it surfaces DNS-exfil and recovers the
+///   hostname behind a shared-CDN `network_egress` IP. `file_write`'s
+///   payload is reworked (it was defined but never emitted in ≤0.4, so
+///   this breaks no existing consumer): the `is_agent_config` bool
+///   becomes a richer `write_class` enum (agent-config / credential /
+///   executable) and `bytes_written` becomes `Option<u64>` for parity
+///   with `CredentialAccess.bytes_read` (None when the probe only sees
+///   the open-for-write, not the write). Collectors emit `file_write`
+///   only for these "sensitive" classes — ordinary writes by enrolled
+///   processes are dropped at the collector, same noise discipline as
+///   the credential path.
+pub const SCHEMA_VERSION: &str = "0.5";
 
 /// One link in a process's ancestor chain. Same order semantics as the
 /// old `Vec<String>` (root → immediate parent, excludes the event's own
@@ -100,6 +113,7 @@ pub enum EventKind {
     ProcessExit(ProcessExitPayload),
     CredentialAccess(CredentialAccessPayload),
     NetworkEgress(NetworkEgressPayload),
+    DnsQuery(DnsQueryPayload),
     FileWrite(FileWritePayload),
 }
 
@@ -291,13 +305,73 @@ pub struct NetworkEgressPayload {
     pub tls_sni: Option<String>,
 }
 
+/// DNS query record type. Typed (like `CredentialClass`/`Protocol`) so
+/// detections don't string-match. `Txt` is the high-signal one — TXT lookups
+/// are the classic DNS-tunnel / exfil carrier. Anything outside the common set
+/// collapses to `Other` (the raw numeric qtype is preserved in `RawJson`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsQueryType {
+    A,
+    Aaaa,
+    Cname,
+    Txt,
+    Mx,
+    Ns,
+    Ptr,
+    Srv,
+    Soa,
+    Other,
+}
+
+/// A name resolution performed by an enrolled process. The `query_name` is the
+/// primary identifier for attribution (same role `dest_host` plays for
+/// `network_egress`): a lookup of `research.attacker.com` that traces back to a
+/// `requested_in_tool_result` origin is the DNS-exfil fingerprint. `answers`
+/// lets a SIEM join the resolved address forward to a subsequent
+/// `network_egress` whose `dest_ip` would otherwise be an opaque CDN IP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsQueryPayload {
+    pub process: Process,
+    pub attribution: Attribution,
+    /// The queried name, lowercased with any trailing dot stripped.
+    pub query_name: String,
+    pub query_type: DnsQueryType,
+    /// Resolved answers (A/AAAA addresses, CNAME targets) when the probe
+    /// observes the response. Empty when only the outgoing query was seen.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub answers: Vec<String>,
+}
+
+/// Why a `file_write` was deemed worth emitting. Collectors classify the target
+/// path and drop everything that returns no class — ordinary writes by enrolled
+/// processes never reach the SIEM. Mirrors `CredentialClass`'s collector-side
+/// taxonomy so detections key on a typed field, not a path regex.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileWriteClass {
+    /// Write to the agent's own configuration surface — `skills/`, `agents/`,
+    /// `settings.json`, `.claude/`, `.codex/`. Agent self-modification: the
+    /// persistence / privilege-of-future-turns vector.
+    AgentConfig,
+    /// Write to a credential-class path (same taxonomy as `CredentialClass`) —
+    /// e.g. overwriting `~/.aws/credentials` or planting an `~/.ssh/` key.
+    Credential,
+    /// Write of an executable or script file (`.sh`, `.ps1`, `.py`, `.exe`,
+    /// `.bat`, …). Payload / exfil-script staging.
+    Executable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileWritePayload {
     pub process: Process,
     pub attribution: Attribution,
     pub file_path: String,
-    pub bytes_written: u64,
-    pub is_agent_config: bool,
+    /// Bytes written when the probe observes the write itself; None when it
+    /// only sees the open-for-write (parity with `CredentialAccess.bytes_read`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
+    pub write_class: FileWriteClass,
 }
 
 /// Where an identifier surfaced for the first time in a session. Drives the

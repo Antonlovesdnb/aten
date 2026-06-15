@@ -24,6 +24,7 @@
 
 pub mod credentials;
 pub mod enroll;
+pub mod filewrite;
 pub mod network;
 
 #[cfg(target_os = "linux")]
@@ -51,6 +52,14 @@ mod skel_connect {
     #![allow(dead_code)]
     #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
     include!(concat!(env!("OUT_DIR"), "/connect.skel.rs"));
+}
+
+#[cfg(target_os = "linux")]
+mod skel_dns {
+    #![allow(clippy::all)]
+    #![allow(dead_code)]
+    #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
+    include!(concat!(env!("OUT_DIR"), "/dns.skel.rs"));
 }
 
 #[cfg(target_os = "linux")]

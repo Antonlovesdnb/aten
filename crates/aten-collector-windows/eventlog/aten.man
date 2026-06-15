@@ -54,6 +54,7 @@
           <task name="CredentialAccess" symbol="TASK_CREDENTIAL_ACCESS" value="3"  message="$(string.task.credential_access)"/>
           <task name="NetworkEgress"    symbol="TASK_NETWORK_EGRESS"    value="4"  message="$(string.task.network_egress)"/>
           <task name="FileWrite"        symbol="TASK_FILE_WRITE"        value="5"  message="$(string.task.file_write)"/>
+          <task name="DnsQuery"         symbol="TASK_DNS_QUERY"         value="6"  message="$(string.task.dns_query)"/>
           <task name="Prompt"           symbol="TASK_PROMPT"            value="10" message="$(string.task.prompt)"/>
           <task name="ToolCall"         symbol="TASK_TOOL_CALL"         value="11" message="$(string.task.tool_call)"/>
           <task name="ToolResult"       symbol="TASK_TOOL_RESULT"       value="12" message="$(string.task.tool_result)"/>
@@ -134,6 +135,52 @@
             <data name="RawJson"               inType="win:UnicodeString"/>
           </template>
 
+          <template tid="t_file">
+            <data name="Timestamp"             inType="win:UnicodeString"/>
+            <data name="HostId"                inType="win:UnicodeString"/>
+            <data name="AgentId"               inType="win:UnicodeString"/>
+            <data name="UserId"                inType="win:UnicodeString"/>
+            <data name="Pid"                   inType="win:Int32"/>
+            <data name="Ppid"                  inType="win:Int32"/>
+            <data name="ProcessName"           inType="win:UnicodeString"/>
+            <data name="ProcessPath"           inType="win:UnicodeString"/>
+            <data name="CommandLine"           inType="win:UnicodeString"/>
+            <data name="User"                  inType="win:UnicodeString"/>
+            <data name="AgentRootPid"          inType="win:Int32"/>
+            <data name="AttributedByDescent"   inType="win:UnicodeString"/>
+            <data name="RequestedInToolResult" inType="win:UnicodeString"/>
+            <data name="TriggeringCommand"     inType="win:UnicodeString"/>
+            <data name="TriggeringPrompt"      inType="win:UnicodeString"/>
+            <data name="ParentChain"           inType="win:UnicodeString"/>
+            <data name="FilePath"              inType="win:UnicodeString"/>
+            <data name="WriteClass"            inType="win:UnicodeString"/>
+            <data name="BytesWritten"          inType="win:UnicodeString"/>
+            <data name="RawJson"               inType="win:UnicodeString"/>
+          </template>
+
+          <template tid="t_dns">
+            <data name="Timestamp"             inType="win:UnicodeString"/>
+            <data name="HostId"                inType="win:UnicodeString"/>
+            <data name="AgentId"               inType="win:UnicodeString"/>
+            <data name="UserId"                inType="win:UnicodeString"/>
+            <data name="Pid"                   inType="win:Int32"/>
+            <data name="Ppid"                  inType="win:Int32"/>
+            <data name="ProcessName"           inType="win:UnicodeString"/>
+            <data name="ProcessPath"           inType="win:UnicodeString"/>
+            <data name="CommandLine"           inType="win:UnicodeString"/>
+            <data name="User"                  inType="win:UnicodeString"/>
+            <data name="AgentRootPid"          inType="win:Int32"/>
+            <data name="AttributedByDescent"   inType="win:UnicodeString"/>
+            <data name="RequestedInToolResult" inType="win:UnicodeString"/>
+            <data name="TriggeringCommand"     inType="win:UnicodeString"/>
+            <data name="TriggeringPrompt"      inType="win:UnicodeString"/>
+            <data name="ParentChain"           inType="win:UnicodeString"/>
+            <data name="QueryName"             inType="win:UnicodeString"/>
+            <data name="QueryType"             inType="win:UnicodeString"/>
+            <data name="Answers"               inType="win:UnicodeString"/>
+            <data name="RawJson"               inType="win:UnicodeString"/>
+          </template>
+
           <!-- Transcript-derived events (emitted by the daemon's transcript
                reader, not the kernel collector). Envelope prefix (1-5) then
                kind-specific then RawJson. -->
@@ -173,7 +220,7 @@
           </template>
 
           <!-- Generic fallback for event kinds not currently emitted
-               (ProcessExit, FileWrite): envelope + Pid + RawJson. -->
+               (ProcessExit): envelope + Pid + RawJson. -->
           <template tid="t_generic">
             <data name="Timestamp" inType="win:UnicodeString"/>
             <data name="HostId"    inType="win:UnicodeString"/>
@@ -188,7 +235,8 @@
           <event symbol="EVT_PROCESS_EXIT"      value="2"  version="0" channel="Operational" level="win:Informational" task="ProcessExit"      template="t_generic"     message="$(string.evt.process_exit)"/>
           <event symbol="EVT_CREDENTIAL_ACCESS" value="3"  version="0" channel="Operational" level="win:Warning"       task="CredentialAccess" template="t_cred"        message="$(string.evt.credential_access)"/>
           <event symbol="EVT_NETWORK_EGRESS"    value="4"  version="0" channel="Operational" level="win:Warning"       task="NetworkEgress"    template="t_net"         message="$(string.evt.network_egress)"/>
-          <event symbol="EVT_FILE_WRITE"        value="5"  version="0" channel="Operational" level="win:Informational" task="FileWrite"        template="t_generic"     message="$(string.evt.file_write)"/>
+          <event symbol="EVT_FILE_WRITE"        value="5"  version="0" channel="Operational" level="win:Warning"       task="FileWrite"        template="t_file"        message="$(string.evt.file_write)"/>
+          <event symbol="EVT_DNS_QUERY"         value="6"  version="0" channel="Operational" level="win:Informational" task="DnsQuery"        template="t_dns"         message="$(string.evt.dns_query)"/>
           <event symbol="EVT_PROMPT"            value="10" version="0" channel="Operational" level="win:Informational" task="Prompt"           template="t_prompt"      message="$(string.evt.prompt)"/>
           <event symbol="EVT_TOOL_CALL"         value="11" version="0" channel="Operational" level="win:Informational" task="ToolCall"         template="t_tool_call"   message="$(string.evt.tool_call)"/>
           <event symbol="EVT_TOOL_RESULT"       value="12" version="0" channel="Operational" level="win:Informational" task="ToolResult"       template="t_tool_result" message="$(string.evt.tool_result)"/>
@@ -206,6 +254,7 @@
         <string id="task.credential_access" value="Credential Access"/>
         <string id="task.network_egress"    value="Network Egress"/>
         <string id="task.file_write"        value="File Write"/>
+        <string id="task.dns_query"         value="DNS Query"/>
         <string id="task.prompt"            value="Prompt"/>
         <string id="task.tool_call"         value="Tool Call"/>
         <string id="task.tool_result"       value="Tool Result"/>
@@ -217,7 +266,8 @@
         <string id="evt.process_exit"      value="AI agent process exit (pid %4)"/>
         <string id="evt.credential_access" value="AI agent credential access by %7 (pid %5): %17 [%18]"/>
         <string id="evt.network_egress"    value="AI agent network egress by %7 (pid %5) to %17:%18 (%19)"/>
-        <string id="evt.file_write"        value="AI agent file write (pid %4)"/>
+        <string id="evt.file_write"        value="AI agent file write by %7 (pid %5): %17 [%18]"/>
+        <string id="evt.dns_query"         value="AI agent DNS query by %7 (pid %5): %17 [%18]"/>
         <string id="evt.prompt"            value="AI agent prompt (%6): %7"/>
         <string id="evt.tool_call"         value="AI agent tool call: %6"/>
         <string id="evt.tool_result"       value="AI agent tool result [%7]"/>

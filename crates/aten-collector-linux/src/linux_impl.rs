@@ -12,11 +12,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use aten_schema::{
-    AccessType, Attribution, CredentialAccessPayload, CredentialClass, Event, EventKind,
-    NetworkEgressPayload, Platform, Process, ProcessExecPayload, Protocol, Source, SCHEMA_VERSION,
+    AccessType, Attribution, CredentialAccessPayload, CredentialClass, DnsQueryPayload,
+    DnsQueryType, Event, EventKind, FileWriteClass, FileWritePayload, NetworkEgressPayload,
+    Platform, Process, ProcessExecPayload, Protocol, Source, SCHEMA_VERSION,
 };
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::OpenObject;
+use libbpf_rs::{OpenObject, UprobeOpts};
 use plain::Plain;
 use serde::Deserialize;
 
@@ -25,8 +26,9 @@ use crate::network::{self, Endpoint};
 use crate::proc;
 use crate::skel_connect::*;
 use crate::skel_credacc::*;
+use crate::skel_dns::*;
 use crate::skel_execve::*;
-use crate::{credentials};
+use crate::{credentials, filewrite};
 
 const TASK_COMM_LEN: usize = 16;
 const MAX_FILENAME_LEN: usize = 256;
@@ -87,6 +89,24 @@ struct RawConnectEvent {
 unsafe impl Plain for RawConnectEvent {}
 
 impl RawConnectEvent {
+    fn zeroed() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// Mirror of the BPF program's `struct dns_event` in `dns.bpf.c`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct RawDnsEvent {
+    timestamp_ns: u64,
+    pid: u32,
+    uid: u32,
+    comm: [u8; TASK_COMM_LEN],
+    qname: [u8; MAX_FILENAME_LEN],
+}
+unsafe impl Plain for RawDnsEvent {}
+
+impl RawDnsEvent {
     fn zeroed() -> Self {
         unsafe { std::mem::zeroed() }
     }
@@ -154,6 +174,7 @@ where
     let mut exec_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
     let mut cred_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
     let mut conn_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
+    let mut dns_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
 
     let exec_skel = ExecveSkelBuilder::default()
         .open(&mut exec_obj)
@@ -173,6 +194,42 @@ where
     let mut conn_skel = conn_skel.load().context("load connect BPF")?;
     conn_skel.attach().context("attach connect BPF")?;
 
+    // The DNS probe is a uprobe on libc's getaddrinfo, so it doesn't auto-
+    // attach by section name like the tracepoints — we attach it by hand to
+    // the resolved libc path, for all processes (pid -1; userspace filters by
+    // enrollment). Keep `_dns_link` alive for the run loop; dropping it
+    // detaches the probe.
+    let dns_skel = DnsSkelBuilder::default()
+        .open(&mut dns_obj)
+        .context("open dns skeleton")?;
+    let dns_skel = dns_skel.load().context("load dns BPF")?;
+    let _dns_link = match libc_path() {
+        Some(path) => {
+            let opts = UprobeOpts {
+                func_name: "getaddrinfo".to_string(),
+                ..Default::default()
+            };
+            match dns_skel
+                .progs
+                .handle_getaddrinfo
+                .attach_uprobe_with_opts(-1, &path, 0, opts)
+            {
+                Ok(link) => Some(link),
+                Err(e) => {
+                    // Non-fatal: DNS visibility is degraded but the other three
+                    // probes keep working. (Happens on static-musl hosts or if
+                    // getaddrinfo isn't exported where we looked.)
+                    eprintln!("aten-ebpf: getaddrinfo uprobe attach failed ({e}); dns_query disabled");
+                    None
+                }
+            }
+        }
+        None => {
+            eprintln!("aten-ebpf: no libc with getaddrinfo found; dns_query disabled");
+            None
+        }
+    };
+
     let state = RefCell::new(SharedState::default());
     let emit_cell = RefCell::new(emit);
     let host_id = config.host_id.clone();
@@ -181,6 +238,7 @@ where
     let exec_maps = &exec_skel.maps;
     let cred_maps = &cred_skel.maps;
     let conn_maps = &conn_skel.maps;
+    let dns_maps = &dns_skel.maps;
     let mut builder = libbpf_rs::RingBufferBuilder::new();
 
     let exec_handle = |bytes: &[u8]| -> i32 {
@@ -229,6 +287,21 @@ where
         0
     };
 
+    let dns_handle = |bytes: &[u8]| -> i32 {
+        let mut state = state.borrow_mut();
+        let mut emit = emit_cell.borrow_mut();
+        if let Err(e) = handle_dns_event(
+            bytes,
+            &mut state,
+            host_id.as_deref(),
+            &mut *emit,
+        ) {
+            had_error.set(Some(e));
+            return 1;
+        }
+        0
+    };
+
     builder
         .add(&exec_maps.events, exec_handle)
         .context("add execve ringbuf consumer")?;
@@ -238,6 +311,9 @@ where
     builder
         .add(&conn_maps.connect_events, conn_handle)
         .context("add connect ringbuf consumer")?;
+    builder
+        .add(&dns_maps.dns_events, dns_handle)
+        .context("add dns ringbuf consumer")?;
     let ringbuf = builder.build().context("build ringbuf")?;
 
     while !stop.load(Ordering::Relaxed) {
@@ -403,6 +479,16 @@ where
     let filename = nul_str(&raw.filename);
     let bpf_comm = nul_str(&raw.comm).to_string();
 
+    // Write-intent opens to a sensitive path become file_write (mirrors the
+    // Windows Create-disposition split). A read-intent open of a credential
+    // file stays credential_access below. Classify before any enrollment work,
+    // same drop-99%-cheaply ordering as the credential path.
+    if is_write_intent(raw.flags) {
+        if let Some(write_class) = filewrite::classify(filename) {
+            return emit_file_write(&raw, filename, write_class, state, host_id, emit);
+        }
+    }
+
     // 99%+ of opens are not credentials — classify FIRST, then check enrollment.
     let class = credentials::classify(filename);
     if class == CredentialClass::None {
@@ -486,6 +572,201 @@ where
             access_type,
             credential_class: class,
             bytes_read: None,
+        }),
+    };
+
+    emit(event);
+    Ok(())
+}
+
+/// Emit a `FileWrite` for a write-intent openat whose path the `filewrite`
+/// classifier flagged as sensitive. Shares the credential handler's enrollment
+/// + /proc enrichment; `bytes_written` is None because the openat probe sees
+/// the open, not the write.
+fn emit_file_write<F>(
+    raw: &RawCredaccEvent,
+    filename: &str,
+    write_class: FileWriteClass,
+    state: &mut SharedState,
+    host_id: Option<&str>,
+    emit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Event),
+{
+    let pid = raw.pid as i32;
+
+    let record = match resolve_enrollment(pid, state) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    let abs_path = absolutize(filename, pid);
+    let snap = proc::snapshot(pid);
+    let chain = proc::parent_chain(pid, 16);
+    let is_agent_root = record.agent_root.pid == pid;
+    let attributed_by_descent = !is_agent_root;
+
+    let bpf_comm = nul_str(&raw.comm).to_string();
+    let process_name = if !snap.comm.is_empty() {
+        snap.comm.clone()
+    } else {
+        bpf_comm
+    };
+    let user = if !snap.user.is_empty() {
+        snap.user.clone()
+    } else {
+        raw.uid.to_string()
+    };
+
+    let event = Event {
+        schema_version: SCHEMA_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: rfc3339_from_boot_ns(raw.timestamp_ns),
+        monotonic_ns: Some(raw.timestamp_ns),
+        platform: Platform::Linux,
+        host_id: host_id.map(str::to_string),
+        agent_id: if is_agent_root {
+            "agent-root".to_string()
+        } else {
+            "agent-descendant".to_string()
+        },
+        session_id: None,
+        user_id: Some(user.clone()),
+        source: Source {
+            collector: "linux_ebpf".to_string(),
+            probe: "tracepoint/syscalls/sys_enter_openat".to_string(),
+            host_pid: Some(pid),
+        },
+        kind: EventKind::FileWrite(FileWritePayload {
+            process: Process {
+                pid,
+                ppid: snap.ppid,
+                start_time: snap.start_time_ticks.to_string(),
+                name: process_name,
+                path: snap.exe_path.clone(),
+                cmdline: snap.cmdline.clone(),
+                cwd: snap.cwd.clone(),
+                user,
+                integrity_level: None,
+                parent_chain: chain,
+                agent_root_pid: Some(record.agent_root.pid),
+            },
+            attribution: Attribution {
+                attributed_tool_call_id: None,
+                attributed_by_descent,
+                requested_by_tool_call: false,
+                requested_in_user_message: false,
+                requested_in_assistant_message: false,
+                requested_in_tool_result: false,
+                time_window_ms: None,
+                triggering_command: None,
+                triggering_prompt: None,
+            },
+            file_path: abs_path,
+            bytes_written: None,
+            write_class,
+        }),
+    };
+
+    emit(event);
+    Ok(())
+}
+
+fn handle_dns_event<F>(
+    bytes: &[u8],
+    state: &mut SharedState,
+    host_id: Option<&str>,
+    emit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Event),
+{
+    if bytes.len() < std::mem::size_of::<RawDnsEvent>() {
+        return Ok(());
+    }
+    let mut raw = RawDnsEvent::zeroed();
+    plain::copy_from_bytes(&mut raw, bytes)
+        .map_err(|_| anyhow!("ringbuf record size mismatch"))?;
+
+    let pid = raw.pid as i32;
+    let qname = nul_str(&raw.qname).trim_end_matches('.').to_lowercase();
+    if qname.is_empty() {
+        return Ok(());
+    }
+
+    let record = match resolve_enrollment(pid, state) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    let snap = proc::snapshot(pid);
+    let chain = proc::parent_chain(pid, 16);
+    let is_agent_root = record.agent_root.pid == pid;
+    let attributed_by_descent = !is_agent_root;
+
+    let bpf_comm = nul_str(&raw.comm).to_string();
+    let process_name = if !snap.comm.is_empty() {
+        snap.comm.clone()
+    } else {
+        bpf_comm
+    };
+    let user = if !snap.user.is_empty() {
+        snap.user.clone()
+    } else {
+        raw.uid.to_string()
+    };
+
+    let event = Event {
+        schema_version: SCHEMA_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: rfc3339_from_boot_ns(raw.timestamp_ns),
+        monotonic_ns: Some(raw.timestamp_ns),
+        platform: Platform::Linux,
+        host_id: host_id.map(str::to_string),
+        agent_id: if is_agent_root {
+            "agent-root".to_string()
+        } else {
+            "agent-descendant".to_string()
+        },
+        session_id: None,
+        user_id: Some(user.clone()),
+        source: Source {
+            collector: "linux_ebpf".to_string(),
+            probe: "uprobe/libc:getaddrinfo".to_string(),
+            host_pid: Some(pid),
+        },
+        kind: EventKind::DnsQuery(DnsQueryPayload {
+            process: Process {
+                pid,
+                ppid: snap.ppid,
+                start_time: snap.start_time_ticks.to_string(),
+                name: process_name,
+                path: snap.exe_path.clone(),
+                cmdline: snap.cmdline.clone(),
+                cwd: snap.cwd.clone(),
+                user,
+                integrity_level: None,
+                parent_chain: chain,
+                agent_root_pid: Some(record.agent_root.pid),
+            },
+            attribution: Attribution {
+                attributed_tool_call_id: None,
+                attributed_by_descent,
+                requested_by_tool_call: false,
+                requested_in_user_message: false,
+                requested_in_assistant_message: false,
+                requested_in_tool_result: false,
+                time_window_ms: None,
+                triggering_command: None,
+                triggering_prompt: None,
+            },
+            query_name: qname,
+            // getaddrinfo resolves A and AAAA together — the wire qtype isn't
+            // visible at this layer, so we tag Other. Answers would need a
+            // uretprobe walking struct addrinfo (backlog); empty for now.
+            query_type: DnsQueryType::Other,
+            answers: Vec::new(),
         }),
     };
 
@@ -666,6 +947,35 @@ fn access_type_from_flags(flags: i32) -> AccessType {
     }
 }
 
+/// True when an openat's flags indicate intent to modify the file: a writable
+/// access mode (O_WRONLY/O_RDWR) or a creating/truncating open. O_RDONLY opens
+/// (including O_RDONLY|O_CLOEXEC reads of a credential file) are not writes.
+fn is_write_intent(flags: i32) -> bool {
+    const O_ACCMODE: i32 = 3;
+    const O_CREAT: i32 = 0o100;
+    const O_TRUNC: i32 = 0o1000;
+    let accmode = flags & O_ACCMODE;
+    accmode == 1 || accmode == 2 || (flags & (O_CREAT | O_TRUNC)) != 0
+}
+
+/// Locate the libc shared object that exports `getaddrinfo`, for the DNS
+/// uprobe. Checks the common glibc multi-arch locations; returns the first that
+/// exists. None on a static-musl host (where the uprobe simply won't attach).
+fn libc_path() -> Option<String> {
+    const CANDIDATES: &[&str] = &[
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib64/libc.so.6",
+        "/usr/lib/libc.so.6",
+    ];
+    CANDIDATES
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|p| p.to_string())
+}
+
 fn nul_str(buf: &[u8]) -> &str {
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     std::str::from_utf8(&buf[..len]).unwrap_or("")
@@ -759,5 +1069,23 @@ mod tests {
         // 2026-05-27T17:52:11Z → 1_779_904_331
         let (y, m, d, h, mi, s) = unix_to_civil(1_779_904_331);
         assert_eq!((y, m, d, h, mi, s), (2026, 5, 27, 17, 52, 11));
+    }
+
+    #[test]
+    fn write_intent_distinguishes_read_from_write() {
+        const O_RDONLY: i32 = 0;
+        const O_WRONLY: i32 = 1;
+        const O_RDWR: i32 = 2;
+        const O_CREAT: i32 = 0o100;
+        const O_TRUNC: i32 = 0o1000;
+        const O_CLOEXEC: i32 = 0o2000000;
+        // Reads (incl. the credential-exfil case: O_RDONLY|O_CLOEXEC).
+        assert!(!is_write_intent(O_RDONLY));
+        assert!(!is_write_intent(O_RDONLY | O_CLOEXEC));
+        // Writes / creations / truncations.
+        assert!(is_write_intent(O_WRONLY));
+        assert!(is_write_intent(O_RDWR));
+        assert!(is_write_intent(O_WRONLY | O_CREAT | O_TRUNC));
+        assert!(is_write_intent(O_RDONLY | O_CREAT)); // creating, still a write
     }
 }

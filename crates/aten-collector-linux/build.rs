@@ -12,6 +12,7 @@ mod linux_build {
         ("src/bpf/execve.bpf.c", "execve.skel.rs"),
         ("src/bpf/credacc.bpf.c", "credacc.skel.rs"),
         ("src/bpf/connect.bpf.c", "connect.skel.rs"),
+        ("src/bpf/dns.bpf.c", "dns.skel.rs"),
     ];
 
     pub fn run() {

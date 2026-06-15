@@ -381,6 +381,7 @@ impl AttributionEngine {
             EventKind::ProcessExec(p) => p.process.agent_root_pid,
             EventKind::CredentialAccess(c) => c.process.agent_root_pid,
             EventKind::NetworkEgress(n) => n.process.agent_root_pid,
+            EventKind::DnsQuery(d) => d.process.agent_root_pid,
             EventKind::FileWrite(f) => f.process.agent_root_pid,
             _ => None,
         };
@@ -496,6 +497,61 @@ impl AttributionEngine {
                 n.attribution.requested_in_user_message = origins.user_message;
                 n.attribution.requested_in_assistant_message = origins.assistant_message;
                 n.attribution.requested_in_tool_result = origins.tool_result;
+            }
+            EventKind::DnsQuery(d) => {
+                // query_name is the primary identifier, same role dest_host
+                // plays for network_egress — a lookup of a host that first
+                // surfaced in a tool_result is the DNS-exfil fingerprint.
+                let name = d.query_name.clone();
+                if let Some(tc) = confident_tc {
+                    d.attribution.attributed_tool_call_id = Some(tc.id.clone());
+                    d.attribution.time_window_ms = time_window_ms;
+                    d.attribution.requested_by_tool_call = tc.input_text.contains(&name);
+                }
+                d.attribution.triggering_command = triggering_command;
+                d.attribution.triggering_prompt = triggering_prompt;
+                let mut origins = session.origins_for_text(&name);
+                // Resolved answers may themselves be identifiers the model was
+                // handed (e.g. a tool_result that named the IP directly).
+                for ip in &d.answers {
+                    let ip_origins = session.origins_for_text(ip);
+                    origins.user_message |= ip_origins.user_message;
+                    origins.assistant_message |= ip_origins.assistant_message;
+                    origins.tool_result |= ip_origins.tool_result;
+                }
+                d.attribution.requested_in_user_message = origins.user_message;
+                d.attribution.requested_in_assistant_message = origins.assistant_message;
+                d.attribution.requested_in_tool_result = origins.tool_result;
+            }
+            EventKind::FileWrite(f) => {
+                // file_path is the primary identifier, same handling as
+                // credential_access: a write to a path that only ever appeared
+                // in a tool_result is an injection-driven self-modification.
+                let path = f.file_path.clone();
+                let normalized = aten_transcript::normalize(&path, None);
+                if let Some(tc) = confident_tc {
+                    f.attribution.attributed_tool_call_id = Some(tc.id.clone());
+                    f.attribution.time_window_ms = time_window_ms;
+                    f.attribution.requested_by_tool_call = tc.input_text.contains(&path)
+                        || tc.input_text.to_lowercase().contains(&normalized);
+                }
+                f.attribution.triggering_command = triggering_command;
+                f.attribution.triggering_prompt = triggering_prompt;
+                if let Some(entry) = session.identifier_index.entries.get(&normalized) {
+                    for o in &entry.origins {
+                        match o {
+                            aten_schema::Origin::UserMessage => {
+                                f.attribution.requested_in_user_message = true;
+                            }
+                            aten_schema::Origin::AssistantMessage => {
+                                f.attribution.requested_in_assistant_message = true;
+                            }
+                            aten_schema::Origin::ToolResult => {
+                                f.attribution.requested_in_tool_result = true;
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
