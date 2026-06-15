@@ -194,40 +194,53 @@ where
     let mut conn_skel = conn_skel.load().context("load connect BPF")?;
     conn_skel.attach().context("attach connect BPF")?;
 
-    // The DNS probe is a uprobe on libc's getaddrinfo, so it doesn't auto-
-    // attach by section name like the tracepoints — we attach it by hand to
-    // the resolved libc path, for all processes (pid -1; userspace filters by
-    // enrollment). Keep `_dns_link` alive for the run loop; dropping it
-    // detaches the probe.
-    let dns_skel = DnsSkelBuilder::default()
+    // The DNS probe is a sleepable uprobe on libc's getaddrinfo. Its whole
+    // setup is BEST-EFFORT: a kernel without sleepable uprobes / the
+    // bpf_copy_from_user_str kfunc (< 6.11) fails at LOAD, and that must NOT
+    // take down the other three probes. open / load / attach failures all
+    // degrade to "no dns_query" instead of aborting the collector. It doesn't
+    // auto-attach by section name (uprobes need a binary+offset), so we attach
+    // by hand to the resolved libc path for all processes (pid -1; userspace
+    // filters by enrollment). Keep `_dns_link` alive for the run loop; dropping
+    // it detaches the probe.
+    let dns_skel = match DnsSkelBuilder::default()
         .open(&mut dns_obj)
-        .context("open dns skeleton")?;
-    let dns_skel = dns_skel.load().context("load dns BPF")?;
-    let _dns_link = match libc_path() {
-        Some(path) => {
-            let opts = UprobeOpts {
-                func_name: "getaddrinfo".to_string(),
-                ..Default::default()
-            };
-            match dns_skel
-                .progs
-                .handle_getaddrinfo
-                .attach_uprobe_with_opts(-1, &path, 0, opts)
-            {
-                Ok(link) => Some(link),
-                Err(e) => {
-                    // Non-fatal: DNS visibility is degraded but the other three
-                    // probes keep working. (Happens on static-musl hosts or if
-                    // getaddrinfo isn't exported where we looked.)
-                    eprintln!("aten-ebpf: getaddrinfo uprobe attach failed ({e}); dns_query disabled");
-                    None
-                }
-            }
-        }
-        None => {
-            eprintln!("aten-ebpf: no libc with getaddrinfo found; dns_query disabled");
+        .and_then(|s| s.load())
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!(
+                "aten-ebpf: dns probe unavailable ({e}); dns_query disabled \
+                 (execve/credacc/connect unaffected)"
+            );
             None
         }
+    };
+    let _dns_link = match dns_skel.as_ref() {
+        Some(skel) => match libc_path() {
+            Some(path) => {
+                let opts = UprobeOpts {
+                    func_name: "getaddrinfo".to_string(),
+                    ..Default::default()
+                };
+                match skel
+                    .progs
+                    .handle_getaddrinfo
+                    .attach_uprobe_with_opts(-1, &path, 0, opts)
+                {
+                    Ok(link) => Some(link),
+                    Err(e) => {
+                        eprintln!("aten-ebpf: getaddrinfo uprobe attach failed ({e}); dns_query disabled");
+                        None
+                    }
+                }
+            }
+            None => {
+                eprintln!("aten-ebpf: no libc with getaddrinfo found; dns_query disabled");
+                None
+            }
+        },
+        None => None,
     };
 
     let state = RefCell::new(SharedState::default());
@@ -238,7 +251,9 @@ where
     let exec_maps = &exec_skel.maps;
     let cred_maps = &cred_skel.maps;
     let conn_maps = &conn_skel.maps;
-    let dns_maps = &dns_skel.maps;
+    // None when the DNS probe failed to load/attach (see above) — the consumer
+    // is then simply not registered.
+    let dns_maps = dns_skel.as_ref().map(|s| &s.maps);
     let mut builder = libbpf_rs::RingBufferBuilder::new();
 
     let exec_handle = |bytes: &[u8]| -> i32 {
@@ -287,21 +302,6 @@ where
         0
     };
 
-    let dns_handle = |bytes: &[u8]| -> i32 {
-        let mut state = state.borrow_mut();
-        let mut emit = emit_cell.borrow_mut();
-        if let Err(e) = handle_dns_event(
-            bytes,
-            &mut state,
-            host_id.as_deref(),
-            &mut *emit,
-        ) {
-            had_error.set(Some(e));
-            return 1;
-        }
-        0
-    };
-
     builder
         .add(&exec_maps.events, exec_handle)
         .context("add execve ringbuf consumer")?;
@@ -311,9 +311,27 @@ where
     builder
         .add(&conn_maps.connect_events, conn_handle)
         .context("add connect ringbuf consumer")?;
-    builder
-        .add(&dns_maps.dns_events, dns_handle)
-        .context("add dns ringbuf consumer")?;
+    // Only register the DNS consumer if its probe loaded. Defined here so the
+    // closure isn't dead code when DNS is disabled.
+    if let Some(dns_maps) = dns_maps {
+        let dns_handle = |bytes: &[u8]| -> i32 {
+            let mut state = state.borrow_mut();
+            let mut emit = emit_cell.borrow_mut();
+            if let Err(e) = handle_dns_event(
+                bytes,
+                &mut state,
+                host_id.as_deref(),
+                &mut *emit,
+            ) {
+                had_error.set(Some(e));
+                return 1;
+            }
+            0
+        };
+        builder
+            .add(&dns_maps.dns_events, dns_handle)
+            .context("add dns ringbuf consumer")?;
+    }
     let ringbuf = builder.build().context("build ringbuf")?;
 
     while !stop.load(Ordering::Relaxed) {
@@ -601,10 +619,19 @@ where
         None => return Ok(()),
     };
 
+    let is_agent_root = record.agent_root.pid == pid;
+
+    // Suppress the agent ROOT writing its OWN config surface — expected
+    // behavior, not a signal. A descendant writing the agent's config (e.g. a
+    // prompt-injected tool run) is the persistence vector and still emits.
+    // Mirrors the credential self-read suppression.
+    if is_agent_root && write_class == FileWriteClass::AgentConfig {
+        return Ok(());
+    }
+
     let abs_path = absolutize(filename, pid);
     let snap = proc::snapshot(pid);
     let chain = proc::parent_chain(pid, 16);
-    let is_agent_root = record.agent_root.pid == pid;
     let attributed_by_descent = !is_agent_root;
 
     let bpf_comm = nul_str(&raw.comm).to_string();

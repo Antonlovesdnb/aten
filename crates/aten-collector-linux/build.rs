@@ -21,9 +21,18 @@ mod linux_build {
         // in a multi-arch path that clang with `-target bpf` doesn't auto-
         // search. Both common locations; clang ignores the one that doesn't
         // apply on the build host.
+        // dns.bpf.c hand-defines struct pt_regs per arch to read the uprobe's
+        // first arg; tell it which arch we're targeting. Any other arch makes
+        // the DNS probe a no-op rather than reading the wrong register.
+        let arch_def = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+            Ok("x86_64") => "-D__TARGET_ARCH_x86_64",
+            Ok("aarch64") => "-D__TARGET_ARCH_arm64",
+            _ => "-D__TARGET_ARCH_unknown",
+        };
         let clang_args = [
             "-I/usr/include/x86_64-linux-gnu",
             "-I/usr/include/aarch64-linux-gnu",
+            arch_def,
         ];
 
         for (src, skel_name) in SOURCES {

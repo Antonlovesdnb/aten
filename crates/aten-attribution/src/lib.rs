@@ -506,7 +506,11 @@ impl AttributionEngine {
                 if let Some(tc) = confident_tc {
                     d.attribution.attributed_tool_call_id = Some(tc.id.clone());
                     d.attribution.time_window_ms = time_window_ms;
-                    d.attribution.requested_by_tool_call = tc.input_text.contains(&name);
+                    // query_name is already lowercased by the collectors; the
+                    // tool input is not, so lowercase it before matching (a
+                    // `curl HTTPS://Host` would otherwise miss).
+                    d.attribution.requested_by_tool_call =
+                        tc.input_text.to_lowercase().contains(&name);
                 }
                 d.attribution.triggering_command = triggering_command;
                 d.attribution.triggering_prompt = triggering_prompt;

@@ -43,8 +43,9 @@ use serde::{Deserialize, Serialize};
 ///   hostname behind a shared-CDN `network_egress` IP. `file_write`'s
 ///   payload is reworked (it was defined but never emitted in ≤0.4, so
 ///   this breaks no existing consumer): the `is_agent_config` bool
-///   becomes a richer `write_class` enum (agent-config / credential /
-///   executable) and `bytes_written` becomes `Option<u64>` for parity
+///   becomes a richer `write_class` enum (agent-config / executable;
+///   credential-path writes stay on `credential_access` with
+///   `access_type = write`) and `bytes_written` becomes `Option<u64>` for parity
 ///   with `CredentialAccess.bytes_read` (None when the probe only sees
 ///   the open-for-write, not the write). Collectors emit `file_write`
 ///   only for these "sensitive" classes — ordinary writes by enrolled
@@ -347,6 +348,12 @@ pub struct DnsQueryPayload {
 /// path and drop everything that returns no class — ordinary writes by enrolled
 /// processes never reach the SIEM. Mirrors `CredentialClass`'s collector-side
 /// taxonomy so detections key on a typed field, not a path regex.
+///
+/// Writes to *credential* paths are deliberately NOT a `file_write` class:
+/// `credential_access` already owns that path taxonomy and carries an
+/// `access_type` (read vs write), so a credential overwrite/plant surfaces as
+/// `credential_access` with `access_type = write`. Routing it here instead
+/// would have swallowed the read signal for read-then-write opens.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FileWriteClass {
@@ -354,9 +361,6 @@ pub enum FileWriteClass {
     /// `settings.json`, `.claude/`, `.codex/`. Agent self-modification: the
     /// persistence / privilege-of-future-turns vector.
     AgentConfig,
-    /// Write to a credential-class path (same taxonomy as `CredentialClass`) —
-    /// e.g. overwriting `~/.aws/credentials` or planting an `~/.ssh/` key.
-    Credential,
     /// Write of an executable or script file (`.sh`, `.ps1`, `.py`, `.exe`,
     /// `.bat`, …). Payload / exfil-script staging.
     Executable,

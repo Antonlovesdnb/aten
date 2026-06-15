@@ -18,9 +18,11 @@
 // schema's `answers` field is best-effort and stays empty on Linux for now.
 //
 // We avoid vmlinux.h (same as the other probes). A uprobe's context IS a
-// `struct pt_regs`, so we define the x86_64 layout by hand and read arg1 from
-// `rdi`. This file is therefore x86_64-only for now; aarch64 would read `regs[0]`
-// from its own pt_regs shape.
+// `struct pt_regs`, so we hand-define the layout per arch and read the first
+// argument register. The arch is selected by -D__TARGET_ARCH_* passed from
+// build.rs (from CARGO_CFG_TARGET_ARCH); x86_64 and arm64 are supported. Any
+// other arch compiles to a no-op (node always NULL → no emission) rather than
+// reading a wrong register and emitting a garbage hostname.
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
@@ -28,7 +30,8 @@
 #define TASK_COMM_LEN 16
 #define MAX_QNAME_LEN 256
 
-// x86_64 kernel `struct pt_regs` layout (UAPI-stable). Function arg1 is in rdi.
+#if defined(__TARGET_ARCH_x86_64)
+// x86_64 kernel `struct pt_regs` (UAPI-stable). First arg is in rdi.
 struct pt_regs {
     unsigned long r15;
     unsigned long r14;
@@ -44,7 +47,7 @@ struct pt_regs {
     unsigned long rcx;
     unsigned long rdx;
     unsigned long rsi;
-    unsigned long rdi; // arg1: const char *node
+    unsigned long rdi; // arg0: const char *node
     unsigned long orig_rax;
     unsigned long rip;
     unsigned long cs;
@@ -52,6 +55,23 @@ struct pt_regs {
     unsigned long rsp;
     unsigned long ss;
 };
+#define ATEN_UPROBE_ARG0(ctx) ((ctx)->rdi)
+#elif defined(__TARGET_ARCH_arm64)
+// arm64 user_pt_regs: first arg is regs[0].
+struct pt_regs {
+    unsigned long regs[31];
+    unsigned long sp;
+    unsigned long pc;
+    unsigned long pstate;
+};
+#define ATEN_UPROBE_ARG0(ctx) ((ctx)->regs[0])
+#else
+// Unsupported arch — no-op the probe rather than read a wrong register.
+struct pt_regs {
+    unsigned long __unused;
+};
+#define ATEN_UPROBE_ARG0(ctx) (0UL)
+#endif
 
 struct dns_event {
     __u64 timestamp_ns;
@@ -88,7 +108,7 @@ extern int bpf_copy_from_user_str(void *dst, __u32 dst__sz,
 // copy fixes both. Requires kernel >= 6.11 for bpf_copy_from_user_str.
 SEC("uprobe.s")
 int handle_getaddrinfo(struct pt_regs *ctx) {
-    const char *node = (const char *)ctx->rdi;
+    const char *node = (const char *)ATEN_UPROBE_ARG0(ctx);
     if (!node) {
         return 0; // getaddrinfo(NULL, service, ...) — a service-only lookup
     }

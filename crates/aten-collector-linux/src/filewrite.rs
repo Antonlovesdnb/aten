@@ -11,11 +11,16 @@
 //!     signal. Deliberately does NOT match the whole `.claude/` tree — the
 //!     transcript JSONL and todo/history churn under `.claude/projects/` would
 //!     be a firehose and is normal behavior.
-//!   - **Credential** — writes to a credential-class path (reuses
-//!     `credentials::classify`): planting an `~/.ssh/` key, overwriting
-//!     `~/.aws/credentials`.
 //!   - **Executable** — writes of an executable/script by extension. Payload or
 //!     exfil-script staging.
+//!
+//! Credential-path writes are intentionally NOT classified here: the
+//! `credentials` classifier + `credential_access` event already own that path
+//! taxonomy and carry an `access_type`, so a credential overwrite/plant is a
+//! `credential_access` with `access_type = write`. Classifying it as a
+//! `file_write` here would make the write-intent branch in the collectors
+//! divert credential *reads* (e.g. an `O_RDWR` open) away from
+//! `credential_access` and drop the exfil signal.
 //!
 //! Classification is by *path fragment* with Windows separators normalized to
 //! `/`, matching the `credentials` module so one set of patterns works on every
@@ -23,20 +28,14 @@
 
 use aten_schema::FileWriteClass;
 
-use crate::credentials;
-
 /// Best-effort classification of a written path. Returns `None` for ordinary
-/// writes the collector should drop. Priority is AgentConfig → Credential →
-/// Executable: the most security-specific class wins when a path could fit more
-/// than one (e.g. a `.env` planted under `skills/`).
+/// writes the collector should drop *and* for credential paths (owned by
+/// `credential_access`). Priority is AgentConfig → Executable.
 pub fn classify(path: &str) -> Option<FileWriteClass> {
     let p = path.to_lowercase().replace('\\', "/");
 
     if is_agent_config(&p) {
         return Some(FileWriteClass::AgentConfig);
-    }
-    if credentials::classify(path) != aten_schema::CredentialClass::None {
-        return Some(FileWriteClass::Credential);
     }
     if is_executable(&p) {
         return Some(FileWriteClass::Executable);
@@ -130,15 +129,12 @@ mod tests {
     }
 
     #[test]
-    fn credential_writes() {
-        assert_eq!(
-            classify("/home/anton/.aws/credentials"),
-            Some(FileWriteClass::Credential)
-        );
-        assert_eq!(
-            classify(r"C:\Users\anton\.ssh\planted_key"),
-            Some(FileWriteClass::Credential)
-        );
+    fn credential_paths_return_none() {
+        // Credential paths are owned by credential_access (which carries
+        // access_type), so file_write must NOT claim them — otherwise the
+        // collector's write-intent branch would swallow credential reads.
+        assert_eq!(classify("/home/anton/.aws/credentials"), None);
+        assert_eq!(classify(r"C:\Users\anton\.ssh\planted_key"), None);
     }
 
     #[test]

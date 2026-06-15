@@ -794,6 +794,16 @@ fn emit_file_write(
     };
     let agent_root_pid = Some(rec.agent_root.pid);
     let is_agent_root = rec.agent_root.pid == pid as i32;
+
+    // Suppress the agent ROOT writing its OWN config surface — that's expected
+    // (the agent rewrites its settings on startup / normal use), not a signal.
+    // A *descendant* writing the agent's config (e.g. a prompt-injected tool
+    // run) is the persistence vector and still emits (is_agent_root false).
+    // Mirrors the credential self-read suppression. Drops the guard.
+    if is_agent_root && write_class == FileWriteClass::AgentConfig {
+        return Ok(());
+    }
+
     let cached = st.proc_info.get(&(pid as i32)).cloned();
     st.events_emitted += 1;
     drop(st);
@@ -1165,8 +1175,11 @@ fn dns_qtype(qtype: u32) -> DnsQueryType {
 
 /// Parse the DNS-Client `QueryResults` blob into resolved answers. The field is
 /// a `;`-delimited list whose entries are either a bare address or a
-/// `type: <n> <data>` form (CNAME chains carry the type prefix). We take the
-/// last whitespace-separated token of each non-empty entry.
+/// `type: <n> <data>` form (CNAME chains carry the type prefix). For the
+/// `type:` form we strip the `type:` keyword and the numeric type id, keeping
+/// the *entire remaining data verbatim* — TXT records (the high-signal DNS
+/// tunnel/exfil carrier) carry spaces, so taking only the last token would
+/// silently truncate the payload an analyst needs.
 fn parse_dns_results(results: &str) -> Vec<String> {
     results
         .split(';')
@@ -1175,9 +1188,24 @@ fn parse_dns_results(results: &str) -> Vec<String> {
             if seg.is_empty() {
                 return None;
             }
-            // "type:  5 cname.example.com" → "cname.example.com"; a bare
-            // "93.184.216.34" → itself.
-            Some(seg.split_whitespace().last().unwrap_or(seg).to_string())
+            match seg.strip_prefix("type:") {
+                // "type:  16 v=spf1 ... ~all" → "v=spf1 ... ~all"
+                Some(rest) => {
+                    let after_num = rest
+                        .trim_start()
+                        .splitn(2, char::is_whitespace)
+                        .nth(1)
+                        .unwrap_or("")
+                        .trim();
+                    if after_num.is_empty() {
+                        None
+                    } else {
+                        Some(after_num.to_string())
+                    }
+                }
+                // bare "93.184.216.34" → itself
+                None => Some(seg.to_string()),
+            }
         })
         .collect()
 }
@@ -1267,10 +1295,16 @@ mod tests {
             parse_dns_results("93.184.216.34;93.184.216.35;"),
             vec!["93.184.216.34", "93.184.216.35"]
         );
-        // CNAME-chain "type: n data" entries — take the trailing token.
+        // CNAME-chain "type: n data" entries — strip "type: n", keep the data.
         assert_eq!(
             parse_dns_results("type:  5 cdn.example.com;type:  1 93.184.216.34;"),
             vec!["cdn.example.com", "93.184.216.34"]
+        );
+        // TXT data carries spaces — must be preserved verbatim, not truncated
+        // to the last token (this is the DNS-exfil carrier).
+        assert_eq!(
+            parse_dns_results("type:  16 v=spf1 include:_spf.example.com ~all;"),
+            vec!["v=spf1 include:_spf.example.com ~all"]
         );
         // Empty / whitespace-only → no answers.
         assert!(parse_dns_results("").is_empty());
