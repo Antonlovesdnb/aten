@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fishbowl macOS dev-mode setup + preflight checker.
+# aten macOS dev-mode setup + preflight checker.
 #
 # We build on a free Apple account (no paid Developer Program), so the
 # entitlement-gated paths — EndpointSecurity (es_new_client) and the
@@ -33,7 +33,7 @@ ok()   { printf "  \033[32m✓\033[0m %s\n" "$1"; }
 bad()  { printf "  \033[31m✗\033[0m %s\n" "$1"; }
 info() { printf "  \033[33m•\033[0m %s\n" "$1"; }
 
-echo "fishbowl macOS dev-mode preflight"
+echo "aten macOS dev-mode preflight"
 echo
 
 # 1. SIP

@@ -1,0 +1,227 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ATEN ETW instrumentation manifest.
+
+  Declares the "ATEN" ETW provider and a dedicated Operational channel,
+  "ATEN/Operational", that surfaces in Event Viewer under
+  Applications and Services Logs and is collectable by Windows Event Forwarding
+  and SIEM agents — the same shape Sysmon uses for
+  Microsoft-Windows-Sysmon/Operational.
+
+  Each event type has its own template of typed, named fields (rendered as
+  native <EventData> in Event Viewer and addressable by XPath in WEF/SIEM),
+  plus a trailing RawJson field carrying the full aten_schema::Event for
+  anything not promoted to a typed field. Each event also has a Task (shows in
+  the "Task Category" column) and a Level.
+
+  The provider GUID, channel value (16), per-event IDs, Task values, and the
+  field ORDER of every template MUST stay in sync with
+  crates/aten-collector-windows/src/eventlog.rs (unit tests guard the IDs;
+  the field order is the contract for the EVENT_DATA_DESCRIPTOR arrays).
+
+  Build the resource DLL with build-manifest.ps1, then register with:
+  wevtutil im aten.man /rf:<dll> /mf:<dll>   (admin).
+-->
+<instrumentationManifest
+    xmlns="http://schemas.microsoft.com/win/2004/08/events"
+    xmlns:win="http://manifests.microsoft.com/win/2004/08/windows/events"
+    xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <instrumentation>
+    <events>
+      <provider
+          name="ATEN"
+          guid="{0e28e4c0-89f9-4b9d-9f35-bd497b26c397}"
+          symbol="ATEN_PROVIDER"
+          resourceFileName="C:\ProgramData\aten\aten_events.dll"
+          messageFileName="C:\ProgramData\aten\aten_events.dll">
+
+        <channels>
+          <!-- value="16": Operational channel ids start at 16 (0-15 reserved).
+               This byte is what eventlog.rs stamps into EVENT_DESCRIPTOR.Channel. -->
+          <channel name="ATEN/Operational"
+                   chid="Operational"
+                   symbol="ATEN_CHANNEL_OPERATIONAL"
+                   type="Operational"
+                   enabled="true"
+                   value="16"/>
+        </channels>
+
+        <!-- Task Category values. eventlog.rs sets EVENT_DESCRIPTOR.Task to the
+             matching value (same number as the Event ID, for simplicity). -->
+        <tasks>
+          <task name="ProcessExec"      symbol="TASK_PROCESS_EXEC"      value="1"  message="$(string.task.process_exec)"/>
+          <task name="ProcessExit"      symbol="TASK_PROCESS_EXIT"      value="2"  message="$(string.task.process_exit)"/>
+          <task name="CredentialAccess" symbol="TASK_CREDENTIAL_ACCESS" value="3"  message="$(string.task.credential_access)"/>
+          <task name="NetworkEgress"    symbol="TASK_NETWORK_EGRESS"    value="4"  message="$(string.task.network_egress)"/>
+          <task name="FileWrite"        symbol="TASK_FILE_WRITE"        value="5"  message="$(string.task.file_write)"/>
+          <task name="Prompt"           symbol="TASK_PROMPT"            value="10" message="$(string.task.prompt)"/>
+          <task name="ToolCall"         symbol="TASK_TOOL_CALL"         value="11" message="$(string.task.tool_call)"/>
+          <task name="ToolResult"       symbol="TASK_TOOL_RESULT"       value="12" message="$(string.task.tool_result)"/>
+        </tasks>
+
+        <templates>
+          <!-- Common kernel prefix (fields 1-16) is identical across
+               t_proc_exec / t_cred / t_net so the message %-indices line up and
+               eventlog.rs can share one builder. ParentChain is the flattened
+               "name(pid) > …" ancestry. RawJson is always the last field.
+               Booleans are emitted as "true"/"false" strings to avoid ETW
+               boolean width ambiguity. -->
+          <template tid="t_proc_exec">
+            <data name="Timestamp"             inType="win:UnicodeString"/>
+            <data name="HostId"                inType="win:UnicodeString"/>
+            <data name="AgentId"               inType="win:UnicodeString"/>
+            <data name="UserId"                inType="win:UnicodeString"/>
+            <data name="Pid"                   inType="win:Int32"/>
+            <data name="Ppid"                  inType="win:Int32"/>
+            <data name="ProcessName"           inType="win:UnicodeString"/>
+            <data name="ProcessPath"           inType="win:UnicodeString"/>
+            <data name="CommandLine"           inType="win:UnicodeString"/>
+            <data name="User"                  inType="win:UnicodeString"/>
+            <data name="AgentRootPid"          inType="win:Int32"/>
+            <data name="AttributedByDescent"   inType="win:UnicodeString"/>
+            <data name="RequestedInToolResult" inType="win:UnicodeString"/>
+            <data name="TriggeringCommand"     inType="win:UnicodeString"/>
+            <data name="TriggeringPrompt"      inType="win:UnicodeString"/>
+            <data name="ParentChain"           inType="win:UnicodeString"/>
+            <data name="ExecArgs"              inType="win:UnicodeString"/>
+            <data name="RawJson"               inType="win:UnicodeString"/>
+          </template>
+
+          <template tid="t_cred">
+            <data name="Timestamp"             inType="win:UnicodeString"/>
+            <data name="HostId"                inType="win:UnicodeString"/>
+            <data name="AgentId"               inType="win:UnicodeString"/>
+            <data name="UserId"                inType="win:UnicodeString"/>
+            <data name="Pid"                   inType="win:Int32"/>
+            <data name="Ppid"                  inType="win:Int32"/>
+            <data name="ProcessName"           inType="win:UnicodeString"/>
+            <data name="ProcessPath"           inType="win:UnicodeString"/>
+            <data name="CommandLine"           inType="win:UnicodeString"/>
+            <data name="User"                  inType="win:UnicodeString"/>
+            <data name="AgentRootPid"          inType="win:Int32"/>
+            <data name="AttributedByDescent"   inType="win:UnicodeString"/>
+            <data name="RequestedInToolResult" inType="win:UnicodeString"/>
+            <data name="TriggeringCommand"     inType="win:UnicodeString"/>
+            <data name="TriggeringPrompt"      inType="win:UnicodeString"/>
+            <data name="ParentChain"           inType="win:UnicodeString"/>
+            <data name="FilePath"              inType="win:UnicodeString"/>
+            <data name="CredentialClass"       inType="win:UnicodeString"/>
+            <data name="AccessType"            inType="win:UnicodeString"/>
+            <data name="RawJson"               inType="win:UnicodeString"/>
+          </template>
+
+          <template tid="t_net">
+            <data name="Timestamp"             inType="win:UnicodeString"/>
+            <data name="HostId"                inType="win:UnicodeString"/>
+            <data name="AgentId"               inType="win:UnicodeString"/>
+            <data name="UserId"                inType="win:UnicodeString"/>
+            <data name="Pid"                   inType="win:Int32"/>
+            <data name="Ppid"                  inType="win:Int32"/>
+            <data name="ProcessName"           inType="win:UnicodeString"/>
+            <data name="ProcessPath"           inType="win:UnicodeString"/>
+            <data name="CommandLine"           inType="win:UnicodeString"/>
+            <data name="User"                  inType="win:UnicodeString"/>
+            <data name="AgentRootPid"          inType="win:Int32"/>
+            <data name="AttributedByDescent"   inType="win:UnicodeString"/>
+            <data name="RequestedInToolResult" inType="win:UnicodeString"/>
+            <data name="TriggeringCommand"     inType="win:UnicodeString"/>
+            <data name="TriggeringPrompt"      inType="win:UnicodeString"/>
+            <data name="ParentChain"           inType="win:UnicodeString"/>
+            <data name="DestIp"                inType="win:UnicodeString"/>
+            <data name="DestPort"              inType="win:Int32"/>
+            <data name="Protocol"              inType="win:UnicodeString"/>
+            <data name="DestHost"              inType="win:UnicodeString"/>
+            <data name="RawJson"               inType="win:UnicodeString"/>
+          </template>
+
+          <!-- Transcript-derived events (emitted by the daemon's transcript
+               reader, not the kernel collector). Envelope prefix (1-5) then
+               kind-specific then RawJson. -->
+          <template tid="t_prompt">
+            <data name="Timestamp"     inType="win:UnicodeString"/>
+            <data name="HostId"        inType="win:UnicodeString"/>
+            <data name="AgentId"       inType="win:UnicodeString"/>
+            <data name="UserId"        inType="win:UnicodeString"/>
+            <data name="SessionId"     inType="win:UnicodeString"/>
+            <data name="Role"          inType="win:UnicodeString"/>
+            <data name="PromptSummary" inType="win:UnicodeString"/>
+            <data name="RawJson"       inType="win:UnicodeString"/>
+          </template>
+
+          <template tid="t_tool_call">
+            <data name="Timestamp"        inType="win:UnicodeString"/>
+            <data name="HostId"           inType="win:UnicodeString"/>
+            <data name="AgentId"          inType="win:UnicodeString"/>
+            <data name="UserId"           inType="win:UnicodeString"/>
+            <data name="SessionId"        inType="win:UnicodeString"/>
+            <data name="ToolName"         inType="win:UnicodeString"/>
+            <data name="ToolCallId"       inType="win:UnicodeString"/>
+            <data name="ToolInputSummary" inType="win:UnicodeString"/>
+            <data name="RawJson"          inType="win:UnicodeString"/>
+          </template>
+
+          <template tid="t_tool_result">
+            <data name="Timestamp"     inType="win:UnicodeString"/>
+            <data name="HostId"        inType="win:UnicodeString"/>
+            <data name="AgentId"       inType="win:UnicodeString"/>
+            <data name="UserId"        inType="win:UnicodeString"/>
+            <data name="SessionId"     inType="win:UnicodeString"/>
+            <data name="ToolCallId"    inType="win:UnicodeString"/>
+            <data name="ResultStatus"  inType="win:UnicodeString"/>
+            <data name="ResultSummary" inType="win:UnicodeString"/>
+            <data name="RawJson"       inType="win:UnicodeString"/>
+          </template>
+
+          <!-- Generic fallback for event kinds not currently emitted
+               (ProcessExit, FileWrite): envelope + Pid + RawJson. -->
+          <template tid="t_generic">
+            <data name="Timestamp" inType="win:UnicodeString"/>
+            <data name="HostId"    inType="win:UnicodeString"/>
+            <data name="AgentId"   inType="win:UnicodeString"/>
+            <data name="Pid"       inType="win:Int32"/>
+            <data name="RawJson"   inType="win:UnicodeString"/>
+          </template>
+        </templates>
+
+        <events>
+          <event symbol="EVT_PROCESS_EXEC"      value="1"  version="0" channel="Operational" level="win:Informational" task="ProcessExec"      template="t_proc_exec"   message="$(string.evt.process_exec)"/>
+          <event symbol="EVT_PROCESS_EXIT"      value="2"  version="0" channel="Operational" level="win:Informational" task="ProcessExit"      template="t_generic"     message="$(string.evt.process_exit)"/>
+          <event symbol="EVT_CREDENTIAL_ACCESS" value="3"  version="0" channel="Operational" level="win:Warning"       task="CredentialAccess" template="t_cred"        message="$(string.evt.credential_access)"/>
+          <event symbol="EVT_NETWORK_EGRESS"    value="4"  version="0" channel="Operational" level="win:Warning"       task="NetworkEgress"    template="t_net"         message="$(string.evt.network_egress)"/>
+          <event symbol="EVT_FILE_WRITE"        value="5"  version="0" channel="Operational" level="win:Informational" task="FileWrite"        template="t_generic"     message="$(string.evt.file_write)"/>
+          <event symbol="EVT_PROMPT"            value="10" version="0" channel="Operational" level="win:Informational" task="Prompt"           template="t_prompt"      message="$(string.evt.prompt)"/>
+          <event symbol="EVT_TOOL_CALL"         value="11" version="0" channel="Operational" level="win:Informational" task="ToolCall"         template="t_tool_call"   message="$(string.evt.tool_call)"/>
+          <event symbol="EVT_TOOL_RESULT"       value="12" version="0" channel="Operational" level="win:Informational" task="ToolResult"       template="t_tool_result" message="$(string.evt.tool_result)"/>
+        </events>
+      </provider>
+    </events>
+  </instrumentation>
+
+  <localization>
+    <resources culture="en-US">
+      <stringTable>
+        <!-- Task Category labels -->
+        <string id="task.process_exec"      value="Process Exec"/>
+        <string id="task.process_exit"      value="Process Exit"/>
+        <string id="task.credential_access" value="Credential Access"/>
+        <string id="task.network_egress"    value="Network Egress"/>
+        <string id="task.file_write"        value="File Write"/>
+        <string id="task.prompt"            value="Prompt"/>
+        <string id="task.tool_call"         value="Tool Call"/>
+        <string id="task.tool_result"       value="Tool Result"/>
+
+        <!-- General-tab messages. %-indices reference template fields in order;
+             the kernel templates share fields 1-15, so %5=Pid, %7=ProcessName,
+             %8=ProcessPath throughout. -->
+        <string id="evt.process_exec"      value="AI agent process exec by %7 (pid %5): %8"/>
+        <string id="evt.process_exit"      value="AI agent process exit (pid %4)"/>
+        <string id="evt.credential_access" value="AI agent credential access by %7 (pid %5): %17 [%18]"/>
+        <string id="evt.network_egress"    value="AI agent network egress by %7 (pid %5) to %17:%18 (%19)"/>
+        <string id="evt.file_write"        value="AI agent file write (pid %4)"/>
+        <string id="evt.prompt"            value="AI agent prompt (%6): %7"/>
+        <string id="evt.tool_call"         value="AI agent tool call: %6"/>
+        <string id="evt.tool_result"       value="AI agent tool result [%7]"/>
+      </stringTable>
+    </resources>
+  </localization>
+</instrumentationManifest>

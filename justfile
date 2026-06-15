@@ -1,4 +1,4 @@
-# fishbowl-v2 task recipes. Both platforms invoke the same commands; CI calls these too.
+# ATEN task recipes. Both platforms invoke the same commands; CI calls these too.
 # `just` install (Windows): winget install --id Casey.Just --scope user
 # `just` install (Linux): cargo install just  OR  apt install just
 
@@ -35,4 +35,4 @@ fmt:
 # Run the daemon CLI against this session's own transcript on the VM — a quick
 # end-to-end check that schema events are being emitted.
 demo-transcript SESSION_JSONL:
-    ssh {{VM}} 'cd {{VM_REPO}} && source ~/.cargo/env && cargo run --release --bin fishbowl -- transcript {{SESSION_JSONL}}'
+    ssh {{VM}} 'cd {{VM_REPO}} && source ~/.cargo/env && cargo run --release --bin aten -- transcript {{SESSION_JSONL}}'

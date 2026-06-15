@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build and ad-hoc-sign the `fishbowl` daemon binary with the EndpointSecurity
-# client entitlement, so `fishbowl collect-macos` / `fishbowl daemon` can create
+# Build and ad-hoc-sign the `aten` daemon binary with the EndpointSecurity
+# client entitlement, so `aten collect-macos` / `aten daemon` can create
 # an ES client. Without this signing step es_new_client returns NOT_PERMITTED.
 #
 # Free-account dev mode: ad-hoc identity ("-") + the entitlement is honored only
@@ -19,11 +19,11 @@ ENTITLEMENTS="macos/esf.entitlements"
 echo "==> cargo build --profile $PROFILE (with esf feature)"
 # The macos collector's `esf` feature is on by default; build the daemon bin.
 if [ "$PROFILE" = "release" ]; then
-  cargo build --release -p fishbowl-daemon
-  BIN="target/release/fishbowl"
+  cargo build --release -p aten-daemon
+  BIN="target/release/aten"
 else
-  cargo build -p fishbowl-daemon
-  BIN="target/debug/fishbowl"
+  cargo build -p aten-daemon
+  BIN="target/debug/aten"
 fi
 
 if [ ! -f "$BIN" ]; then
@@ -43,4 +43,4 @@ codesign -dv --entitlements :- "$BIN" 2>&1 | sed 's/^/  /'
 echo
 echo "Signed: $BIN"
 echo "Run:    sudo $BIN collect-macos --agents claude,codex"
-echo "  (sudo is required for ESF; the netflow UDS lives in /var/run/fishbowl.)"
+echo "  (sudo is required for ESF; the netflow UDS lives in /var/run/aten.)"

@@ -1,0 +1,31 @@
+[package]
+name = "aten-collector-linux"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Linux eBPF collector for ATEN"
+
+# Only buildable on Linux — Cargo will refuse to compile on Windows hosts.
+# The daemon depends on this crate behind a target_os = "linux" cfg.
+[lib]
+name = "aten_collector_linux"
+path = "src/lib.rs"
+
+[dependencies]
+aten-schema = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Linux-only deps. The crate as a whole is a no-op on non-Linux hosts so the
+# workspace can build on Windows without pulling libbpf.
+[target.'cfg(target_os = "linux")'.dependencies]
+libbpf-rs = "0.24"
+libc = "0.2"
+plain = "0.2"
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+libbpf-cargo = "0.24"

@@ -1,9 +1,9 @@
 # XcodeGen spec for the macOS network-egress components.
 #
 # Two targets:
-#   FishbowlHost   — the .app that activates the system extension and installs
+#   AtenHost   — the .app that activates the system extension and installs
 #                    the content-filter configuration.
-#   FishbowlNetExt — the NEFilterDataProvider system extension, embedded into
+#   AtenNetExt — the NEFilterDataProvider system extension, embedded into
 #                    the host's Contents/Library/SystemExtensions.
 #
 # Generate + build with ./build.sh (which runs `xcodegen generate` then
@@ -12,9 +12,9 @@
 # Signing is ad-hoc ("-") for free-account dev mode; see devsetup.md. On a paid
 # Developer Program account, set DEVELOPMENT_TEAM and a real CODE_SIGN_IDENTITY.
 
-name: Fishbowl
+name: Aten
 options:
-  bundleIdPrefix: ai.fishbowl
+  bundleIdPrefix: ai.aten
   deploymentTarget:
     macOS: "11.0"
   createIntermediateGroups: true
@@ -28,29 +28,29 @@ settings:
     ENABLE_HARDENED_RUNTIME: YES
 
 targets:
-  FishbowlHost:
+  AtenHost:
     type: application
     platform: macOS
     sources:
-      - path: FishbowlHost
+      - path: AtenHost
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: ai.fishbowl.host
-        PRODUCT_NAME: FishbowlHost
-        INFOPLIST_FILE: FishbowlHost/Info.plist
-        CODE_SIGN_ENTITLEMENTS: FishbowlHost/FishbowlHost.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: ai.aten.host
+        PRODUCT_NAME: AtenHost
+        INFOPLIST_FILE: AtenHost/Info.plist
+        CODE_SIGN_ENTITLEMENTS: AtenHost/AtenHost.entitlements
     dependencies:
-      - target: FishbowlNetExt
+      - target: AtenNetExt
         embed: true            # → Contents/Library/SystemExtensions
 
-  FishbowlNetExt:
+  AtenNetExt:
     type: system-extension
     platform: macOS
     sources:
-      - path: FishbowlNetExt
+      - path: AtenNetExt
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: ai.fishbowl.netext
-        PRODUCT_NAME: FishbowlNetExt
-        INFOPLIST_FILE: FishbowlNetExt/Info.plist
-        CODE_SIGN_ENTITLEMENTS: FishbowlNetExt/FishbowlNetExt.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: ai.aten.netext
+        PRODUCT_NAME: AtenNetExt
+        INFOPLIST_FILE: AtenNetExt/Info.plist
+        CODE_SIGN_ENTITLEMENTS: AtenNetExt/AtenNetExt.entitlements

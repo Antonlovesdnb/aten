@@ -1,5 +1,5 @@
 """
-fishbowl-v2 transcript reader — prototype.
+ATEN transcript reader — prototype.
 
 Reads a Claude Code session transcript (`~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`)
 and emits schema.md v0.2 events: `prompt`, `tool_call`, `tool_result`. Also builds a per-session

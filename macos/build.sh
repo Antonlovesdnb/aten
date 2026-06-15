@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Build the fishbowl macOS network-extension app + system extension (dev mode).
+# Build the aten macOS network-extension app + system extension (dev mode).
 #
 # Prereqs (see devsetup.md): Xcode command-line tools, XcodeGen
 # (`brew install xcodegen`), and the one-time host prep (SIP off, amfi boot-arg,
 # `systemextensionsctl developer on`). Run from anywhere; paths are resolved
 # relative to this script.
 #
-# Produces macos/build/Build/Products/Debug/FishbowlHost.app with the system
+# Produces macos/build/Build/Products/Debug/AtenHost.app with the system
 # extension embedded. Then:
-#   open  macos/build/Build/Products/Debug/FishbowlHost.app   # activate + enable
+#   open  macos/build/Build/Products/Debug/AtenHost.app   # activate + enable
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -18,13 +18,13 @@ if ! command -v xcodegen >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> Generating Fishbowl.xcodeproj from project.yml"
+echo "==> Generating Aten.xcodeproj from project.yml"
 xcodegen generate
 
 echo "==> Building (ad-hoc signed)"
 xcodebuild \
-  -project Fishbowl.xcodeproj \
-  -scheme FishbowlHost \
+  -project Aten.xcodeproj \
+  -scheme AtenHost \
   -configuration Debug \
   -derivedDataPath build \
   CODE_SIGN_IDENTITY="-" \
@@ -32,7 +32,7 @@ xcodebuild \
   CODE_SIGNING_ALLOWED=YES \
   build
 
-APP="build/Build/Products/Debug/FishbowlHost.app"
+APP="build/Build/Products/Debug/AtenHost.app"
 echo "==> Built: $APP"
 echo
 echo "Embedded system extension:"

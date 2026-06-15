@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Entitlements for the content-filter system extension.
+     `content-filter-provider` is the NetworkExtension provider type for an
+     NEFilterDataProvider. On a paid Developer Program account this entitlement
+     is granted directly; in free-account dev mode it is honored only with SIP
+     adjustments + `systemextensionsctl developer on` (see macos/devsetup.md). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.networking.networkextension</key>
+    <array>
+        <string>content-filter-provider</string>
+    </array>
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <!-- The sandboxed extension needs to open the collector's UDS in
+         /var/run/aten. A client UNIX socket connect is permitted under the
+         network-client entitlement; the path itself is root-owned. -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+</dict>
+</plist>

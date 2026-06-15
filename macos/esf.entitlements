@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Entitlement applied to the `fishbowl` daemon binary so it can create an
+<!-- Entitlement applied to the `aten` daemon binary so it can create an
      EndpointSecurity client. `es_new_client` returns ES_NEW_CLIENT_RESULT_ERR_
      NOT_PERMITTED without it.
 

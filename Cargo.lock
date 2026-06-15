@@ -349,24 +349,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "fishbowl-attribution"
+name = "aten-attribution"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "fishbowl-schema",
- "fishbowl-transcript",
+ "aten-schema",
+ "aten-transcript",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
 ]
 
 [[package]]
-name = "fishbowl-collector-linux"
+name = "aten-collector-linux"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "fishbowl-schema",
+ "aten-schema",
  "libbpf-cargo",
  "libbpf-rs",
  "libc",
@@ -378,14 +378,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "fishbowl-collector-macos"
+name = "aten-collector-macos"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
  "endpoint-sec",
- "fishbowl-collector-linux",
- "fishbowl-schema",
+ "aten-collector-linux",
+ "aten-schema",
  "libc",
  "libproc",
  "serde",
@@ -395,14 +395,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "fishbowl-collector-windows"
+name = "aten-collector-windows"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
  "ferrisetw",
- "fishbowl-collector-linux",
- "fishbowl-schema",
+ "aten-collector-linux",
+ "aten-schema",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -411,18 +411,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "fishbowl-daemon"
+name = "aten-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "fishbowl-attribution",
- "fishbowl-collector-linux",
- "fishbowl-collector-macos",
- "fishbowl-collector-windows",
- "fishbowl-schema",
- "fishbowl-transcript",
+ "aten-attribution",
+ "aten-collector-linux",
+ "aten-collector-macos",
+ "aten-collector-windows",
+ "aten-schema",
+ "aten-transcript",
  "libc",
  "serde",
  "serde_json",
@@ -432,7 +432,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fishbowl-schema"
+name = "aten-schema"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -441,11 +441,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "fishbowl-transcript"
+name = "aten-transcript"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "fishbowl-schema",
+ "aten-schema",
  "regex",
  "serde",
  "serde_json",

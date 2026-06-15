@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LaunchDaemon for the always-on aten daemon (macOS analog of the Windows
+     service in crates/aten-daemon/src/service.rs). Install:
+
+       sudo cp macos/com.aten.daemon.plist /Library/LaunchDaemons/
+       sudo chown root:wheel /Library/LaunchDaemons/com.aten.daemon.plist
+       sudo cp target/release/aten /usr/local/bin/aten   # ESF-signed
+       sudo launchctl bootstrap system /Library/LaunchDaemons/com.aten.daemon.plist
+
+     Tear down:
+       sudo launchctl bootout system /Library/LaunchDaemons/com.aten.daemon.plist
+
+     Edit --watch-dir to point at the user's transcript dirs. Runs as root
+     (required for ESF). The system extension is activated separately by the
+     AtenHost app (see build.sh). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aten.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/aten</string>
+        <string>daemon</string>
+        <string>--agents</string>
+        <string>claude,cursor,codex</string>
+        <string>--watch-dir</string>
+        <string>/Users/Shared/.claude/projects</string>
+        <string>--out</string>
+        <string>/Library/Application Support/aten/events.jsonl</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/aten/daemon.err.log</string>
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/aten/daemon.out.log</string>
+</dict>
+</plist>

@@ -1,0 +1,16 @@
+[package]
+name = "aten-attribution"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Attribution engine stitching transcript events to kernel events"
+
+[dependencies]
+aten-schema = { workspace = true }
+aten-transcript = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }

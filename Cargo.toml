@@ -6,16 +6,16 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2021"
 authors = ["Anton Ovrutsky <aovrutsky@gmail.com>"]
-repository = "https://github.com/Antonlovesdnb/fishbowl-v2"
+repository = "https://github.com/Antonlovesdnb/aten"
 description = "Always-on cross-platform telemetry daemon for AI agent activity"
 
 [workspace.dependencies]
-fishbowl-schema = { path = "crates/fishbowl-schema" }
-fishbowl-transcript = { path = "crates/fishbowl-transcript" }
-fishbowl-collector-linux = { path = "crates/fishbowl-collector-linux" }
-fishbowl-collector-windows = { path = "crates/fishbowl-collector-windows" }
-fishbowl-collector-macos = { path = "crates/fishbowl-collector-macos" }
-fishbowl-attribution = { path = "crates/fishbowl-attribution" }
+aten-schema = { path = "crates/aten-schema" }
+aten-transcript = { path = "crates/aten-transcript" }
+aten-collector-linux = { path = "crates/aten-collector-linux" }
+aten-collector-windows = { path = "crates/aten-collector-windows" }
+aten-collector-macos = { path = "crates/aten-collector-macos" }
+aten-attribution = { path = "crates/aten-attribution" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
