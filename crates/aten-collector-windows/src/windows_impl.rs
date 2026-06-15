@@ -799,15 +799,14 @@ fn emit_file_write(
     let agent_root_pid = Some(rec.agent_root.pid);
     let is_agent_root = rec.agent_root.pid == pid as i32;
 
-    // Suppress the agent ROOT writing its OWN config surface — that's expected
-    // (the agent rewrites its settings on startup / normal use), not a signal.
-    // A *descendant* writing the agent's config (e.g. a prompt-injected tool
-    // run) is the persistence vector and still emits (is_agent_root false).
-    // Mirrors the credential self-read suppression. Drops the guard.
-    if is_agent_root && write_class == FileWriteClass::AgentConfig {
-        return Ok(());
-    }
-
+    // NOTE: we deliberately do NOT suppress the agent root writing its own
+    // config surface here, even though that's usually benign noise. Dropping it
+    // at the collector is lossy in-collector policy (against the telemetry-not-
+    // policy design) and created a blind spot — an in-process-compromised agent,
+    // or a process holding a recycled agent-root PID, could write persistence
+    // (skills/, settings.json) invisibly. The event carries process.pid and
+    // agent_root_pid, so the SIEM filters self-writes (pid == agent_root_pid)
+    // with full attribution context, reversibly.
     let cached = st.proc_info.get(&(pid as i32)).cloned();
     st.events_emitted += 1;
     drop(st);

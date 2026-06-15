@@ -599,7 +599,7 @@ where
 
 /// Emit a `FileWrite` for a write-intent openat whose path the `filewrite`
 /// classifier flagged as sensitive. Shares the credential handler's enrollment
-/// + /proc enrichment; `bytes_written` is None because the openat probe sees
+/// and /proc enrichment; `bytes_written` is None because the openat probe sees
 /// the open, not the write.
 fn emit_file_write<F>(
     raw: &RawCredaccEvent,
@@ -621,14 +621,14 @@ where
 
     let is_agent_root = record.agent_root.pid == pid;
 
-    // Suppress the agent ROOT writing its OWN config surface — expected
-    // behavior, not a signal. A descendant writing the agent's config (e.g. a
-    // prompt-injected tool run) is the persistence vector and still emits.
-    // Mirrors the credential self-read suppression.
-    if is_agent_root && write_class == FileWriteClass::AgentConfig {
-        return Ok(());
-    }
-
+    // NOTE: we deliberately do NOT suppress the agent root writing its own
+    // config surface here, even though that's usually benign noise. Dropping it
+    // at the collector is lossy in-collector policy (against the telemetry-not-
+    // policy design) and created a blind spot — an in-process-compromised agent,
+    // or a process holding a recycled agent-root PID, could write persistence
+    // (skills/, settings.json) invisibly. The event carries process.pid and
+    // agent_root_pid, so the SIEM filters self-writes (pid == agent_root_pid)
+    // with full attribution context, reversibly.
     let abs_path = absolutize(filename, pid);
     let snap = proc::snapshot(pid);
     let chain = proc::parent_chain(pid, 16);

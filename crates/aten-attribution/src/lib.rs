@@ -643,7 +643,7 @@ fn walk_jsonl(dir: &Path, cb: &mut dyn FnMut(PathBuf)) {
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
             walk_jsonl(&path, cb);
-        } else if ft.is_file() && path.extension().map_or(false, |e| e == "jsonl") {
+        } else if ft.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
             cb(path);
         }
     }
