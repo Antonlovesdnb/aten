@@ -121,6 +121,14 @@ struct SharedState {
     /// pid → ProcessKey, populated on each enrolled exec, removed on each
     /// non-enrolled exec so PID reuse doesn't return a stale binding.
     pid_to_key: HashMap<i32, ProcessKey>,
+    /// Negative cache: pid → start_time_ticks for processes we've determined are
+    /// NOT enrolled. The credacc/connect/dns probes fire host-wide, so without
+    /// this every event from a chatty non-enrolled process (a web server, a
+    /// package manager) re-ran the full `resolve_enrollment` /proc snapshot +
+    /// 16-level ancestor walk before being dropped. The start_time value keys
+    /// the entry to a specific process incarnation so a recycled PID isn't
+    /// wrongly suppressed (validated with one cheap stat read on hit).
+    non_enrolled: HashMap<i32, u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -410,9 +418,15 @@ where
     match record {
         Some(_) => {
             state.pid_to_key.insert(pid, key);
+            // A prior incarnation of this PID may have been cached non-enrolled.
+            state.non_enrolled.remove(&pid);
         }
         None => {
             state.pid_to_key.remove(&pid);
+            // Authoritative: this exec's immediate parent isn't enrolled (and
+            // enrollment propagates down the tree at each exec), so this PID is
+            // non-enrolled — cache it so its file/net/dns events skip the walk.
+            remember_non_enrolled(state, pid, key.start_time_ticks);
         }
     }
 
@@ -420,7 +434,7 @@ where
         return Ok(());
     };
 
-    let chain = proc::parent_chain(pid, 16);
+    let chain = proc::parent_chain_from(&snap, 16);
     let attributed_by_descent = !is_agent_root_match;
     let agent_root_pid = Some(record.agent_root.pid);
 
@@ -521,7 +535,7 @@ where
     let abs_path = absolutize(filename, pid);
 
     let snap = proc::snapshot(pid);
-    let chain = proc::parent_chain(pid, 16);
+    let chain = proc::parent_chain_from(&snap, 16);
     let is_agent_root = record.agent_root.pid == pid;
     let attributed_by_descent = !is_agent_root;
 
@@ -631,7 +645,7 @@ where
     // with full attribution context, reversibly.
     let abs_path = absolutize(filename, pid);
     let snap = proc::snapshot(pid);
-    let chain = proc::parent_chain(pid, 16);
+    let chain = proc::parent_chain_from(&snap, 16);
     let attributed_by_descent = !is_agent_root;
 
     let bpf_comm = nul_str(&raw.comm).to_string();
@@ -730,7 +744,7 @@ where
     };
 
     let snap = proc::snapshot(pid);
-    let chain = proc::parent_chain(pid, 16);
+    let chain = proc::parent_chain_from(&snap, 16);
     let is_agent_root = record.agent_root.pid == pid;
     let attributed_by_descent = !is_agent_root;
 
@@ -803,6 +817,21 @@ where
     Ok(())
 }
 
+/// Cap on the negative cache so a churny host (lots of distinct non-enrolled
+/// PIDs) can't grow it without bound. On overflow we clear it wholesale and let
+/// it repopulate lazily — process-exit cleanup is a separate, larger follow-up.
+const NON_ENROLLED_CAP: usize = 65_536;
+
+fn remember_non_enrolled(state: &mut SharedState, pid: i32, start_time_ticks: u64) {
+    if start_time_ticks == 0 {
+        return; // no disambiguator → don't risk suppressing a reused PID
+    }
+    if state.non_enrolled.len() >= NON_ENROLLED_CAP {
+        state.non_enrolled.clear();
+    }
+    state.non_enrolled.insert(pid, start_time_ticks);
+}
+
 /// Find the EnrollmentRecord for `pid`, falling back to a /proc walk if the
 /// fast-path `pid_to_key` lookup misses (race with the exec ringbuf).
 fn resolve_enrollment(pid: i32, state: &mut SharedState) -> Option<EnrollmentRecord> {
@@ -810,6 +839,20 @@ fn resolve_enrollment(pid: i32, state: &mut SharedState) -> Option<EnrollmentRec
         if let Some(r) = state.table.get(key) {
             return Some(r);
         }
+    }
+
+    // Negative cache: if we've already determined this PID is non-enrolled,
+    // skip the expensive snapshot + ancestor walk. Validate against the
+    // recorded start_time with ONE cheap stat read so a recycled PID (new
+    // process on the same number) isn't wrongly suppressed — on mismatch we
+    // drop the stale entry and re-evaluate via the walk below (the safety net
+    // for the event-before-exec race stays intact for genuinely-unknown PIDs).
+    if let Some(&cached_start) = state.non_enrolled.get(&pid) {
+        let st = proc::start_time(pid);
+        if st != 0 && st == cached_start {
+            return None;
+        }
+        state.non_enrolled.remove(&pid);
     }
 
     let snap = proc::snapshot(pid);
@@ -849,6 +892,9 @@ fn resolve_enrollment(pid: i32, state: &mut SharedState) -> Option<EnrollmentRec
         }
         current_ppid = psnap.ppid;
     }
+    // Walk exhausted with no enrolled ancestor → genuinely non-enrolled; cache
+    // it so repeat events from this PID short-circuit above.
+    remember_non_enrolled(state, pid, snap.start_time_ticks);
     None
 }
 
@@ -887,7 +933,7 @@ where
     };
 
     let snap = proc::snapshot(pid);
-    let chain = proc::parent_chain(pid, 16);
+    let chain = proc::parent_chain_from(&snap, 16);
     let is_agent_root = record.agent_root.pid == pid;
     let attributed_by_descent = !is_agent_root;
 

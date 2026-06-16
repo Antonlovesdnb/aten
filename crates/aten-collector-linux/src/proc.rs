@@ -58,28 +58,46 @@ pub fn snapshot(pid: i32) -> ProcSnapshot {
 /// so downstream rules can join the chain against `process_exec` events
 /// emitted earlier for the same ancestors without re-walking PPIDs.
 pub fn parent_chain(pid: i32, max_depth: usize) -> Vec<ParentChainEntry> {
+    parent_chain_from(&snapshot(pid), max_depth)
+}
+
+/// Like `parent_chain`, but starts from a snapshot the caller already took for
+/// `start.pid` and snapshots each ancestor exactly **once**. The old
+/// `parent_chain` snapshotted every level twice (once for the ppid, once for
+/// the parent's name) and re-read /proc/<pid> that callers had already read —
+/// ~2× the /proc reads per event. Output is identical.
+pub fn parent_chain_from(start: &ProcSnapshot, max_depth: usize) -> Vec<ParentChainEntry> {
     let mut chain: Vec<ParentChainEntry> = Vec::new();
-    let mut current = pid;
+    let mut child_pid = start.pid;
+    let mut parent_pid = start.ppid;
     for _ in 0..max_depth {
-        let snap = snapshot(current);
-        if snap.ppid <= 0 || snap.ppid == current {
+        if parent_pid <= 0 || parent_pid == child_pid {
             break;
         }
-        let parent_snap = snapshot(snap.ppid);
-        if parent_snap.comm.is_empty() {
+        let parent = snapshot(parent_pid);
+        if parent.comm.is_empty() {
             break;
         }
         chain.push(ParentChainEntry {
-            pid: snap.ppid,
-            name: parent_snap.comm.clone(),
+            pid: parent_pid,
+            name: parent.comm.clone(),
         });
-        if snap.ppid == 1 {
+        if parent_pid == 1 {
             break;
         }
-        current = snap.ppid;
+        child_pid = parent_pid;
+        parent_pid = parent.ppid;
     }
     chain.reverse();
     chain
+}
+
+/// Read ONLY field 22 (`starttime`) from /proc/<pid>/stat — the PID-reuse
+/// disambiguator — without the full `snapshot` (6 reads + an NSS lookup). Used
+/// by the enrollment negative-cache to cheaply confirm a cached non-enrolled
+/// PID is still the same process incarnation.
+pub fn start_time(pid: i32) -> u64 {
+    parse_stat(PathBuf::from(format!("/proc/{pid}/stat"))).1
 }
 
 fn read_trim(path: PathBuf) -> String {
