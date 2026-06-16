@@ -65,7 +65,10 @@ pub fn parent_chain(pid: i32, max_depth: usize) -> Vec<ParentChainEntry> {
 /// `start.pid` and snapshots each ancestor exactly **once**. The old
 /// `parent_chain` snapshotted every level twice (once for the ppid, once for
 /// the parent's name) and re-read /proc/<pid> that callers had already read —
-/// ~2× the /proc reads per event. Output is identical.
+/// ~2× the /proc reads per event. Output matches the old walk for a process
+/// tree that's stable across the (≤ `max_depth`) reads; if an ancestor exits
+/// mid-walk the chains can differ (this carries the captured ppid forward
+/// rather than re-reading the now-reparented child) — a rare, benign race.
 pub fn parent_chain_from(start: &ProcSnapshot, max_depth: usize) -> Vec<ParentChainEntry> {
     let mut chain: Vec<ParentChainEntry> = Vec::new();
     let mut child_pid = start.pid;

@@ -107,7 +107,11 @@ impl SessionState {
         }
         self.tool_calls.sort_by_key(|tc| tc.timestamp_ns);
         self.user_prompts.sort_by_key(|p| p.timestamp_ns);
-        self.identifier_index = aten_transcript::build_identifier_index(events, None);
+        // Incremental: only fold in the events new since the last refresh. The
+        // transcript is append-only (same contract as the loop above), so this
+        // avoids re-extracting the whole transcript every tick (O(n²)).
+        self.identifier_index
+            .ingest(&events[self.processed_event_count..], None);
         self.processed_event_count = events.len();
     }
 

@@ -14,7 +14,7 @@ use aten_schema::{
     Source, ToolCallPayload, ToolResultPayload, SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 pub mod codex;
 pub mod identifiers;
@@ -325,51 +325,60 @@ impl IdentifierIndex {
     }
 }
 
-/// Walk emitted events and assemble the identifier index. `tool_call` events are
-/// deliberately excluded — tool_input populates `requested_by_tool_call` instead,
-/// which is a different attribution axis from "the identifier was mentioned in
-/// session content."
+/// Walk emitted events and assemble the identifier index from scratch.
+/// Convenience wrapper around [`IdentifierIndex::ingest`].
 pub fn build_identifier_index(events: &[Event], home: Option<&str>) -> IdentifierIndex {
-    let mut index: BTreeMap<String, IndexEntry> = BTreeMap::new();
+    let mut index = IdentifierIndex::default();
+    index.ingest(events, home);
+    index
+}
 
-    for ev in events {
-        let (text, origin) = match &ev.kind {
-            EventKind::Prompt(p) => {
-                let origin = match p.role {
-                    Role::User => Origin::UserMessage,
-                    Role::Assistant => Origin::AssistantMessage,
-                    Role::System => Origin::AssistantMessage,
-                };
-                (p.prompt_text.as_str(), origin)
+impl IdentifierIndex {
+    /// Merge identifiers from `events` into the index. Append-only: existing
+    /// entries gain new mentions/origins, so a caller can extend the index
+    /// **incrementally** (only the events new since the last refresh) instead
+    /// of rebuilding from the whole transcript every time — the latter is
+    /// O(transcript) per refresh, i.e. O(n²) over a session with large
+    /// tool_results. `tool_call` events are excluded: `tool_input` drives
+    /// `requested_by_tool_call`, a different attribution axis from "the
+    /// identifier was mentioned in session content."
+    pub fn ingest(&mut self, events: &[Event], home: Option<&str>) {
+        for ev in events {
+            let (text, origin) = match &ev.kind {
+                EventKind::Prompt(p) => {
+                    let origin = match p.role {
+                        Role::User => Origin::UserMessage,
+                        Role::Assistant => Origin::AssistantMessage,
+                        Role::System => Origin::AssistantMessage,
+                    };
+                    (p.prompt_text.as_str(), origin)
+                }
+                EventKind::ToolResult(tr) => (tr.result_text.as_str(), Origin::ToolResult),
+                _ => continue,
+            };
+
+            for ident in identifiers::extract(text) {
+                let norm = identifiers::normalize(&ident, home);
+                let entry = self.entries.entry(norm).or_insert_with(|| IndexEntry {
+                    raw_first_form: ident.clone(),
+                    first_seen_ts: ev.timestamp.clone(),
+                    first_seen_origin: origin,
+                    mentions: Vec::new(),
+                    origins: Vec::new(),
+                });
+                entry.mentions.push(Mention {
+                    ts: ev.timestamp.clone(),
+                    origin,
+                    event_id: ev.event_id.clone(),
+                });
+                // Keep `origins` sorted + deduped incrementally (≤3 values)
+                // rather than recomputing it from all mentions each build.
+                if let Err(pos) = entry.origins.binary_search(&origin) {
+                    entry.origins.insert(pos, origin);
+                }
             }
-            EventKind::ToolResult(tr) => (tr.result_text.as_str(), Origin::ToolResult),
-            _ => continue,
-        };
-
-        for ident in identifiers::extract(text) {
-            let norm = identifiers::normalize(&ident, home);
-            let entry = index.entry(norm).or_insert_with(|| IndexEntry {
-                raw_first_form: ident.clone(),
-                first_seen_ts: ev.timestamp.clone(),
-                first_seen_origin: origin,
-                mentions: Vec::new(),
-                origins: Vec::new(),
-            });
-            entry.mentions.push(Mention {
-                ts: ev.timestamp.clone(),
-                origin,
-                event_id: ev.event_id.clone(),
-            });
         }
     }
-
-    // Dedupe + sort each entry's origins list for stable JSON output.
-    for entry in index.values_mut() {
-        let set: BTreeSet<Origin> = entry.mentions.iter().map(|m| m.origin).collect();
-        entry.origins = set.into_iter().collect();
-    }
-
-    IdentifierIndex { entries: index }
 }
 
 // Re-export the regex inventory for callers who want to reuse the patterns.
@@ -576,6 +585,76 @@ mod tests {
             .find(|(k, _)| k.contains("attacker.com"))
             .expect("url entry");
         assert_eq!(url.1.first_seen_origin, Origin::UserMessage);
+    }
+
+    /// Incremental `ingest` (the daemon's per-refresh path) must produce the
+    /// same index as a single full build over all events — same keys, origins,
+    /// first-seen origin, and mention counts. Guards the O(n²)→incremental
+    /// refactor.
+    #[test]
+    fn incremental_ingest_matches_full_build() {
+        fn ev(id: &str, ts: &str, kind: EventKind) -> Event {
+            Event {
+                schema_version: SCHEMA_VERSION.into(),
+                event_id: id.into(),
+                timestamp: ts.into(),
+                monotonic_ns: None,
+                platform: Platform::Linux,
+                host_id: None,
+                agent_id: "claude-code".into(),
+                session_id: Some("s1".into()),
+                user_id: None,
+                source: Source {
+                    collector: "transcript".into(),
+                    probe: "x".into(),
+                    host_pid: None,
+                },
+                kind,
+            }
+        }
+        let events = vec![
+            ev(
+                "e1",
+                "1",
+                EventKind::Prompt(PromptPayload {
+                    role: Role::User,
+                    prompt_text: "check attacker.com".into(),
+                    prompt_summary: String::new(),
+                    message_id: None,
+                }),
+            ),
+            ev(
+                "e2",
+                "2",
+                EventKind::ToolResult(ToolResultPayload {
+                    tool_call_id: "t1".into(),
+                    result_status: ResultStatus::Success,
+                    result_summary: String::new(),
+                    result_text: "fetched attacker.com and evil.tk".into(),
+                    child_pids: vec![],
+                }),
+            ),
+        ];
+
+        let full = build_identifier_index(&events, Some("/home/anton"));
+        let mut inc = IdentifierIndex::default();
+        inc.ingest(&events[..1], Some("/home/anton"));
+        inc.ingest(&events[1..], Some("/home/anton"));
+
+        assert_eq!(
+            full.entries.keys().collect::<Vec<_>>(),
+            inc.entries.keys().collect::<Vec<_>>()
+        );
+        for (k, fe) in &full.entries {
+            let ie = &inc.entries[k];
+            assert_eq!(fe.origins, ie.origins, "origins differ for {k}");
+            assert_eq!(fe.first_seen_origin, ie.first_seen_origin, "first_seen {k}");
+            assert_eq!(fe.mentions.len(), ie.mentions.len(), "mentions {k}");
+        }
+        // sanity: attacker.com gained both origins across the two chunks
+        let a = &inc.entries["attacker.com"];
+        assert_eq!(a.first_seen_origin, Origin::UserMessage);
+        assert!(a.origins.contains(&Origin::UserMessage) && a.origins.contains(&Origin::ToolResult));
     }
 
     /// The DNS-exfil fingerprint: a bare hostname surfaces ONLY in a poisoned

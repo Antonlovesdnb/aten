@@ -731,17 +731,21 @@ where
         .map_err(|_| anyhow!("ringbuf record size mismatch"))?;
 
     let pid = raw.pid as i32;
+
+    // Enrollment gate FIRST (now cheap via the negative cache) so the host-wide
+    // flood of non-enrolled DNS doesn't pay the per-event qname allocation
+    // (nul_str_lossy) just to be dropped.
+    let record = match resolve_enrollment(pid, state) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
     let qname = nul_str_lossy(&raw.qname)
         .trim_end_matches('.')
         .to_lowercase();
     if qname.is_empty() {
         return Ok(());
     }
-
-    let record = match resolve_enrollment(pid, state) {
-        Some(r) => r,
-        None => return Ok(()),
-    };
 
     let snap = proc::snapshot(pid);
     let chain = proc::parent_chain_from(&snap, 16);
