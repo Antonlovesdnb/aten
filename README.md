@@ -1,6 +1,6 @@
 # ATEN
 
-**A**gent **T**elemetry & **E**vent **N**otation. ATEN is a background service that records what AI coding agents — Claude Code, Cursor, Codex — do on a host, and writes it out as structured events for a SIEM. It's the same idea as Sysmon, scoped to agent activity.
+**A**gent **T**elemetry & **E**vent **N**otation. ATEN is a background service that records what AI coding agents — Claude Code and Codex today — do on a host, and writes it out as structured events for a SIEM. It's the same idea as Sysmon, scoped to agent activity.
 
 It collects two kinds of telemetry and links them:
 
@@ -14,23 +14,18 @@ Linux and Windows are built and verified end to end. macOS is written but not ye
 ## How it works, step by step
 
 ```
-  agent transcript            the host's kernel
-  (~/.claude, ~/.codex)        (process / file / network activity)
-        │                              │
-        │ prompts, tool calls,         │ events for enrolled
-        │ tool results                 │ processes only
-        ▼                              ▼
-  ┌──────────────────────────────────────────┐
-  │            attribution engine             │
-  │  ties each action event to the session    │
-  │  and tool call its process descends from   │
-  └──────────────────────────────────────────┘
-        │
-        ▼
-  one JSON event per line  →  file, or the Windows event log  →  SIEM
+  Transcript reader  ──►  prompts, tool calls, tool results        (intent)
+  Kernel collector   ──►  process exec, file, DNS, network, creds  (action)
+         │
+         ▼
+  Attribution engine links each action event back to the session and the
+  tool call its process descended from.
+         │
+         ▼
+  One JSON event per line  ──►  a file, or the Windows event log  ──►  SIEM
 ```
 
-1. **Install and configure.** You install ATEN as a service and tell it which process names to treat as agents (`claude`, `cursor`, `codex` by default), and which directories hold the agents' transcripts (`~/.claude/projects`, `~/.codex/sessions`).
+1. **Install and configure.** You install ATEN as a service and tell it which process names to treat as agents (`claude`, `codex`), and which directories hold the agents' transcripts (`~/.claude/projects`, `~/.codex/sessions`). Intent capture only works for agents whose transcript format ATEN can parse — Claude Code and Codex today (see [Supported agents](#supported-agents)).
 
 2. **Enrollment.** ATEN watches every process that starts. When a process whose name matches your agent list starts, ATEN *enrolls* it. Any child it spawns is enrolled too, and so on down the tree — so `claude → bash → npm → node` is all tracked as one agent's activity. Processes that aren't an agent or a descendant of one are ignored, so unrelated host activity never enters the pipeline.
 
@@ -133,6 +128,15 @@ index=aten event_type=credential_access
 
 Prompt injection is the opposite case — the tool call *did* name the file, because content it fetched told it to, and the user never did. Same event type, different fields: `requested_by_tool_call=true AND requested_in_user_message=false AND requested_in_tool_result=true`.
 
+## Supported agents
+
+The intent layer reads each agent's session transcript, so an agent is fully supported only when ATEN can parse that transcript's format. Two are supported today:
+
+- **Claude Code** — `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`
+- **Codex CLI** — `~/.codex/sessions/<date>/rollout-<uuid>.jsonl`
+
+**Cursor is not supported yet.** It keeps its chat and agent history in application state (a SQLite database), not an append-only transcript ATEN can tail, and there is no parser for its format. You can still enroll Cursor's process name to capture its *action* events from the kernel, but those events arrive without attribution — no session, no tool-call link, every `requested_*` field false — which removes the main reason to run ATEN. Supporting it means writing a transcript adapter for its history format first.
+
 ## Running it
 
 ATEN is a single `aten` binary. The collectors need privilege: root or `CAP_BPF`+`CAP_PERFMON` on Linux, Administrator on Windows, root plus the EndpointSecurity entitlement on macOS.
@@ -148,11 +152,11 @@ aten daemon --sink eventlog     # Windows: write to ATEN/Operational instead of 
 aten version
 ```
 
-Config lives at `/etc/aten/config.toml` (Linux) or `%ProgramData%\aten\config.toml` (Windows). Every field is optional, and any CLI flag overrides it:
+Config lives at `/etc/aten/config.toml` (Linux) or `%ProgramData%\aten\config.toml` (Windows). Every field is optional, and unknown keys are rejected. `aten install` writes a populated config and points the service at it.
 
 ```toml
 [daemon]
-agents = ["claude", "cursor", "codex"]   # process names to enroll as agents
+agents = ["claude", "codex"]             # process names to enroll as agents
 
 [transcripts]
 watch_dirs = ["/home/anton/.claude/projects", "/home/anton/.codex/sessions"]
@@ -162,9 +166,13 @@ file_path = "/var/log/aten/events.jsonl"
 sink = "jsonl"                           # jsonl | eventlog | both  (eventlog/both: Windows only)
 ```
 
-Default output is `/var/log/aten/events.jsonl` on Linux and `%ProgramData%\aten\events.jsonl` on Windows. ATEN persists how far it has read across restarts, so restarting the service replays no old events and drops nothing in flight.
+How CLI flags combine with the file: `--agents`, `--out`, and `--sink` **override** the corresponding config value, while `--watch-dir` and `--transcript` are **added** to whatever the config already lists, not a replacement.
 
-Coverage today: the full action set is live on Linux and Windows; macOS emits `process_exec`, `credential_access`, and `network_egress`, but not yet `file_write` or `dns_query`. `process_exit` is defined in the schema but not yet emitted.
+Output destination: the `/var/log/aten/events.jsonl` (Linux) and `%ProgramData%\aten\events.jsonl` (Windows) paths apply when ATEN runs as an installed service — they come from the config the installer writes. A foreground `aten daemon` with no `--out` and no `file_path` set writes JSONL to **stdout** instead. ATEN persists how far it has read across restarts, so restarting the service replays no old events and drops nothing in flight.
+
+Not everything is a setting. The state-file location, the timing constants (transcript poll interval, the ~2s attribution buffer, the 10s confidence gate), the credential-class path patterns, and the set of parsable transcript formats are fixed in the build, not the config.
+
+Platform coverage today: the full action set is live on Linux and Windows; macOS emits `process_exec`, `credential_access`, and `network_egress`, but not yet `file_write` or `dns_query`. `process_exit` is defined in the schema but not yet emitted.
 
 ## Lineage
 
