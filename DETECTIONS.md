@@ -2,7 +2,15 @@
 
 A starting catalog of detections over ATEN events. Each rule is a query plus the reasoning behind it, the events and platforms it needs, and the false positives to expect. They are starting points, not drop-in production rules — baseline them against a week of normal agent activity in your environment and tune the thresholds before alerting.
 
-Queries are written in Splunk SPL because that is what fishbowl v1 used, but nothing here is Splunk-specific: every field is a flat JSON key (except the nested `process.*` and `attribution.*` blocks, which your backend may address with slightly different syntax). Replace `index=aten` with wherever you land ATEN's JSONL.
+The queries are written as **backend-agnostic pseudocode**, not a specific query language — translate them to Splunk SPL, KQL, OpenSearch, etc. Read them as:
+
+- `FROM <event_type>` — the events to scan (ATEN's `event_type`, over whatever index/table holds ATEN's JSONL).
+- `WHERE` — predicates on event fields. `field = value`, `field in (a, b)`, `is set` / `is null`, `matches /regex/`.
+- `GROUP BY` — fields to aggregate by.
+- `HAVING` — a predicate on an aggregate (`count(*)`, `distinct(field)`).
+- `SELECT` — the fields to surface in the alert.
+
+Field names are flat JSON keys, except the nested `process.*` and `attribution.*` blocks (the `attribution.*` fields are written here without the prefix, as they appear in most rules).
 
 ## How to read these rules
 
@@ -37,28 +45,31 @@ Severity is a suggestion: **high** = page someone, **medium** = queue for triage
 ### CRED-1 — Credential read nobody in the session asked for
 **Severity: high.** A process under the agent read a credential file, and the path was never named by the user, the model, the triggering tool call, or any tool result. This is the malicious-dependency / malicious-skill case — code riding the agent's process tree that the conversation never mentioned. MITRE T1552 (Unsecured Credentials).
 
-```spl
-index=aten event_type=credential_access access_type IN (read, open)
-| where attributed_tool_call_id!=null
-        AND requested_by_tool_call=false   AND requested_in_user_message=false
-        AND requested_in_assistant_message=false   AND requested_in_tool_result=false
-| stats values(file_path) as creds, values(credential_class) as kind,
-        values(process.cmdline) as offender, values(triggering_prompt) as user_asked_for
-        by session_id, user_id, host_id
+```
+FROM credential_access
+WHERE access_type in (read, open)
+  AND attributed_tool_call_id        is set
+  AND requested_by_tool_call         = false
+  AND requested_in_user_message      = false
+  AND requested_in_assistant_message = false
+  AND requested_in_tool_result       = false
+GROUP BY session_id, user_id, host_id
+SELECT file_path, credential_class, process.cmdline, triggering_prompt
 ```
 
-**False positives:** legitimate tooling the agent invokes that reads credentials as a side effect (e.g. `aws`, `gcloud`, `kubectl`, `git` over HTTPS, a cloud SDK) when the user's request didn't literally name the file. Baseline which `credential_class` values are normal for which `process.name` on your hosts and exclude those pairs. Tightening `attributed_tool_call_id!=null` to require recent attribution (`time_window_ms < 5000`) cuts stale bindings.
+**False positives:** legitimate tooling the agent invokes that reads credentials as a side effect (e.g. `aws`, `gcloud`, `kubectl`, `git` over HTTPS, a cloud SDK) when the user's request didn't literally name the file. Baseline which `credential_class` values are normal for which `process.name` on your hosts and exclude those pairs. Adding `time_window_ms < 5000` requires the tool-call binding to be recent and cuts stale matches.
 
 ### CRED-2 — Prompt-injection credential read
 **Severity: high.** The tool call *did* name the credential file, but the user never did and the path traces back to a tool result — i.e. fetched content told the agent to read it. The opposite attribution corner from CRED-1. MITRE T1552 + prompt injection.
 
-```spl
-index=aten event_type=credential_access access_type IN (read, open)
-| where requested_by_tool_call=true
-        AND requested_in_user_message=false   AND requested_in_tool_result=true
-| stats values(file_path) as creds, values(triggering_command) as ran,
-        values(triggering_prompt) as user_actually_asked, values(tool_call_id) as fooled_call
-        by session_id, user_id, host_id
+```
+FROM credential_access
+WHERE access_type in (read, open)
+  AND requested_by_tool_call    = true
+  AND requested_in_user_message = false
+  AND requested_in_tool_result  = true
+GROUP BY session_id, user_id, host_id
+SELECT file_path, triggering_command, triggering_prompt, tool_call_id
 ```
 
 **False positives:** lower than CRED-1, because requiring the identifier to appear in a tool result is specific. The main one is a tool result that legitimately contains a credential path the user then approves reading — check whether `requested_in_user_message` flips true on a later event in the same session.
@@ -66,15 +77,15 @@ index=aten event_type=credential_access access_type IN (read, open)
 ### CRED-3 — Credential file written or planted
 **Severity: medium.** A write to a credential path — overwriting `~/.aws/credentials`, dropping a new `~/.ssh/authorized_keys`, etc. Credential *writes* surface as `credential_access` with `access_type=write` (not `file_write`). Often a precursor to lateral movement or backdoor key injection.
 
-```spl
-index=aten event_type=credential_access access_type=write
-| stats values(file_path) as path, values(credential_class) as kind,
-        values(process.cmdline) as wrote_by, values(triggering_prompt) as user_asked_for,
-        values(requested_in_user_message) as user_named_it
-        by session_id, user_id, host_id
+```
+FROM credential_access
+WHERE access_type = write
+GROUP BY session_id, user_id, host_id
+SELECT file_path, credential_class, process.cmdline,
+       requested_in_user_message, triggering_prompt
 ```
 
-**False positives:** `aws configure`, `gcloud auth login`, `ssh-keygen`, credential-helper refreshes — all legitimately write credential paths. This rule is best as medium/triage; add `| where user_named_it=false` to focus on writes the user never requested.
+**False positives:** `aws configure`, `gcloud auth login`, `ssh-keygen`, credential-helper refreshes — all legitimately write credential paths. This rule is best as medium/triage; add `requested_in_user_message = false` to focus on writes the user never requested.
 
 ---
 
@@ -83,28 +94,30 @@ index=aten event_type=credential_access access_type=write
 ### EXFIL-1 — Egress to a destination nobody asked for
 **Severity: medium.** An agent descendant opened a connection to a host that no one in the session named. The network sibling of CRED-1. MITRE T1041 (Exfiltration Over C2).
 
-```spl
-index=aten event_type=network_egress
-| where attributed_by_descent=true
-        AND requested_by_tool_call=false   AND requested_in_user_message=false
-        AND requested_in_assistant_message=false   AND requested_in_tool_result=false
-| stats values(dest_host) as dest, values(dest_ip) as ips, values(dest_port) as ports,
-        values(process.cmdline) as by, values(triggering_prompt) as user_asked_for
-        by session_id, user_id, host_id
+```
+FROM network_egress
+WHERE attributed_by_descent          = true
+  AND requested_by_tool_call         = false
+  AND requested_in_user_message      = false
+  AND requested_in_assistant_message = false
+  AND requested_in_tool_result       = false
+GROUP BY session_id, user_id, host_id
+SELECT dest_host, dest_ip, dest_port, process.cmdline, triggering_prompt
 ```
 
-**False positives:** high without tuning — package registries, telemetry endpoints, CDNs, and update checks all fire here. Maintain an allowlist of expected destinations (npm/PyPI/crates mirrors, your proxy, etc.) and exclude them. Consider scoping to `dest_port` outside 80/443 or to direct-to-IP connections (`isnull(dest_host)`) for a higher-signal variant.
+**False positives:** high without tuning — package registries, telemetry endpoints, CDNs, and update checks all fire here. Maintain an allowlist of expected destinations (npm/PyPI/crates mirrors, your proxy, etc.) and exclude them. For a higher-signal variant, scope to `dest_port` outside 80/443, or to direct-to-IP connections (`dest_host is null`).
 
 ### EXFIL-2 — DNS TXT lookups to an unrequested domain
 **Severity: medium.** DNS-tunnel exfil shows up as a burst of `txt` lookups (often long, encoded labels) to a domain the user never typed. `query_type=txt` is the classic carrier.
 
-```spl
-index=aten event_type=dns_query query_type=txt
-| where attributed_by_descent=true AND requested_in_user_message=false
-| stats count, dc(query_name) as distinct_names, values(query_name) as names,
-        values(triggering_prompt) as user_asked_for
-        by session_id, user_id, host_id
-| where count > 20 OR distinct_names > 20
+```
+FROM dns_query
+WHERE query_type              = txt
+  AND attributed_by_descent   = true
+  AND requested_in_user_message = false
+GROUP BY session_id, user_id, host_id
+HAVING count(*) > 20 OR distinct(query_name) > 20
+SELECT query_name, triggering_prompt
 ```
 
 **False positives:** some legitimate services use TXT for SPF/DKIM lookups and verification flows, but rarely in volume from an agent descendant. Tune the count threshold to your baseline. Note the Linux probe reports `query_type=other` for libc resolver calls, so this TXT rule is most effective on Windows; on Linux, hunt on high-volume / high-entropy `query_name` regardless of type.
@@ -112,17 +125,15 @@ index=aten event_type=dns_query query_type=txt
 ### EXFIL-3 — Credential read followed by egress (same process)
 **Severity: high.** The fishbowl v1 signature, expressed natively: the same process that read a credential file then made an outbound connection. ATEN is observe-only by design, so this credential→exfil correlation is a SIEM rule, not an in-daemon action — the events already share `session_id` and `process.agent_root_pid` to join on.
 
-```spl
-index=aten (event_type=credential_access access_type IN (read, open)) OR event_type=network_egress
-| sort 0 _time
-| stats earliest(_time) as first_seen, latest(_time) as last_seen,
-        values(eval(if(event_type="credential_access", credential_class, null()))) as creds_read,
-        values(eval(if(event_type="network_egress", dest_host, null()))) as egress_to,
-        count(eval(event_type="credential_access")) as reads,
-        count(eval(event_type="network_egress")) as egresses
-        by session_id, host_id, process.pid, process.agent_root_pid
-| where reads > 0 AND egresses > 0
-| eval window_secs = last_seen - first_seen
+```
+FROM credential_access, network_egress           # both event types in one pass
+WHERE (event_type = credential_access AND access_type in (read, open))
+   OR  event_type = network_egress
+GROUP BY session_id, host_id, process.pid, process.agent_root_pid
+HAVING any(event_type = credential_access) AND any(event_type = network_egress)
+SELECT creds_read  = credential_class where event_type = credential_access,
+       egress_to   = dest_host        where event_type = network_egress,
+       window_secs = last(timestamp) - first(timestamp)
 ```
 
 **False positives:** cloud CLIs legitimately read credentials and then call an API — that is read-then-egress by design. Combine with the attribution signal: add the destination's `requested_*` flags, or require the credential read to match CRED-1 (unrequested), to separate "read keys, called AWS" from "read keys, called somewhere nobody mentioned." Narrow `window_secs` to reduce coincidental pairings.
@@ -134,25 +145,26 @@ index=aten (event_type=credential_access access_type IN (read, open)) OR event_t
 ### PERSIST-1 — Write to the agent's own config not requested by the user
 **Severity: high.** A write into the agent's configuration surface — a new skill, an edited `settings.json`, a `.claude/`/`.codex/` file — changes the agent's *future* behavior. ATEN tags these `file_write` with `write_class=agent_config`. When the user didn't ask for it, treat it as planted persistence. MITRE TA0003.
 
-```spl
-index=aten event_type=file_write write_class=agent_config
-| where requested_in_user_message=false
-| stats values(file_path) as changed, values(process.cmdline) as by,
-        values(requested_in_tool_result) as from_fetched_content,
-        values(triggering_prompt) as user_asked_for
-        by session_id, user_id, host_id
+```
+FROM file_write
+WHERE write_class                = agent_config
+  AND requested_in_user_message  = false
+GROUP BY session_id, user_id, host_id
+SELECT file_path, process.cmdline, requested_in_tool_result, triggering_prompt
 ```
 
-**False positives:** the agent legitimately edits its own config when the user asks it to ("add a skill that…"). The `requested_in_user_message=false` filter removes most of those. `from_fetched_content=true` (i.e. `requested_in_tool_result`) is the strongest signal that the change came from injection rather than intent. Self-writes by the agent process itself are emitted, not dropped — add `| where 'process.pid'!='process.agent_root_pid'` to focus on writes by *descendants*.
+**False positives:** the agent legitimately edits its own config when the user asks it to ("add a skill that…"). The `requested_in_user_message = false` filter removes most of those. `requested_in_tool_result = true` is the strongest signal that the change came from injection rather than intent. Self-writes by the agent process itself are emitted, not dropped — add `process.pid != process.agent_root_pid` to focus on writes by *descendants*.
 
 ### PERSIST-2 — Executable or script dropped under the agent
 **Severity: medium.** A script or binary written by an agent descendant — payload staging. ATEN tags these `file_write` with `write_class=executable`.
 
-```spl
-index=aten event_type=file_write write_class=executable
-| where attributed_by_descent=true AND requested_in_user_message=false
-| stats values(file_path) as dropped, values(process.cmdline) as by,
-        values(triggering_prompt) as user_asked_for   by session_id, user_id, host_id
+```
+FROM file_write
+WHERE write_class             = executable
+  AND attributed_by_descent   = true
+  AND requested_in_user_message = false
+GROUP BY session_id, user_id, host_id
+SELECT file_path, process.cmdline, triggering_prompt
 ```
 
 **False positives:** build steps and codegen legitimately write scripts (`./configure`, generated `.py`/`.sh`, compiled binaries) when the user asked the agent to build or scaffold. Baseline expected write paths (project build dirs) and exclude them; alert on writes to autostart/`bin`/profile locations.
@@ -164,11 +176,12 @@ index=aten event_type=file_write write_class=executable
 ### EXEC-1 — Agent descendant that did not come from a tool call
 **Severity: low (hunt).** A process whose `agent_root_pid` is set — it descends from the agent — but with no `attributed_tool_call_id`, meaning it was not spawned inside any observed tool-call window. Detached helpers, a postinstall that outlived its tool call, or something the agent backgrounded. Mostly investigative.
 
-```spl
-index=aten event_type=process_exec
-| where isnotnull('process.agent_root_pid') AND attributed_tool_call_id=null
-| stats values(process.cmdline) as cmd, values(process.name) as name,
-        values(process.path) as path   by session_id, host_id, process.agent_root_pid
+```
+FROM process_exec
+WHERE process.agent_root_pid  is set
+  AND attributed_tool_call_id is null
+GROUP BY session_id, host_id, process.agent_root_pid
+SELECT process.cmdline, process.name, process.path
 ```
 
 **False positives:** common and benign — shells, language servers, and helper daemons the agent starts outside a tool call all land here. Use it to hunt, or narrow to specific `process.name` values (interpreters, `curl`/`wget`, `nc`, `powershell`) for a higher-signal variant.
@@ -176,14 +189,14 @@ index=aten event_type=process_exec
 ### EXEC-2 — Network/transfer tool run unrequested
 **Severity: medium.** A known transfer or shell tool (`curl`, `wget`, `nc`, `scp`, `powershell -enc`, …) executed under the agent without the user naming it — a download-cradle or exfil primitive.
 
-```spl
-index=aten event_type=process_exec
-| where attributed_by_descent=true AND requested_in_user_message=false
-        AND (like(process.name, "curl%") OR like(process.name, "wget%")
-             OR process.name IN (nc, ncat, scp, socat)
-             OR match(process.cmdline, "(?i)powershell.*-enc"))
-| stats values(process.cmdline) as cmd, values(triggering_prompt) as user_asked_for
-        by session_id, user_id, host_id
+```
+FROM process_exec
+WHERE attributed_by_descent     = true
+  AND requested_in_user_message = false
+  AND ( process.name in (curl, wget, nc, ncat, scp, socat)
+        OR process.cmdline matches /powershell.*-enc/i )
+GROUP BY session_id, user_id, host_id
+SELECT process.cmdline, triggering_prompt
 ```
 
 **False positives:** agents use `curl`/`wget` constantly for legitimate fetches the user implicitly authorized ("check this API"). Pair with EXFIL-1 on the resulting connection, or require the destination in the command line to be unrequested, rather than alerting on the tool alone.

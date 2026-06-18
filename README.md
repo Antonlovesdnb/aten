@@ -88,7 +88,7 @@ A note on accuracy: kernel events can arrive before the agent has finished writi
 
 ## Examples
 
-Each example below is the same shape — an action event plus its attribution — read a different way. The detections differ only in which `requested_*` fields they test, because each combination describes a different situation. The JSON is trimmed to the fields that matter for the example (every real event also carries the full envelope and `process` block). Queries are written for Splunk; the field names are the same on any backend.
+Each example below is the same shape — an action event plus its attribution — read a different way. The detections differ only in which `requested_*` fields they test, because each combination describes a different situation. The JSON is trimmed to the fields that matter for the example (every real event also carries the full envelope and `process` block). Queries are written as backend-agnostic pseudocode — `FROM` an event type, `WHERE` predicates on its fields — to translate to Splunk, KQL, etc. The fuller, tuned set lives in [`DETECTIONS.md`](./DETECTIONS.md).
 
 ### 1. A dependency reads credentials nobody asked for
 
@@ -132,14 +132,15 @@ Then the read itself:
 
 The read ran under the agent (`attributed_by_descent` is true), but all four `requested_*` are false: the credential path was never named by the user, the model, the tool call, or any tool result. Nothing in the session asked for it.
 
-```spl
-index=aten event_type=credential_access
-| where attributed_tool_call_id!=null
-        AND requested_by_tool_call=false   AND requested_in_user_message=false
-        AND requested_in_assistant_message=false   AND requested_in_tool_result=false
-| stats values(file_path) as creds, values(credential_class) as kind,
-        values(triggering_prompt) as user_asked_for, values(process.path) as offender
-        by session_id, user_id, host_id
+```
+FROM credential_access
+WHERE attributed_tool_call_id        is set
+  AND requested_by_tool_call         = false
+  AND requested_in_user_message      = false
+  AND requested_in_assistant_message = false
+  AND requested_in_tool_result       = false
+GROUP BY session_id, user_id, host_id
+SELECT file_path, credential_class, process.path, triggering_prompt
 ```
 
 A moment later the same process beacons out, and the `network_egress` event carries the identical attribution corner — so the sibling rule (swap `event_type=network_egress`, report `dest_host` instead of `file_path`) catches the exfiltration leg of the same attack.
@@ -179,13 +180,13 @@ The agent followed the injected instruction. The resulting `credential_access` a
 
 `requested_in_tool_result=true` with `requested_in_user_message=false` is the injection fingerprint: the instruction entered the session through content the agent fetched, not through the user.
 
-```spl
-index=aten event_type=credential_access
-| where requested_by_tool_call=true
-        AND requested_in_user_message=false   AND requested_in_tool_result=true
-| stats values(file_path) as creds, values(triggering_command) as ran,
-        values(triggering_prompt) as user_actually_asked, values(tool_call_id) as fooled_call
-        by session_id, user_id, host_id
+```
+FROM credential_access
+WHERE requested_by_tool_call    = true
+  AND requested_in_user_message = false
+  AND requested_in_tool_result  = true
+GROUP BY session_id, user_id, host_id
+SELECT file_path, triggering_command, triggering_prompt, tool_call_id
 ```
 
 ### 3. DNS exfiltration
@@ -210,12 +211,14 @@ Data leaves over DNS TXT lookups to a domain the user never typed — it first a
 }
 ```
 
-```spl
-index=aten event_type=dns_query query_type=txt
-| where attributed_by_descent=true AND requested_in_user_message=false
-| stats count, values(query_name) as names, values(triggering_prompt) as user_asked_for
-        by session_id, user_id, host_id
-| where count > 20
+```
+FROM dns_query
+WHERE query_type              = txt
+  AND attributed_by_descent   = true
+  AND requested_in_user_message = false
+GROUP BY session_id, user_id, host_id
+HAVING count(*) > 20
+SELECT query_name, triggering_prompt
 ```
 
 ### 4. Agent self-modification (persistence)
@@ -240,11 +243,12 @@ A write into the agent's own configuration surface — a new skill, an edited `s
 }
 ```
 
-```spl
-index=aten event_type=file_write write_class=agent_config
-| where requested_in_user_message=false
-| stats values(file_path) as changed, values(triggering_command) as ran,
-        values(triggering_prompt) as user_asked_for   by session_id, user_id, host_id
+```
+FROM file_write
+WHERE write_class               = agent_config
+  AND requested_in_user_message = false
+GROUP BY session_id, user_id, host_id
+SELECT file_path, triggering_command, triggering_prompt
 ```
 
 Note that `pid==agent_root_pid` self-writes are emitted, not dropped — filter those out here if you only want writes made by *descendants* of the agent rather than the agent process itself.
