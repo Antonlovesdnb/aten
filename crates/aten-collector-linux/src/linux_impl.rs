@@ -146,7 +146,6 @@ impl Default for CollectorConfig {
         Self {
             enrolled_agents: vec![
                 "claude".into(),
-                "cursor".into(),
                 "codex".into(),
             ],
             host_id: None,

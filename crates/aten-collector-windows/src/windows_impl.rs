@@ -130,7 +130,7 @@ const EVENT_ID_DNS_QUERY_COMPLETE: u16 = 3008;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollectorConfig {
-    /// Image-name basenames (e.g. "claude.exe", "cursor.exe") that count as
+    /// Image-name basenames (e.g. "claude.exe", "codex.exe") that count as
     /// agent roots. Matched case-insensitively against the ImageName field's
     /// final path component.
     pub enrolled_agents: Vec<String>,
@@ -144,7 +144,6 @@ impl Default for CollectorConfig {
         Self {
             enrolled_agents: vec![
                 "claude.exe".into(),
-                "cursor.exe".into(),
                 "codex.exe".into(),
             ],
             host_id: None,

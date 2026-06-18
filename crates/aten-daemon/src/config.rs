@@ -32,7 +32,7 @@ pub struct ConfigFile {
 pub struct DaemonSection {
     /// Process basenames to enroll as agent roots. Matched case-insensitively
     /// against the image basename of every ProcessStart + rundown entry.
-    /// Defaults applied when not set: claude.exe / cursor.exe / codex.exe.
+    /// Defaults applied when not set: claude.exe / codex.exe.
     #[serde(default)]
     pub agents: Vec<String>,
 }

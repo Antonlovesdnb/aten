@@ -23,7 +23,7 @@
         <string>/usr/local/bin/aten</string>
         <string>daemon</string>
         <string>--agents</string>
-        <string>claude,cursor,codex</string>
+        <string>claude,codex</string>
         <string>--watch-dir</string>
         <string>/Users/Shared/.claude/projects</string>
         <string>--out</string>

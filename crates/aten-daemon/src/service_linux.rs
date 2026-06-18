@@ -54,7 +54,7 @@ pub fn install_service() -> Result<()> {
              #   sudo systemctl restart aten\n\
              \n\
              [daemon]\n\
-             agents = [\"claude\", \"cursor\", \"codex\"]\n\
+             agents = [\"claude\", \"codex\"]\n\
              \n\
              [transcripts]\n\
              # Recursively scanned for *.jsonl. Dialect (Claude / Codex) auto-detected per file.\n\

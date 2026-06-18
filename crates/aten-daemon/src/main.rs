@@ -126,7 +126,7 @@ enum Command {
     #[cfg(target_os = "linux")]
     CollectLinux {
         /// Process `comm` names to enroll as agent roots. Comma-separated.
-        /// Default: claude,cursor,codex.
+        /// Default: claude,codex.
         #[arg(long, value_delimiter = ',')]
         agents: Option<Vec<String>>,
         /// Stop after this many seconds. Default: run until SIGINT.
@@ -219,8 +219,8 @@ enum Command {
         watch_dir: Vec<PathBuf>,
         /// Process names to enroll as agent roots. Comma-separated.
         /// Overrides config file. On Linux matches `comm` (e.g.
-        /// `claude,cursor,codex`); on Windows matches image basename
-        /// (e.g. `claude.exe,cursor.exe,codex.exe`).
+        /// `claude,codex`); on Windows matches image basename
+        /// (e.g. `claude.exe,codex.exe`).
         #[arg(long, value_delimiter = ',')]
         agents: Option<Vec<String>>,
         /// Stop after this many seconds. Default: run until SIGINT / Ctrl-C.
@@ -316,7 +316,7 @@ fn run_daemon(
         agents,
         out,
         sink,
-        &["claude.exe", "cursor.exe", "codex.exe"],
+        &["claude.exe", "codex.exe"],
     )?;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -516,7 +516,7 @@ fn run_collect_windows(
 
     let cfg = aten_collector_windows::CollectorConfig {
         enrolled_agents: agents.unwrap_or_else(|| {
-            vec!["claude.exe".into(), "cursor.exe".into(), "codex.exe".into()]
+            vec!["claude.exe".into(), "codex.exe".into()]
         }),
         host_id: read_machine_guid_windows(),
     };
@@ -642,7 +642,7 @@ fn run_collect_linux(
 
     let cfg = aten_collector_linux::CollectorConfig {
         enrolled_agents: agents.unwrap_or_else(|| {
-            vec!["claude".into(), "cursor".into(), "codex".into()]
+            vec!["claude".into(), "codex".into()]
         }),
         host_id: read_machine_id(),
     };
@@ -746,7 +746,7 @@ fn run_daemon(
         agents,
         out,
         sink,
-        &["claude", "cursor", "codex"],
+        &["claude", "codex"],
     )?;
 
     let cfg = aten_collector_linux::CollectorConfig {
@@ -981,7 +981,7 @@ fn run_collect_macos(
 
     let cfg = aten_collector_macos::CollectorConfig {
         enrolled_agents: agents
-            .unwrap_or_else(|| vec!["claude".into(), "cursor".into(), "codex".into()]),
+            .unwrap_or_else(|| vec!["claude".into(), "codex".into()]),
         host_id: macos_host_id(),
     };
 
@@ -1043,7 +1043,7 @@ fn run_daemon(
         agents,
         out,
         sink,
-        &["claude", "cursor", "codex"],
+        &["claude", "codex"],
     )?;
 
     let cfg = aten_collector_macos::CollectorConfig {

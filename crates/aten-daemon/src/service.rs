@@ -164,7 +164,7 @@ fn service_main_impl() -> Result<()> {
         None,
         None,
         None, // sink: service mode reads output.sink from the config file
-        &["claude.exe", "cursor.exe", "codex.exe"],
+        &["claude.exe", "codex.exe"],
     )?;
     // Service mode defaults to writing the events JSONL to ProgramData
     // when the config doesn't specify a path. CLI mode kept stdout as the
@@ -450,7 +450,7 @@ pub fn install_service() -> Result<()> {
              #   sc stop {SERVICE_NAME} && sc start {SERVICE_NAME}\n\
              \n\
              [daemon]\n\
-             agents = [\"claude.exe\", \"cursor.exe\", \"codex.exe\"]\n\
+             agents = [\"claude.exe\", \"codex.exe\"]\n\
              \n\
              [transcripts]\n\
              # Recursively scanned for *.jsonl. Dialect (Claude / Codex) auto-detected per file.\n\
