@@ -2,6 +2,8 @@
 
 **A**gent **T**elemetry & **E**vent **N**otation. ATEN is a background service that records what AI coding agents — Claude Code and Codex today — do on a host, and writes it out as structured events for a SIEM. It's the same idea as Sysmon, scoped to agent activity.
 
+> **ATEN correlates what an AI coding agent was asked to do with what its process tree actually did.**
+
 It collects two kinds of telemetry and links them:
 
 - **Intent** — what the agent was asked to do and chose to do: the user's prompts, the tool calls the agent made, and the results it got back. This is read from the session transcript the agent writes to disk.
