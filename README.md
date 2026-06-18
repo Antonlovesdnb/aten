@@ -249,6 +249,8 @@ index=aten event_type=file_write write_class=agent_config
 
 Note that `pid==agent_root_pid` self-writes are emitted, not dropped — filter those out here if you only want writes made by *descendants* of the agent rather than the agent process itself.
 
+These four are a sample. [`DETECTIONS.md`](./DETECTIONS.md) carries the fuller catalog — credential read/write, egress, DNS tunnel, the credential→exfil correlation, persistence, and execution rules — each with severity, false-positive notes, and platform coverage.
+
 ## Supported agents
 
 The intent layer reads each agent's session transcript, so an agent is fully supported only when ATEN can parse that transcript's format. Two are supported today:

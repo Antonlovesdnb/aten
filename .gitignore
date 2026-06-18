@@ -1,7 +1,8 @@
-# Docs / notes are local-only working files, not published. README is the
-# sole exception — it's the repo's public entry point.
+# Docs / notes are local-only working files, not published. README and the
+# detection-rules catalog are the published exceptions.
 *.md
 !README.md
+!DETECTIONS.md
 
 # Python
 __pycache__/
