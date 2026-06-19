@@ -56,8 +56,7 @@ const SERVICE_DESCRIPTION: &str =
 /// resourceFileName/messageFileName point at
 /// `%ProgramData%\aten\aten_events.dll` — exactly where install copies
 /// the compiled resource DLL.
-const EVENT_MANIFEST: &str =
-    include_str!("../../aten-collector-windows/eventlog/aten.man");
+const EVENT_MANIFEST: &str = include_str!("../../aten-collector-windows/eventlog/aten.man");
 
 /// Filenames inside `%ProgramData%\aten`.
 const MANIFEST_FILE: &str = "aten.man";
@@ -428,9 +427,7 @@ pub fn install_service() -> Result<()> {
             (svc, false)
         }
     };
-    service
-        .set_description(SERVICE_DESCRIPTION)
-        .ok(); // non-fatal if it fails
+    service.set_description(SERVICE_DESCRIPTION).ok(); // non-fatal if it fails
 
     // Drop a default config if none exists yet. Discovers the *current
     // user's* Claude/Codex transcript dirs by looking at USERPROFILE,
@@ -470,9 +467,15 @@ pub fn install_service() -> Result<()> {
             out = events_path.display().to_string().replace('\\', "\\\\"),
         );
         std::fs::write(&cfg_path, body).with_context(|| format!("write {}", cfg_path.display()))?;
-        eprintln!("[aten install] wrote default config to {}", cfg_path.display());
+        eprintln!(
+            "[aten install] wrote default config to {}",
+            cfg_path.display()
+        );
     } else {
-        eprintln!("[aten install] preserved existing config {}", cfg_path.display());
+        eprintln!(
+            "[aten install] preserved existing config {}",
+            cfg_path.display()
+        );
     }
 
     // Register the Event Log channel (best-effort; non-fatal if the resource

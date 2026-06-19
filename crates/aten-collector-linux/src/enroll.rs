@@ -40,11 +40,7 @@ impl EnrollmentTable {
     /// Insert a freshly-observed enrolled process. If it has an enrolled
     /// parent, inherit the parent's agent_root; otherwise the process is
     /// itself a new agent root (caller decided this based on comm matching).
-    pub fn enroll(
-        &mut self,
-        key: ProcessKey,
-        parent_key: Option<ProcessKey>,
-    ) -> EnrollmentRecord {
+    pub fn enroll(&mut self, key: ProcessKey, parent_key: Option<ProcessKey>) -> EnrollmentRecord {
         let record = if let Some(parent_record) = parent_key.and_then(|pk| self.inner.get(&pk)) {
             EnrollmentRecord {
                 agent_root: parent_record.agent_root,
@@ -64,11 +60,9 @@ impl EnrollmentTable {
         self.inner.contains_key(&key)
     }
 
-    /// Drop an entry. Called on process exit once we wire that up; for v0.x
-    /// the table grows until the daemon restarts (acceptable for short demos).
-    #[allow(dead_code)]
-    pub fn forget(&mut self, key: ProcessKey) {
-        self.inner.remove(&key);
+    /// Drop a process incarnation after an OS exit notification.
+    pub fn forget(&mut self, key: ProcessKey) -> bool {
+        self.inner.remove(&key).is_some()
     }
 
     pub fn len(&self) -> usize {

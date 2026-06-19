@@ -97,12 +97,10 @@ fn is_agent_config(p: &str) -> bool {
 fn is_executable(p: &str) -> bool {
     const EXEC_EXTS: &[&str] = &[
         // shells / interpreters
-        ".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".psd1", ".bat",
-        ".cmd", ".py", ".pyw", ".rb", ".pl", ".php", ".lua", ".js", ".mjs",
-        ".cjs", ".ts", ".vbs", ".vbe", ".wsf", ".jse",
+        ".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".psd1", ".bat", ".cmd", ".py", ".pyw",
+        ".rb", ".pl", ".php", ".lua", ".js", ".mjs", ".cjs", ".ts", ".vbs", ".vbe", ".wsf", ".jse",
         // native / packaged
-        ".exe", ".dll", ".com", ".scr", ".cpl", ".msi", ".jar", ".elf",
-        ".so", ".dylib",
+        ".exe", ".dll", ".com", ".scr", ".cpl", ".msi", ".jar", ".elf", ".so", ".dylib",
     ];
     let name = p.rsplit('/').next().unwrap_or(p);
     EXEC_EXTS.iter().any(|ext| name.ends_with(ext))
@@ -157,13 +155,19 @@ mod tests {
 
     #[test]
     fn executable_drops() {
-        assert_eq!(classify("/tmp/payload.sh"), Some(FileWriteClass::Executable));
+        assert_eq!(
+            classify("/tmp/payload.sh"),
+            Some(FileWriteClass::Executable)
+        );
         assert_eq!(
             classify(r"C:\Users\anton\AppData\Local\Temp\stage.ps1"),
             Some(FileWriteClass::Executable)
         );
         assert_eq!(classify("/tmp/loader.py"), Some(FileWriteClass::Executable));
-        assert_eq!(classify("/home/x/evil.exe"), Some(FileWriteClass::Executable));
+        assert_eq!(
+            classify("/home/x/evil.exe"),
+            Some(FileWriteClass::Executable)
+        );
     }
 
     #[test]

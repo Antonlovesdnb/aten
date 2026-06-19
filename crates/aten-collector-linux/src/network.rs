@@ -48,9 +48,7 @@ pub fn parse_sockaddr(bytes: &[u8]) -> Endpoint {
 /// agent's process tree showing up as "network egress."
 pub fn is_uninteresting(ep: &Endpoint) -> bool {
     match ep {
-        Endpoint::V4 { ip, .. } => {
-            ip.is_loopback() || ip.is_unspecified() || ip.is_link_local()
-        }
+        Endpoint::V4 { ip, .. } => ip.is_loopback() || ip.is_unspecified() || ip.is_link_local(),
         Endpoint::V6 { ip, .. } => ip.is_loopback() || ip.is_unspecified(),
         Endpoint::Other => true,
     }

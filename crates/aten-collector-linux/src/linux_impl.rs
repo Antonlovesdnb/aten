@@ -4,11 +4,11 @@
 
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use aten_schema::{
@@ -17,7 +17,7 @@ use aten_schema::{
     Platform, Process, ProcessExecPayload, Protocol, Source, SCHEMA_VERSION,
 };
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{OpenObject, UprobeOpts};
+use libbpf_rs::{MapCore, MapFlags, OpenObject, UprobeOpts};
 use plain::Plain;
 use serde::Deserialize;
 
@@ -32,6 +32,7 @@ use crate::{credentials, filewrite};
 
 const TASK_COMM_LEN: usize = 16;
 const MAX_FILENAME_LEN: usize = 256;
+const PROCESS_CACHE_CAP: usize = 16_384;
 
 /// Mirror of the BPF program's `struct exec_event`. Must stay byte-compatible
 /// with `src/bpf/execve.bpf.c`. `plain::Plain` lets us read the ringbuf bytes
@@ -43,6 +44,7 @@ struct RawExecEvent {
     timestamp_ns: u64,
     pid: u32,
     uid: u32,
+    kind: u32,
     comm: [u8; TASK_COMM_LEN],
     filename: [u8; MAX_FILENAME_LEN],
 }
@@ -54,6 +56,13 @@ impl RawExecEvent {
         // representation.
         unsafe { std::mem::zeroed() }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FilterChange {
+    None,
+    Enroll(u32),
+    Remove(u32),
 }
 
 /// Mirror of the BPF program's `struct credacc_event` in `credacc.bpf.c`.
@@ -129,6 +138,15 @@ struct SharedState {
     /// the entry to a specific process incarnation so a recycled PID isn't
     /// wrongly suppressed (validated with one cheap stat read on hit).
     non_enrolled: HashMap<i32, u64>,
+    /// Process metadata captured once per incarnation and reused by file,
+    /// network, and DNS events.
+    proc_cache: HashMap<ProcessKey, CachedProcess>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedProcess {
+    snapshot: proc::ProcSnapshot,
+    parent_chain: Vec<aten_schema::ParentChainEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -144,10 +162,7 @@ pub struct CollectorConfig {
 impl Default for CollectorConfig {
     fn default() -> Self {
         Self {
-            enrolled_agents: vec![
-                "claude".into(),
-                "codex".into(),
-            ],
+            enrolled_agents: vec!["claude".into(), "codex".into()],
             host_id: None,
         }
     }
@@ -224,33 +239,37 @@ where
         }
     };
     let _dns_link = match dns_skel.as_ref() {
-        Some(skel) => match libc_path() {
-            Some(path) => {
-                let opts = UprobeOpts {
-                    func_name: "getaddrinfo".to_string(),
-                    ..Default::default()
-                };
-                match skel
-                    .progs
-                    .handle_getaddrinfo
-                    .attach_uprobe_with_opts(-1, &path, 0, opts)
-                {
-                    Ok(link) => Some(link),
-                    Err(e) => {
-                        eprintln!("aten-ebpf: getaddrinfo uprobe attach failed ({e}); dns_query disabled");
-                        None
+        Some(skel) => {
+            match libc_path() {
+                Some(path) => {
+                    let opts = UprobeOpts {
+                        func_name: "getaddrinfo".to_string(),
+                        ..Default::default()
+                    };
+                    match skel
+                        .progs
+                        .handle_getaddrinfo
+                        .attach_uprobe_with_opts(-1, &path, 0, opts)
+                    {
+                        Ok(link) => Some(link),
+                        Err(e) => {
+                            eprintln!("aten-ebpf: getaddrinfo uprobe attach failed ({e}); dns_query disabled");
+                            None
+                        }
                     }
                 }
+                None => {
+                    eprintln!("aten-ebpf: no libc with getaddrinfo found; dns_query disabled");
+                    None
+                }
             }
-            None => {
-                eprintln!("aten-ebpf: no libc with getaddrinfo found; dns_query disabled");
-                None
-            }
-        },
+        }
         None => None,
     };
 
-    let state = RefCell::new(SharedState::default());
+    let initial_state = seed_existing_processes(&config);
+    let rundown_count = initial_state.pid_to_key.len();
+    let state = RefCell::new(initial_state);
     let emit_cell = RefCell::new(emit);
     let host_id = config.host_id.clone();
     let had_error: Cell<Option<anyhow::Error>> = Cell::new(None);
@@ -261,20 +280,68 @@ where
     // None when the DNS probe failed to load/attach (see above) — the consumer
     // is then simply not registered.
     let dns_maps = dns_skel.as_ref().map(|s| &s.maps);
+    for pid in state.borrow().pid_to_key.keys() {
+        let key = (*pid as u32).to_ne_bytes();
+        let value = [1u8];
+        cred_maps
+            .enrolled_pids
+            .update(&key, &value, MapFlags::ANY)
+            .context("seed credential PID filter")?;
+        conn_maps
+            .enrolled_pids
+            .update(&key, &value, MapFlags::ANY)
+            .context("seed network PID filter")?;
+        if let Some(maps) = dns_maps {
+            maps.enrolled_pids
+                .update(&key, &value, MapFlags::ANY)
+                .context("seed DNS PID filter")?;
+        }
+    }
+    eprintln!("aten-ebpf: enrollment rundown seeded {rundown_count} process(es)");
     let mut builder = libbpf_rs::RingBufferBuilder::new();
 
     let exec_handle = |bytes: &[u8]| -> i32 {
         let mut state = state.borrow_mut();
         let mut emit = emit_cell.borrow_mut();
-        if let Err(e) = handle_exec_event(
-            bytes,
-            &config,
-            &mut state,
-            host_id.as_deref(),
-            &mut *emit,
-        ) {
-            had_error.set(Some(e));
-            return 1;
+        match handle_exec_event(bytes, &config, &mut state, host_id.as_deref(), &mut *emit) {
+            Ok(FilterChange::None) => {}
+            Ok(change @ (FilterChange::Enroll(_) | FilterChange::Remove(_))) => {
+                let (pid, enroll) = match change {
+                    FilterChange::Enroll(pid) => (pid, true),
+                    FilterChange::Remove(pid) => (pid, false),
+                    FilterChange::None => unreachable!(),
+                };
+                let key = pid.to_ne_bytes();
+                let value = [1u8];
+                let result = if enroll {
+                    cred_maps
+                        .enrolled_pids
+                        .update(&key, &value, MapFlags::ANY)
+                        .and_then(|_| conn_maps.enrolled_pids.update(&key, &value, MapFlags::ANY))
+                        .and_then(|_| {
+                            if let Some(maps) = dns_maps {
+                                maps.enrolled_pids.update(&key, &value, MapFlags::ANY)
+                            } else {
+                                Ok(())
+                            }
+                        })
+                } else {
+                    let _ = cred_maps.enrolled_pids.delete(&key);
+                    let _ = conn_maps.enrolled_pids.delete(&key);
+                    if let Some(maps) = dns_maps {
+                        let _ = maps.enrolled_pids.delete(&key);
+                    }
+                    Ok(())
+                };
+                if let Err(e) = result {
+                    had_error.set(Some(anyhow!("update enrolled PID filters: {e}")));
+                    return 1;
+                }
+            }
+            Err(e) => {
+                had_error.set(Some(e));
+                return 1;
+            }
         }
         0
     };
@@ -282,12 +349,7 @@ where
     let cred_handle = |bytes: &[u8]| -> i32 {
         let mut state = state.borrow_mut();
         let mut emit = emit_cell.borrow_mut();
-        if let Err(e) = handle_credacc_event(
-            bytes,
-            &mut state,
-            host_id.as_deref(),
-            &mut *emit,
-        ) {
+        if let Err(e) = handle_credacc_event(bytes, &mut state, host_id.as_deref(), &mut *emit) {
             had_error.set(Some(e));
             return 1;
         }
@@ -297,12 +359,7 @@ where
     let conn_handle = |bytes: &[u8]| -> i32 {
         let mut state = state.borrow_mut();
         let mut emit = emit_cell.borrow_mut();
-        if let Err(e) = handle_connect_event(
-            bytes,
-            &mut state,
-            host_id.as_deref(),
-            &mut *emit,
-        ) {
+        if let Err(e) = handle_connect_event(bytes, &mut state, host_id.as_deref(), &mut *emit) {
             had_error.set(Some(e));
             return 1;
         }
@@ -324,12 +381,7 @@ where
         let dns_handle = |bytes: &[u8]| -> i32 {
             let mut state = state.borrow_mut();
             let mut emit = emit_cell.borrow_mut();
-            if let Err(e) = handle_dns_event(
-                bytes,
-                &mut state,
-                host_id.as_deref(),
-                &mut *emit,
-            ) {
+            if let Err(e) = handle_dns_event(bytes, &mut state, host_id.as_deref(), &mut *emit) {
                 had_error.set(Some(e));
                 return 1;
             }
@@ -340,6 +392,8 @@ where
             .context("add dns ringbuf consumer")?;
     }
     let ringbuf = builder.build().context("build ringbuf")?;
+    let mut last_drop_check = Instant::now();
+    let mut prior_drops = [0u64; 4];
 
     while !stop.load(Ordering::Relaxed) {
         match ringbuf.poll(Duration::from_millis(200)) {
@@ -350,10 +404,45 @@ where
         if let Some(err) = had_error.take() {
             return Err(err);
         }
+        if last_drop_check.elapsed() >= Duration::from_secs(10) {
+            let current = [
+                bpf_drop_count(&exec_maps.dropped_events),
+                bpf_drop_count(&cred_maps.dropped_events),
+                bpf_drop_count(&conn_maps.dropped_events),
+                dns_maps.map_or(0, |maps| bpf_drop_count(&maps.dropped_events)),
+            ];
+            for (index, label) in ["exec", "credential", "network", "dns"].iter().enumerate() {
+                if current[index] > prior_drops[index] {
+                    eprintln!(
+                        "aten-ebpf: {label} ring buffer dropped {} event(s), {} total",
+                        current[index] - prior_drops[index],
+                        current[index]
+                    );
+                }
+            }
+            prior_drops = current;
+            last_drop_check = Instant::now();
+        }
         tick();
     }
 
     Ok(())
+}
+
+fn bpf_drop_count<M: MapCore + ?Sized>(map: &M) -> u64 {
+    map.lookup_percpu(&0u32.to_ne_bytes(), MapFlags::ANY)
+        .ok()
+        .flatten()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| {
+                    let bytes: [u8; 8] = value.get(..8)?.try_into().ok()?;
+                    Some(u64::from_ne_bytes(bytes))
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 fn handle_exec_event<F>(
@@ -362,18 +451,25 @@ fn handle_exec_event<F>(
     state: &mut SharedState,
     host_id: Option<&str>,
     emit: &mut F,
-) -> Result<()>
+) -> Result<FilterChange>
 where
     F: FnMut(Event),
 {
     if bytes.len() < std::mem::size_of::<RawExecEvent>() {
-        return Ok(());
+        return Ok(FilterChange::None);
     }
     let mut raw = RawExecEvent::zeroed();
-    plain::copy_from_bytes(&mut raw, bytes)
-        .map_err(|_| anyhow!("ringbuf record size mismatch"))?;
+    plain::copy_from_bytes(&mut raw, bytes).map_err(|_| anyhow!("ringbuf record size mismatch"))?;
 
     let pid = raw.pid as i32;
+    if raw.kind == 2 {
+        if let Some(key) = state.pid_to_key.remove(&pid) {
+            state.table.forget(key);
+            state.proc_cache.remove(&key);
+        }
+        state.non_enrolled.remove(&pid);
+        return Ok(FilterChange::Remove(raw.pid));
+    }
     let comm = nul_str(&raw.comm).to_string();
     let filename = nul_str(&raw.filename).to_string();
 
@@ -382,12 +478,19 @@ where
     // 50us between exec and now and we move on.
     let snap = proc::snapshot(pid);
     if snap.start_time_ticks == 0 {
-        return Ok(());
+        return Ok(FilterChange::Remove(raw.pid));
     }
     let key = ProcessKey {
         pid,
         start_time_ticks: snap.start_time_ticks,
     };
+    if let Some(previous) = state.pid_to_key.get(&pid).copied() {
+        if previous != key {
+            state.pid_to_key.remove(&pid);
+            state.table.forget(previous);
+            state.proc_cache.remove(&previous);
+        }
+    }
 
     let parent_key = if snap.ppid > 0 {
         let parent_snap = proc::snapshot(snap.ppid);
@@ -430,10 +533,20 @@ where
     }
 
     let Some(record) = record else {
-        return Ok(());
+        return Ok(FilterChange::Remove(raw.pid));
     };
 
     let chain = proc::parent_chain_from(&snap, 16);
+    if state.proc_cache.len() >= PROCESS_CACHE_CAP {
+        state.proc_cache.clear();
+    }
+    state.proc_cache.insert(
+        key,
+        CachedProcess {
+            snapshot: snap.clone(),
+            parent_chain: chain.clone(),
+        },
+    );
     let attributed_by_descent = !is_agent_root_match;
     let agent_root_pid = Some(record.agent_root.pid);
 
@@ -487,7 +600,7 @@ where
     };
 
     emit(event);
-    Ok(())
+    Ok(FilterChange::Enroll(raw.pid))
 }
 
 fn handle_credacc_event<F>(
@@ -503,8 +616,7 @@ where
         return Ok(());
     }
     let mut raw = RawCredaccEvent::zeroed();
-    plain::copy_from_bytes(&mut raw, bytes)
-        .map_err(|_| anyhow!("ringbuf record size mismatch"))?;
+    plain::copy_from_bytes(&mut raw, bytes).map_err(|_| anyhow!("ringbuf record size mismatch"))?;
 
     let pid = raw.pid as i32;
     let filename = nul_str(&raw.filename);
@@ -533,8 +645,9 @@ where
 
     let abs_path = absolutize(filename, pid);
 
-    let snap = proc::snapshot(pid);
-    let chain = proc::parent_chain_from(&snap, 16);
+    let cached = process_enrichment(pid, state);
+    let snap = cached.snapshot;
+    let chain = cached.parent_chain;
     let is_agent_root = record.agent_root.pid == pid;
     let attributed_by_descent = !is_agent_root;
 
@@ -643,8 +756,9 @@ where
     // agent_root_pid, so the SIEM filters self-writes (pid == agent_root_pid)
     // with full attribution context, reversibly.
     let abs_path = absolutize(filename, pid);
-    let snap = proc::snapshot(pid);
-    let chain = proc::parent_chain_from(&snap, 16);
+    let cached = process_enrichment(pid, state);
+    let snap = cached.snapshot;
+    let chain = cached.parent_chain;
     let attributed_by_descent = !is_agent_root;
 
     let bpf_comm = nul_str(&raw.comm).to_string();
@@ -726,8 +840,7 @@ where
         return Ok(());
     }
     let mut raw = RawDnsEvent::zeroed();
-    plain::copy_from_bytes(&mut raw, bytes)
-        .map_err(|_| anyhow!("ringbuf record size mismatch"))?;
+    plain::copy_from_bytes(&mut raw, bytes).map_err(|_| anyhow!("ringbuf record size mismatch"))?;
 
     let pid = raw.pid as i32;
 
@@ -746,8 +859,9 @@ where
         return Ok(());
     }
 
-    let snap = proc::snapshot(pid);
-    let chain = proc::parent_chain_from(&snap, 16);
+    let cached = process_enrichment(pid, state);
+    let snap = cached.snapshot;
+    let chain = cached.parent_chain;
     let is_agent_root = record.agent_root.pid == pid;
     let attributed_by_descent = !is_agent_root;
 
@@ -825,6 +939,53 @@ where
 /// it repopulate lazily — process-exit cleanup is a separate, larger follow-up.
 const NON_ENROLLED_CAP: usize = 65_536;
 
+fn seed_existing_processes(config: &CollectorConfig) -> SharedState {
+    let processes = proc::process_tree();
+    let mut children: HashMap<i32, Vec<proc::ProcIdentity>> = HashMap::new();
+    let mut roots = Vec::new();
+    for process in processes {
+        if config
+            .enrolled_agents
+            .iter()
+            .any(|name| name == &process.comm)
+        {
+            roots.push(process.clone());
+        }
+        children.entry(process.ppid).or_default().push(process);
+    }
+
+    let mut state = SharedState::default();
+    let mut queue = VecDeque::new();
+    for root in roots {
+        let key = ProcessKey {
+            pid: root.pid,
+            start_time_ticks: root.start_time_ticks,
+        };
+        state.table.enroll(key, None);
+        state.pid_to_key.insert(root.pid, key);
+        queue.push_back(root.pid);
+    }
+
+    while let Some(parent_pid) = queue.pop_front() {
+        let Some(parent_key) = state.pid_to_key.get(&parent_pid).copied() else {
+            continue;
+        };
+        for child in children.remove(&parent_pid).unwrap_or_default() {
+            if state.pid_to_key.contains_key(&child.pid) {
+                continue;
+            }
+            let key = ProcessKey {
+                pid: child.pid,
+                start_time_ticks: child.start_time_ticks,
+            };
+            state.table.enroll(key, Some(parent_key));
+            state.pid_to_key.insert(child.pid, key);
+            queue.push_back(child.pid);
+        }
+    }
+    state
+}
+
 fn remember_non_enrolled(state: &mut SharedState, pid: i32, start_time_ticks: u64) {
     if start_time_ticks == 0 {
         return; // no disambiguator → don't risk suppressing a reused PID
@@ -833,6 +994,31 @@ fn remember_non_enrolled(state: &mut SharedState, pid: i32, start_time_ticks: u6
         state.non_enrolled.clear();
     }
     state.non_enrolled.insert(pid, start_time_ticks);
+}
+
+fn process_enrichment(pid: i32, state: &mut SharedState) -> CachedProcess {
+    if let Some(key) = state.pid_to_key.get(&pid).copied() {
+        if let Some(cached) = state.proc_cache.get(&key) {
+            return cached.clone();
+        }
+    }
+    let snapshot = proc::snapshot(pid);
+    let parent_chain = proc::parent_chain_from(&snapshot, 16);
+    let cached = CachedProcess {
+        snapshot: snapshot.clone(),
+        parent_chain,
+    };
+    if snapshot.start_time_ticks != 0 {
+        let key = ProcessKey {
+            pid,
+            start_time_ticks: snapshot.start_time_ticks,
+        };
+        if state.proc_cache.len() >= PROCESS_CACHE_CAP {
+            state.proc_cache.clear();
+        }
+        state.proc_cache.insert(key, cached.clone());
+    }
+    cached
 }
 
 /// Find the EnrollmentRecord for `pid`, falling back to a /proc walk if the
@@ -914,8 +1100,7 @@ where
         return Ok(());
     }
     let mut raw = RawConnectEvent::zeroed();
-    plain::copy_from_bytes(&mut raw, bytes)
-        .map_err(|_| anyhow!("ringbuf record size mismatch"))?;
+    plain::copy_from_bytes(&mut raw, bytes).map_err(|_| anyhow!("ringbuf record size mismatch"))?;
 
     let pid = raw.pid as i32;
     let endpoint = network::parse_sockaddr(&raw.sockaddr);
@@ -935,8 +1120,9 @@ where
         Endpoint::Other => return Ok(()),
     };
 
-    let snap = proc::snapshot(pid);
-    let chain = proc::parent_chain_from(&snap, 16);
+    let cached = process_enrichment(pid, state);
+    let snap = cached.snapshot;
+    let chain = cached.parent_chain;
     let is_agent_root = record.agent_root.pid == pid;
     let attributed_by_descent = !is_agent_root;
 
@@ -1099,9 +1285,7 @@ fn rfc3339_from_boot_ns(boot_ns: u64) -> String {
 
 fn format_rfc3339(secs: i64, nsec: u32) -> String {
     let (year, month, day, hour, minute, second) = unix_to_civil(secs);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nsec:09}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nsec:09}Z")
 }
 
 fn unix_to_civil(unix_secs: i64) -> (i32, u32, u32, u32, u32, u32) {
@@ -1123,11 +1307,7 @@ fn unix_to_civil(unix_secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     (year as i32, month, day, hour, minute, second)
 }
 
-fn comm_to_agent_id(
-    comm: &str,
-    enrolled: &[String],
-    _record: &enroll::EnrollmentRecord,
-) -> String {
+fn comm_to_agent_id(comm: &str, enrolled: &[String], _record: &enroll::EnrollmentRecord) -> String {
     if enrolled.iter().any(|n| n == comm) {
         return comm.to_string();
     }

@@ -50,9 +50,9 @@ pub fn event_id_for(kind: &EventKind) -> u16 {
 
 fn level_for(kind: &EventKind) -> u8 {
     match kind {
-        EventKind::CredentialAccess(_)
-        | EventKind::NetworkEgress(_)
-        | EventKind::FileWrite(_) => LEVEL_WARNING,
+        EventKind::CredentialAccess(_) | EventKind::NetworkEgress(_) | EventKind::FileWrite(_) => {
+            LEVEL_WARNING
+        }
         // A DNS query on its own is benign (agents resolve their own API
         // hosts constantly); the SIEM rule elevates it by joining to origin.
         _ => LEVEL_INFORMATIONAL,
@@ -168,11 +168,7 @@ fn enum_str<T: serde::Serialize>(v: &T) -> String {
 }
 
 /// Fields 1-16 shared by the kernel templates (t_proc_exec / t_cred / t_net).
-fn kernel_common(
-    ev: &Event,
-    p: &aten_schema::Process,
-    a: &aten_schema::Attribution,
-) -> Vec<Field> {
+fn kernel_common(ev: &Event, p: &aten_schema::Process, a: &aten_schema::Attribution) -> Vec<Field> {
     vec![
         s(&ev.timestamp),
         so(ev.host_id.as_deref()),
@@ -270,7 +266,10 @@ fn fields_for(ev: &Event, json: &str) -> Vec<Field> {
             f.push(s(&enum_str(&p.write_class)));
             // BytesWritten as a string: the number, or "" when the probe only
             // saw the open-for-write (Option::None).
-            f.push(s(&p.bytes_written.map(|n| n.to_string()).unwrap_or_default()));
+            f.push(s(&p
+                .bytes_written
+                .map(|n| n.to_string())
+                .unwrap_or_default()));
             f.push(s(json));
             f
         }
@@ -302,7 +301,7 @@ fn utf16z(s: &str) -> Vec<u16> {
 fn desc_str(buf: &[u16]) -> EVENT_DATA_DESCRIPTOR {
     EVENT_DATA_DESCRIPTOR {
         Ptr: buf.as_ptr() as u64,
-        Size: (buf.len() * std::mem::size_of::<u16>()) as u32,
+        Size: std::mem::size_of_val(buf) as u32,
         ..Default::default()
     }
 }
@@ -402,16 +401,28 @@ mod tests {
     fn parent_chain_flattens() {
         use aten_schema::ParentChainEntry;
         let chain = vec![
-            ParentChainEntry { pid: 100, name: "explorer.exe".into() },
-            ParentChainEntry { pid: 200, name: "claude.exe".into() },
+            ParentChainEntry {
+                pid: 100,
+                name: "explorer.exe".into(),
+            },
+            ParentChainEntry {
+                pid: 200,
+                name: "claude.exe".into(),
+            },
         ];
-        assert_eq!(parent_chain_str(&chain), "explorer.exe(100) > claude.exe(200)");
+        assert_eq!(
+            parent_chain_str(&chain),
+            "explorer.exe(100) > claude.exe(200)"
+        );
         assert_eq!(parent_chain_str(&[]), "");
     }
 
     #[test]
     fn enum_str_strips_quotes() {
-        assert_eq!(enum_str(&CredentialClass::AwsCredentials), "aws_credentials");
+        assert_eq!(
+            enum_str(&CredentialClass::AwsCredentials),
+            "aws_credentials"
+        );
         assert_eq!(enum_str(&Protocol::Tcp), "tcp");
         assert_eq!(enum_str(&AccessType::Open), "open");
     }

@@ -11,7 +11,7 @@
 //!    `PROCESS_QUERY_LIMITED_INFORMATION`.
 //! 2. `OpenProcess + NtQueryInformationProcess(ProcessBasicInformation)
 //!    + QueryFullProcessImageNameW` per hop while walking PPIDs up to the
-//!    enrolled agent root. Capped at 16 hops to match schema §3.
+//!      enrolled agent root. Capped at 16 hops to match schema §3.
 //! 3. `OpenProcessToken(TOKEN_QUERY) + GetTokenInformation(TokenUser)
 //!    + LookupAccountSidW` for `DOMAIN\username`.
 //!
@@ -73,9 +73,9 @@ const PID_SYSTEM: u32 = 4;
 /// lifetime of that allocation.
 #[repr(C)]
 struct UnicodeString {
-    length: u16,           // bytes, not chars; excludes null terminator
+    length: u16, // bytes, not chars; excludes null terminator
     maximum_length: u16,
-    _padding: u32,         // on x86_64; harmless on x86 where Buffer follows directly
+    _padding: u32, // on x86_64; harmless on x86 where Buffer follows directly
     buffer: *mut u16,
 }
 
@@ -419,9 +419,7 @@ pub fn query_integrity_level(pid: u32) -> Option<String> {
 
     // Sized query — first call with zero buffer tells us required size.
     let mut needed: u32 = 0;
-    let _ = unsafe {
-        GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut needed)
-    };
+    let _ = unsafe { GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut needed) };
     if needed == 0 {
         return None;
     }
@@ -511,9 +509,8 @@ fn drive_map() -> &'static HashMap<String, String> {
             }
             let letter_wide: Vec<u16> = letter.encode_utf16().chain(std::iter::once(0)).collect();
             let mut dev_buf = vec![0u16; 1024];
-            let dev_len = unsafe {
-                QueryDosDeviceW(PCWSTR(letter_wide.as_ptr()), Some(&mut dev_buf))
-            };
+            let dev_len =
+                unsafe { QueryDosDeviceW(PCWSTR(letter_wide.as_ptr()), Some(&mut dev_buf)) };
             if dev_len == 0 {
                 continue;
             }
@@ -521,7 +518,10 @@ fn drive_map() -> &'static HashMap<String, String> {
             let dev = String::from_utf16_lossy(
                 &dev_buf[..dev_len.saturating_sub(1).min(dev_buf.len() as u32) as usize],
             );
-            let dev_key = dev.trim_end_matches('\0').trim_end_matches('\\').to_lowercase();
+            let dev_key = dev
+                .trim_end_matches('\0')
+                .trim_end_matches('\\')
+                .to_lowercase();
             if !dev_key.is_empty() {
                 out.insert(dev_key, letter);
             }
@@ -643,7 +643,7 @@ pub fn file_owner(path: &std::path::Path) -> Option<String> {
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows::Win32::Security::{
-        OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID, PSECURITY_DESCRIPTOR,
+        OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     };
 
     let wide: Vec<u16> = path
@@ -873,7 +873,7 @@ pub fn query_user(pid: u32) -> String {
 }
 
 fn basename(path: &str) -> String {
-    path.rsplit_once(|c| c == '\\' || c == '/')
+    path.rsplit_once(['\\', '/'])
         .map(|(_, base)| base.to_string())
         .unwrap_or_else(|| path.to_string())
 }
@@ -885,7 +885,10 @@ mod tests {
     #[test]
     fn basename_strips_win32_path() {
         assert_eq!(basename(r"C:\Windows\System32\notepad.exe"), "notepad.exe");
-        assert_eq!(basename(r"\Device\HarddiskVolume3\notepad.exe"), "notepad.exe");
+        assert_eq!(
+            basename(r"\Device\HarddiskVolume3\notepad.exe"),
+            "notepad.exe"
+        );
         assert_eq!(basename("notepad.exe"), "notepad.exe");
         assert_eq!(basename(""), "");
     }
@@ -926,7 +929,9 @@ mod tests {
     fn wellformed_path_accepts_real_credential_paths() {
         // Drive-letter form.
         assert!(is_wellformed_file_path(r"C:\Users\aovru\.aws\credentials"));
-        assert!(is_wellformed_file_path(r"C:\Users\aovru\.ssh\aten_vm_ed25519"));
+        assert!(is_wellformed_file_path(
+            r"C:\Users\aovru\.ssh\aten_vm_ed25519"
+        ));
         // NT-device form (what the kernel actually delivers pre-normalize).
         assert!(is_wellformed_file_path(
             r"\Device\HarddiskVolume9\Users\aovru\.aws\credentials"

@@ -19,13 +19,69 @@
 //! `es_process_t.start_time` (a `SystemTime`) in `esf.rs`. We standardise on
 //! epoch seconds (`start_time_ticks` holds seconds-since-epoch on macOS).
 
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 use aten_collector_linux::enroll::{EnrollmentTable, ProcessKey};
 use aten_schema::ParentChainEntry;
 
 use libproc::libproc::bsd_info::BSDInfo;
-use libproc::libproc::proc_pid::{self, pidinfo, ProcType};
+use libproc::libproc::proc_pid::{self, pidinfo, PIDInfo, PidInfoFlavor};
+use libproc::processes::{pids_by_type, ProcFilter};
+
+// libproc 0.14 exposes the VNodePathInfo flavor but not the corresponding
+// Darwin struct. Keep the ABI definition local until the crate exports it.
+// Layout mirrors <sys/proc_info.h> / libproc's generated bindings.
+#[repr(C)]
+struct VinfoStat {
+    vst_dev: u32,
+    vst_mode: u16,
+    vst_nlink: u16,
+    vst_ino: u64,
+    vst_uid: libc::uid_t,
+    vst_gid: libc::gid_t,
+    vst_atime: i64,
+    vst_atimensec: i64,
+    vst_mtime: i64,
+    vst_mtimensec: i64,
+    vst_ctime: i64,
+    vst_ctimensec: i64,
+    vst_birthtime: i64,
+    vst_birthtimensec: i64,
+    vst_size: libc::off_t,
+    vst_blocks: i64,
+    vst_blksize: i32,
+    vst_flags: u32,
+    vst_gen: u32,
+    vst_rdev: u32,
+    vst_qspare: [i64; 2],
+}
+
+#[repr(C)]
+struct VnodeInfo {
+    vi_stat: VinfoStat,
+    vi_type: std::os::raw::c_int,
+    vi_pad: std::os::raw::c_int,
+    vi_fsid: libc::fsid_t,
+}
+
+#[repr(C)]
+struct VnodeInfoPath {
+    vip_vi: VnodeInfo,
+    vip_path: [libc::c_char; libc::MAXPATHLEN as usize],
+}
+
+#[repr(C)]
+struct VnodePathInfo {
+    pvi_cdir: VnodeInfoPath,
+    pvi_rdir: VnodeInfoPath,
+}
+
+impl PIDInfo for VnodePathInfo {
+    fn flavor() -> PidInfoFlavor {
+        PidInfoFlavor::VNodePathInfo
+    }
+}
 
 /// Best-effort snapshot of a process. Anything that fails to read becomes an
 /// empty string / 0 — callers must never panic on a process that exited
@@ -127,29 +183,81 @@ pub fn rundown(
     table: &mut EnrollmentTable,
     pid_to_key: &mut std::collections::HashMap<i32, ProcessKey>,
 ) -> usize {
-    let pids = match proc_pid::listpids(ProcType::ProcAllPIDS) {
+    let pids = match pids_by_type(ProcFilter::All) {
         Ok(p) => p,
         Err(_) => return 0,
     };
-    // First pass: enroll the roots (so children can find them in pass two).
-    let mut seeded = 0usize;
-    for &pid in &pids {
-        let pid = pid as i32;
-        let snap = snapshot(pid);
-        if snap.start_time_ticks == 0 {
-            continue;
+    let identities: Vec<ProcIdentity> = pids
+        .into_iter()
+        .filter_map(|pid| process_identity(pid as i32))
+        .collect();
+    let mut children: HashMap<i32, Vec<ProcIdentity>> = HashMap::new();
+    let mut roots = Vec::new();
+    for identity in identities {
+        if is_enrolled_agent(&identity.comm, &identity.exe_path, enrolled_agents) {
+            roots.push(identity.clone());
         }
-        if is_enrolled_agent(&snap.comm, &snap.exe_path, enrolled_agents) {
+        children.entry(identity.ppid).or_default().push(identity);
+    }
+
+    let mut seeded = 0usize;
+    let mut queue = VecDeque::new();
+    for root in roots {
+        let key = ProcessKey {
+            pid: root.pid,
+            start_time_ticks: root.start_time_ticks,
+        };
+        table.enroll(key, None);
+        pid_to_key.insert(root.pid, key);
+        queue.push_back(root.pid);
+        seeded += 1;
+    }
+    while let Some(parent_pid) = queue.pop_front() {
+        let Some(parent_key) = pid_to_key.get(&parent_pid).copied() else {
+            continue;
+        };
+        for child in children.remove(&parent_pid).unwrap_or_default() {
+            if pid_to_key.contains_key(&child.pid) {
+                continue;
+            }
             let key = ProcessKey {
-                pid,
-                start_time_ticks: snap.start_time_ticks,
+                pid: child.pid,
+                start_time_ticks: child.start_time_ticks,
             };
-            table.enroll(key, None);
-            pid_to_key.insert(pid, key);
-            seeded += 1;
+            table.enroll(key, Some(parent_key));
+            pid_to_key.insert(child.pid, key);
+            queue.push_back(child.pid);
         }
     }
     seeded
+}
+
+#[derive(Clone)]
+struct ProcIdentity {
+    pid: i32,
+    ppid: i32,
+    comm: String,
+    exe_path: String,
+    start_time_ticks: u64,
+}
+
+fn process_identity(pid: i32) -> Option<ProcIdentity> {
+    let exe_path = proc_pid::pidpath(pid).unwrap_or_default();
+    let bi = pidinfo::<BSDInfo>(pid, 0).ok()?;
+    if bi.pbi_start_tvsec == 0 {
+        return None;
+    }
+    let comm = cstr_array_to_string(&bi.pbi_name)
+        .or_else(|| cstr_array_to_string(&bi.pbi_comm))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| basename(&exe_path));
+    Some(ProcIdentity {
+        pid,
+        ppid: bi.pbi_ppid as i32,
+        comm,
+        exe_path,
+        start_time_ticks: bi.pbi_start_tvsec,
+    })
 }
 
 /// Match an agent root the same way the kernel-event handlers do: by the
@@ -168,8 +276,6 @@ pub fn is_enrolled_agent(comm: &str, exe_path: &str, enrolled_agents: &[String])
 /// — the macOS equivalent of `/proc/<pid>/cwd`. The daemon's attribution engine
 /// uses this to bind a kernel event's process to a transcript session by cwd.
 pub fn query_cwd(pid: i32) -> Option<String> {
-    use libproc::libproc::proc_pid::pidinfo;
-    use libproc::libproc::task_info::VnodePathInfo; // NOTE: verify module path on macOS
     match pidinfo::<VnodePathInfo>(pid, 0) {
         Ok(vpi) => {
             let s = cstr_array_to_string(&vpi.pvi_cdir.vip_path)?;
@@ -255,7 +361,11 @@ mod tests {
     #[test]
     fn is_enrolled_agent_matches_comm_then_basename() {
         let agents = vec!["claude".to_string(), "codex".to_string()];
-        assert!(is_enrolled_agent("claude", "/usr/local/bin/claude", &agents));
+        assert!(is_enrolled_agent(
+            "claude",
+            "/usr/local/bin/claude",
+            &agents
+        ));
         // comm empty → fall back to exe basename.
         assert!(is_enrolled_agent("", "/opt/homebrew/bin/codex", &agents));
         assert!(!is_enrolled_agent("bash", "/bin/bash", &agents));

@@ -12,24 +12,25 @@
 //!   for `*.jsonl`. Both Claude Code (`~/.claude/projects/`) and Codex
 //!   (`~/.codex/sessions/`) directory layouts are supported; dialect is
 //!   auto-detected per file from its path.
-//! - On each `refresh()` tick the engine walks every configured path,
-//!   checks each `.jsonl` file's mtime, and re-parses any that changed.
-//!   Per-session state is keyed by transcript-recorded `session_id` and
-//!   kept in a `HashMap`, so multiple concurrent Claude / Codex sessions
-//!   can be attributed against from the same daemon instance.
+//! - `refresh()` stats known files and parses only complete bytes appended
+//!   since the prior tick. Recursive discovery runs once per second rather
+//!   than on the 100 ms tail cadence. Per-session state is keyed by the
+//!   transcript-recorded `session_id`, so multiple concurrent Claude / Codex
+//!   sessions can be attributed from one daemon instance.
 //! - `attribute(&mut event)` mutates a kernel-side event in place: looks
 //!   up the agent_root_pid's cwd via the platform-specific
 //!   `cwd_for_pid` resolver, finds whichever session's cwd matches, then
 //!   sets the attribution booleans from that session's most-recent
 //!   tool_call and identifier-origin index.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use aten_schema::{Event, EventKind};
-use aten_transcript::detect_dialect_from_path;
+use aten_transcript::{detect_dialect_from_path, TranscriptStreamParser};
 
 pub mod session;
 
@@ -116,6 +117,11 @@ pub fn default_cwd_for_pid(pid: i32) -> Option<String> {
 #[derive(Debug)]
 struct FileMeta {
     mtime: Option<SystemTime>,
+    len: u64,
+    /// First byte not yet consumed. Only complete JSONL records advance it.
+    byte_offset: u64,
+    /// Retains Codex's opener-only session metadata across tail reads.
+    parser: Option<TranscriptStreamParser>,
     /// File owner resolved on first sight (DOMAIN\username on Windows;
     /// username on Linux). Cached because file ownership rarely changes
     /// and the lookup is a Win32 syscall we don't want to do per event.
@@ -156,6 +162,10 @@ pub struct AttributionEngine {
     /// Per-file metadata: mtime cache (for refresh skip), file owner
     /// cache, and the emission cursor that persists across restarts.
     file_meta: HashMap<PathBuf, FileMeta>,
+    /// Files found by the most recent recursive discovery pass. Normal refresh
+    /// ticks only stat and tail these paths; they do not walk directory trees.
+    known_files: HashSet<PathBuf>,
+    last_discovery: Option<Instant>,
     /// Resolved agent_root_pid → session_id binding. Populated lazily on
     /// the first kernel event whose process cwd matches a session's cwd.
     pid_bindings: HashMap<i32, String>,
@@ -164,6 +174,21 @@ pub struct AttributionEngine {
     /// refresh() returns events; this flag avoids writing the state
     /// file on no-op ticks.
     state_dirty: bool,
+    last_state_save: Option<Instant>,
+    stats: EngineStats,
+}
+
+/// Cumulative counters for validating steady-state overhead in tests and
+/// exposing it to a future health endpoint without putting logging on hot
+/// paths.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EngineStats {
+    pub refreshes: u64,
+    pub discovery_passes: u64,
+    pub files_checked: u64,
+    pub bytes_read: u64,
+    pub records_parsed: u64,
+    pub state_writes: u64,
 }
 
 impl AttributionEngine {
@@ -172,8 +197,12 @@ impl AttributionEngine {
             cfg,
             sessions: HashMap::new(),
             file_meta: HashMap::new(),
+            known_files: HashSet::new(),
+            last_discovery: None,
             pid_bindings: HashMap::new(),
             state_dirty: false,
+            last_state_save: None,
+            stats: EngineStats::default(),
         };
         // Best-effort load of the persisted state file. If it doesn't
         // exist (fresh install) or can't be parsed, start clean — first
@@ -186,6 +215,9 @@ impl AttributionEngine {
                             file,
                             FileMeta {
                                 mtime: None,
+                                len: 0,
+                                byte_offset: 0,
+                                parser: None,
                                 user_id: None,
                                 emitted_count: pf.emitted_count,
                                 from_persisted_state: true,
@@ -202,6 +234,19 @@ impl AttributionEngine {
     /// temp + rename). No-op when no `state_path` is configured or when
     /// nothing has changed since the last save.
     pub fn save_state(&mut self) -> Result<()> {
+        const SAVE_INTERVAL: Duration = Duration::from_secs(2);
+        if self
+            .last_state_save
+            .is_some_and(|last| last.elapsed() < SAVE_INTERVAL)
+        {
+            return Ok(());
+        }
+        self.flush_state()
+    }
+
+    /// Force dirty cursors to disk, used during graceful shutdown. Normal
+    /// refresh ticks call `save_state`, which batches rewrites for two seconds.
+    pub fn flush_state(&mut self) -> Result<()> {
         if !self.state_dirty {
             return Ok(());
         }
@@ -218,10 +263,7 @@ impl AttributionEngine {
                 },
             );
         }
-        let state = PersistedState {
-            version: 1,
-            files,
-        };
+        let state = PersistedState { version: 1, files };
         let text = serde_json::to_string(&state)?;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -230,12 +272,13 @@ impl AttributionEngine {
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, path)?;
         self.state_dirty = false;
+        self.last_state_save = Some(Instant::now());
+        self.stats.state_writes = self.stats.state_writes.saturating_add(1);
         Ok(())
     }
 
-    /// Walk all configured transcript paths, load any new or modified
-    /// JSONL files, fold their events into the matching SessionState.
-    /// Called on startup and on every poll tick (~500 ms in the daemon).
+    /// Discover transcript paths periodically, tail modified JSONL files, and
+    /// fold only appended records into the matching SessionState.
     ///
     /// Returns transcript events that are both **new since the previous
     /// refresh of that file** and **newer than the engine's start time**.
@@ -245,105 +288,131 @@ impl AttributionEngine {
     /// silently absorbed into SessionState for attribution context but
     /// not re-emitted — restarting the service shouldn't replay history.
     pub fn refresh(&mut self) -> Result<Vec<Event>> {
+        self.stats.refreshes = self.stats.refreshes.saturating_add(1);
         let mut new_events: Vec<Event> = Vec::new();
-        for path in self.cfg.transcript_paths.clone() {
-            self.refresh_path(&path, &mut new_events);
-        }
-        Ok(new_events)
-    }
-
-    fn refresh_path(&mut self, path: &Path, new_events: &mut Vec<Event>) {
-        match std::fs::metadata(path) {
-            Ok(md) if md.is_file() => {
-                self.refresh_file(path.to_path_buf(), md.modified().ok(), new_events);
+        const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
+        let should_discover = self
+            .last_discovery
+            .is_none_or(|last| last.elapsed() >= DISCOVERY_INTERVAL);
+        if should_discover {
+            self.stats.discovery_passes = self.stats.discovery_passes.saturating_add(1);
+            let mut discovered = HashSet::new();
+            for path in &self.cfg.transcript_paths {
+                discover_jsonl(path, &mut discovered);
             }
-            Ok(md) if md.is_dir() => {
-                let mut files: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
-                walk_jsonl(path, &mut |file| {
-                    let mtime = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
-                    files.push((file, mtime));
-                });
-                for (file, mtime) in files {
-                    self.refresh_file(file, mtime, new_events);
+            self.known_files = discovered;
+            self.last_discovery = Some(Instant::now());
+        }
+
+        let files: Vec<PathBuf> = self.known_files.iter().cloned().collect();
+        for file in files {
+            self.stats.files_checked = self.stats.files_checked.saturating_add(1);
+            if let Ok(metadata) = std::fs::metadata(&file) {
+                if metadata.is_file() {
+                    self.refresh_file(file, &metadata, &mut new_events);
                 }
             }
-            _ => {} // path doesn't exist yet — fine, will appear later
         }
+        Ok(new_events)
     }
 
     fn refresh_file(
         &mut self,
         file: PathBuf,
-        mtime: Option<SystemTime>,
+        metadata: &std::fs::Metadata,
         new_events: &mut Vec<Event>,
     ) {
-        // Skip files we've already loaded that haven't changed.
-        // Persisted-state entries have mtime=None, so they always
-        // re-read on first encounter (we don't trust an old mtime
-        // across restarts).
-        if let (Some(meta), Some(mt)) = (self.file_meta.get(&file), mtime) {
-            if let Some(prev_mt) = meta.mtime {
-                if prev_mt >= mt {
-                    return;
-                }
-            }
-        }
+        let mtime = metadata.modified().ok();
+        let len = metadata.len();
+        let existing = self.file_meta.remove(&file);
+        let first_sight = existing.is_none();
+        let mut meta = existing.unwrap_or(FileMeta {
+            mtime: None,
+            len: 0,
+            byte_offset: 0,
+            parser: None,
+            user_id: None,
+            emitted_count: 0,
+            from_persisted_state: false,
+        });
 
-        let dialect = detect_dialect_from_path(&file);
-        let (session_id, events) = match session::load_sessions_from_file(&file, dialect) {
-            Ok(x) => x,
-            Err(_) => return, // unreadable / mid-write — try again next tick
-        };
-        if session_id.is_empty() {
+        if meta.parser.is_some() && meta.len == len && meta.mtime.is_some() && meta.mtime >= mtime {
+            self.file_meta.insert(file, meta);
             return;
         }
-        let cwd = session::cwd_from_transcript_raw(&file, dialect);
 
-        // Determine emission cursor:
-        //  - File was loaded from state.json (`from_persisted_state`):
-        //    use the persisted `emitted_count`. May be less than
-        //    `events.len()` if events accrued while the service was off;
-        //    we'll emit the missed ones.
-        //  - File seen for the first time at runtime (no persisted
-        //    state): set cursor to `events.len()` so historical content
-        //    gets folded into SessionState but doesn't replay to the
-        //    sink. Subsequent refreshes will emit the delta.
-        let existing = self.file_meta.get(&file);
-        let emit_cursor = match existing {
-            Some(meta) if meta.from_persisted_state => meta.emitted_count.min(events.len()),
-            Some(meta) => meta.emitted_count.min(events.len()),
-            None => events.len(),
+        let reset = meta.parser.is_none() || len < meta.byte_offset;
+        let dialect = detect_dialect_from_path(&file);
+        let mut parser = if reset {
+            TranscriptStreamParser::new(dialect, host_platform())
+        } else {
+            meta.parser
+                .take()
+                .expect("initialized parser required for tail read")
         };
+        let offset = if reset { 0 } else { meta.byte_offset };
+        let (events, new_offset, bytes_read, records_parsed) =
+            match read_appended_events(&file, offset, &mut parser) {
+                Ok(result) => result,
+                Err(_) => {
+                    meta.parser = Some(parser);
+                    self.file_meta.insert(file, meta);
+                    return;
+                }
+            };
+        self.stats.bytes_read = self.stats.bytes_read.saturating_add(bytes_read);
+        self.stats.records_parsed = self.stats.records_parsed.saturating_add(records_parsed);
+
         // Resolve and cache the file owner. State-loaded entries have
         // `user_id: None` (we don't persist user_id to disk), so we have
         // to actually look it up on the first refresh that touches the
         // file at runtime — not just on first-ever sight. Once cached,
         // subsequent refreshes use the cached value.
-        let user_id = match existing.and_then(|m| m.user_id.clone()) {
+        let user_id = match meta.user_id.clone() {
             Some(u) => Some(u),
             None => (self.cfg.user_for_transcript)(&file),
         };
 
-        match self.sessions.get_mut(&session_id) {
-            Some(state) => {
-                state.refresh(&events);
-                if state.cwd.is_none() {
-                    state.cwd = cwd;
-                }
-            }
-            None => {
+        let session_id = parser.session_id().unwrap_or_default().to_string();
+        let cwd = parser.cwd().map(str::to_string);
+        if !session_id.is_empty() {
+            if reset && !first_sight && !meta.from_persisted_state {
                 self.sessions.insert(
                     session_id.clone(),
-                    SessionState::from_events(session_id.clone(), &events, cwd),
+                    SessionState::from_events(session_id.clone(), &events, cwd.clone()),
                 );
+            } else {
+                match self.sessions.get_mut(&session_id) {
+                    Some(state) => {
+                        state.ingest(&events);
+                        if state.cwd.is_none() {
+                            state.cwd = cwd.clone();
+                        }
+                    }
+                    None => {
+                        self.sessions.insert(
+                            session_id.clone(),
+                            SessionState::from_events(session_id.clone(), &events, cwd.clone()),
+                        );
+                    }
+                }
             }
         }
+
+        let emit_cursor = if reset {
+            if first_sight {
+                events.len()
+            } else {
+                meta.emitted_count.min(events.len())
+            }
+        } else {
+            0
+        };
 
         // Stamp host_id and user_id on each emitted event — the transcript
         // reader leaves those null because they aren't in the source
         // JSONL; the daemon enriches at emit time.
-        let prev_cursor = emit_cursor;
-        for ev in events.iter().skip(prev_cursor) {
+        for ev in events.iter().skip(emit_cursor) {
             let mut enriched = ev.clone();
             if enriched.host_id.is_none() {
                 enriched.host_id = self.cfg.host_id.clone();
@@ -357,19 +426,22 @@ impl AttributionEngine {
         // Update cursor + cached file metadata. If any events were
         // actually emitted past the cursor, flag state dirty so the
         // daemon's next save_state() persists this advance.
-        let new_emitted_count = events.len();
-        if new_emitted_count > emit_cursor {
+        let new_emitted_count = if reset {
+            events.len()
+        } else {
+            meta.emitted_count.saturating_add(events.len())
+        };
+        if events.len() > emit_cursor {
             self.state_dirty = true;
         }
-        self.file_meta.insert(
-            file,
-            FileMeta {
-                mtime,
-                user_id,
-                emitted_count: new_emitted_count,
-                from_persisted_state: false,
-            },
-        );
+        meta.mtime = mtime;
+        meta.len = len;
+        meta.byte_offset = new_offset;
+        meta.parser = Some(parser);
+        meta.user_id = user_id;
+        meta.emitted_count = new_emitted_count;
+        meta.from_persisted_state = false;
+        self.file_meta.insert(file, meta);
     }
 
     /// Mutate a kernel-side event in place to fill in attribution. Looks
@@ -425,7 +497,7 @@ impl AttributionEngine {
         // even when the tool_call binding isn't.
         let triggering_prompt = session
             .most_recent_user_prompt_before(event_ns)
-            .map(|p| p.text.clone());
+            .map(|p| bounded_intent(&p.text));
 
         // Extract a human-readable command from the tool_input. For
         // Bash/PowerShell-style tools that have a `command` field, use
@@ -455,8 +527,8 @@ impl AttributionEngine {
                 if let Some(tc) = confident_tc {
                     c.attribution.attributed_tool_call_id = Some(tc.id.clone());
                     c.attribution.time_window_ms = time_window_ms;
-                    c.attribution.requested_by_tool_call = tc.input_text.contains(&path)
-                        || tc.input_text_lower.contains(&normalized);
+                    c.attribution.requested_by_tool_call =
+                        tc.input_text.contains(&path) || tc.input_text_lower.contains(&normalized);
                 }
                 c.attribution.triggering_command = triggering_command;
                 c.attribution.triggering_prompt = triggering_prompt;
@@ -509,8 +581,7 @@ impl AttributionEngine {
                     // query_name is already lowercased by the collectors; match
                     // against the precomputed lowercased tool input (a
                     // `curl HTTPS://Host` would otherwise miss on case).
-                    d.attribution.requested_by_tool_call =
-                        tc.input_text_lower.contains(&name);
+                    d.attribution.requested_by_tool_call = tc.input_text_lower.contains(&name);
                 }
                 d.attribution.triggering_command = triggering_command;
                 d.attribution.triggering_prompt = triggering_prompt;
@@ -536,8 +607,8 @@ impl AttributionEngine {
                 if let Some(tc) = confident_tc {
                     f.attribution.attributed_tool_call_id = Some(tc.id.clone());
                     f.attribution.time_window_ms = time_window_ms;
-                    f.attribution.requested_by_tool_call = tc.input_text.contains(&path)
-                        || tc.input_text_lower.contains(&normalized);
+                    f.attribution.requested_by_tool_call =
+                        tc.input_text.contains(&path) || tc.input_text_lower.contains(&normalized);
                 }
                 f.attribution.triggering_command = triggering_command;
                 f.attribution.triggering_prompt = triggering_prompt;
@@ -624,28 +695,105 @@ impl AttributionEngine {
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
+
+    pub fn stats(&self) -> EngineStats {
+        self.stats
+    }
 }
 
 fn norm_cwd(s: &str) -> String {
-    s.to_lowercase().replace('\\', "/").trim_end_matches('/').to_string()
+    s.to_lowercase()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string()
 }
 
-/// Recursively walk `dir`, invoking `cb` for every `*.jsonl` file. No
-/// follow-symlinks. Errors (permission denied on a subdir, etc.) are
-/// swallowed silently — the daemon-tick loop should be robust to
-/// transient filesystem hiccups.
-fn walk_jsonl(dir: &Path, cb: &mut dyn FnMut(PathBuf)) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+/// Discover explicit transcript files and recursively scan configured
+/// directories. This runs on a slower cadence than tail ingestion.
+fn discover_jsonl(path: &Path, found: &mut HashSet<PathBuf>) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.is_file() {
+        found.insert(path.to_path_buf());
+        return;
+    }
+    if !metadata.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
+        let child = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
-            walk_jsonl(&path, cb);
-        } else if ft.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
-            cb(path);
+            discover_jsonl(&child, found);
+        } else if ft.is_file() && child.extension().is_some_and(|e| e == "jsonl") {
+            found.insert(child);
         }
+    }
+}
+
+/// Parse complete records starting at `offset`. A valid final record without a
+/// newline is accepted; an incomplete final record leaves the cursor at its
+/// start so the next refresh retries it after the writer finishes.
+fn read_appended_events(
+    path: &Path,
+    offset: u64,
+    parser: &mut TranscriptStreamParser,
+) -> std::io::Result<(Vec<Event>, u64, u64, u64)> {
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new(file);
+    let mut events = Vec::new();
+    let mut cursor = offset;
+    let mut bytes = Vec::new();
+    let mut bytes_read = 0u64;
+    let mut records_parsed = 0u64;
+
+    loop {
+        bytes.clear();
+        let read = reader.read_until(b'\n', &mut bytes)?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(read as u64);
+        let terminated = bytes.last() == Some(&b'\n');
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end_matches(['\r', '\n']).trim();
+        if line.is_empty() {
+            cursor = cursor.saturating_add(read as u64);
+            continue;
+        }
+
+        match parser.parse_line(line) {
+            Ok(parsed) => {
+                events.extend(parsed);
+                records_parsed = records_parsed.saturating_add(1);
+                cursor = cursor.saturating_add(read as u64);
+            }
+            Err(error) if terminated => {
+                eprintln!(
+                    "aten: skipping malformed transcript record in {}: {error}",
+                    path.display()
+                );
+                cursor = cursor.saturating_add(read as u64);
+            }
+            Err(_) => break,
+        }
+    }
+
+    Ok((events, cursor, bytes_read, records_parsed))
+}
+
+fn host_platform() -> aten_schema::Platform {
+    if cfg!(target_os = "windows") {
+        aten_schema::Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        aten_schema::Platform::Macos
+    } else {
+        aten_schema::Platform::Linux
     }
 }
 
@@ -657,10 +805,19 @@ fn walk_jsonl(dir: &Path, cb: &mut dyn FnMut(PathBuf)) {
 fn extract_command(input_text: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(input_text) {
         if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
-            return cmd.to_string();
+            return bounded_intent(cmd);
         }
     }
-    input_text.to_string()
+    bounded_intent(input_text)
+}
+
+fn bounded_intent(text: &str) -> String {
+    const MAX_EMBEDDED_INTENT_CHARS: usize = 4 * 1024;
+    if text.chars().count() <= MAX_EMBEDDED_INTENT_CHARS {
+        text.to_string()
+    } else {
+        text.chars().take(MAX_EMBEDDED_INTENT_CHARS).collect()
+    }
 }
 
 /// Extract identifiers from `cmdline` and check whether each appears as a
@@ -679,6 +836,29 @@ fn identifiers_appear_in(cmdline: &str, tool_input_text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn temp_transcript(name: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "aten-attribution-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("session.jsonl");
+        (dir, file)
+    }
+
+    fn claude_prompt(id: &str, text: &str) -> String {
+        let mut line = format!(
+            r#"{{"type":"user","sessionId":"stream-session","uuid":"{id}","timestamp":"2026-05-27T19:08:02.110Z","cwd":"/tmp/project","message":{{"content":"{text}"}}}}"#
+        );
+        line.push('\n');
+        line
+    }
 
     /// Cmdline identifier appears in the tool_call's input → requested_by_tool_call true.
     #[test]
@@ -702,5 +882,111 @@ mod tests {
         assert_eq!(norm_cwd(r"C:\Users\Anton\Proj"), "c:/users/anton/proj");
         assert_eq!(norm_cwd("/home/anton/proj/"), "/home/anton/proj");
         assert_eq!(norm_cwd("C:/Users/Anton/Proj/"), "c:/users/anton/proj");
+    }
+
+    #[test]
+    fn refresh_tails_only_appended_bytes() {
+        let (dir, file) = temp_transcript("tail");
+        let initial = claude_prompt("one", "first");
+        std::fs::write(&file, &initial).unwrap();
+
+        let mut engine = AttributionEngine::new(EngineConfig {
+            transcript_paths: vec![file.clone()],
+            ..EngineConfig::default()
+        });
+        assert!(engine.refresh().unwrap().is_empty());
+        assert_eq!(engine.session_count(), 1);
+        let first = engine.stats();
+        assert_eq!(first.bytes_read, initial.len() as u64);
+        assert_eq!(first.records_parsed, 1);
+
+        assert!(engine.refresh().unwrap().is_empty());
+        let unchanged = engine.stats();
+        assert_eq!(unchanged.bytes_read, first.bytes_read);
+        assert_eq!(unchanged.discovery_passes, first.discovery_passes);
+
+        let appended = claude_prompt("two", "second");
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        writer.write_all(appended.as_bytes()).unwrap();
+        writer.flush().unwrap();
+
+        let emitted = engine.refresh().unwrap();
+        assert_eq!(emitted.len(), 1);
+        let tailed = engine.stats();
+        assert_eq!(tailed.bytes_read, first.bytes_read + appended.len() as u64);
+        assert_eq!(tailed.records_parsed, 2);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn incomplete_record_is_retried_without_advancing_cursor() {
+        let (dir, file) = temp_transcript("partial");
+        let initial = claude_prompt("one", "first");
+        std::fs::write(&file, &initial).unwrap();
+        let mut engine = AttributionEngine::new(EngineConfig {
+            transcript_paths: vec![file.clone()],
+            ..EngineConfig::default()
+        });
+        engine.refresh().unwrap();
+
+        let appended = claude_prompt("two", "second");
+        let split = appended.len() / 2;
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        writer.write_all(&appended.as_bytes()[..split]).unwrap();
+        writer.flush().unwrap();
+        assert!(engine.refresh().unwrap().is_empty());
+
+        writer.write_all(&appended.as_bytes()[split..]).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(engine.refresh().unwrap().len(), 1);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn state_rewrites_are_batched_and_shutdown_flush_is_forced() {
+        let (dir, file) = temp_transcript("state-batch");
+        let state_path = dir.join("state.json");
+        std::fs::write(&file, claude_prompt("one", "first")).unwrap();
+        let mut engine = AttributionEngine::new(EngineConfig {
+            transcript_paths: vec![file.clone()],
+            state_path: Some(state_path.clone()),
+            ..EngineConfig::default()
+        });
+        engine.refresh().unwrap();
+
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        writer
+            .write_all(claude_prompt("two", "second").as_bytes())
+            .unwrap();
+        writer.flush().unwrap();
+        engine.refresh().unwrap();
+        engine.save_state().unwrap();
+        assert_eq!(engine.stats().state_writes, 1);
+        let first_state = std::fs::read(&state_path).unwrap();
+
+        writer
+            .write_all(claude_prompt("three", "third").as_bytes())
+            .unwrap();
+        writer.flush().unwrap();
+        engine.refresh().unwrap();
+        engine.save_state().unwrap();
+        assert_eq!(engine.stats().state_writes, 1);
+        assert_eq!(std::fs::read(&state_path).unwrap(), first_state);
+
+        engine.flush_state().unwrap();
+        assert_eq!(engine.stats().state_writes, 2);
+        assert_ne!(std::fs::read(&state_path).unwrap(), first_state);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

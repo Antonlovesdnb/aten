@@ -69,17 +69,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
-use ferrisetw::parser::Parser;
-use ferrisetw::provider::Provider;
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::UserTrace;
-use ferrisetw::EventRecord;
 use aten_schema::{
     AccessType, Attribution, CredentialAccessPayload, CredentialClass, DnsQueryPayload,
     DnsQueryType, Event, EventKind, FileWriteClass, FileWritePayload, NetworkEgressPayload,
     Platform, Process, ProcessExecPayload, Protocol, Source, SCHEMA_VERSION,
 };
+use chrono::{DateTime, Utc};
+use ferrisetw::parser::Parser;
+use ferrisetw::provider::{EventFilter, Provider};
+use ferrisetw::schema_locator::SchemaLocator;
+use ferrisetw::trace::UserTrace;
+use ferrisetw::EventRecord;
 use serde::Deserialize;
 
 use aten_collector_linux::credentials;
@@ -88,6 +88,8 @@ use aten_collector_linux::filewrite;
 use aten_collector_linux::network::{is_uninteresting, Endpoint};
 
 use crate::enrich;
+
+type EmitSink = Arc<Mutex<Box<dyn FnMut(Event) + Send>>>;
 
 /// Microsoft-Windows-Kernel-Process provider GUID.
 const KERNEL_PROCESS_GUID: &str = "22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716";
@@ -109,6 +111,7 @@ const DNS_CLIENT_GUID: &str = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D";
 /// Event IDs published by Microsoft-Windows-Kernel-Process. Only the ones we
 /// currently care about are named here.
 const EVENT_ID_PROCESS_START: u16 = 1;
+const EVENT_ID_PROCESS_STOP: u16 = 2;
 
 /// Event ID for `IRP_MJ_CREATE` from Microsoft-Windows-Kernel-File. This is
 /// the file-open event; `FileName` is in-payload (Read/Write events only
@@ -127,6 +130,7 @@ const EVENT_ID_TCP_CONNECT_V6: u16 = 28;
 /// semicolon-delimited string of resolved addresses / CNAME targets). The
 /// query-*sent* event (3006) lacks results, so we key off completion.
 const EVENT_ID_DNS_QUERY_COMPLETE: u16 = 3008;
+const PROCESS_CACHE_CAP: usize = 16_384;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollectorConfig {
@@ -142,10 +146,7 @@ pub struct CollectorConfig {
 impl Default for CollectorConfig {
     fn default() -> Self {
         Self {
-            enrolled_agents: vec![
-                "claude.exe".into(),
-                "codex.exe".into(),
-            ],
+            enrolled_agents: vec!["claude.exe".into(), "codex.exe".into()],
             host_id: None,
         }
     }
@@ -194,6 +195,9 @@ struct ProcInfo {
     cmdline: String,
     user: String,
     start_time_ticks: u64,
+    ppid: u32,
+    parent_chain: Vec<aten_schema::ParentChainEntry>,
+    integrity_level: Option<String>,
 }
 
 /// Resolve a process's identity for a Kernel-File / Kernel-Network event:
@@ -201,9 +205,18 @@ struct ProcInfo {
 /// fall back to a live Win32 query (which may return blanks if the process
 /// already exited). Returns `(name, normalized_image_path, cmdline, user,
 /// start_time_ticks)`.
-fn resolve_proc_identity(pid: u32, cached: Option<ProcInfo>) -> (String, String, String, String, u64) {
+fn resolve_proc_identity(
+    pid: u32,
+    cached: Option<ProcInfo>,
+) -> (String, String, String, String, u64) {
     match cached {
-        Some(pi) => (pi.name, pi.image_path, pi.cmdline, pi.user, pi.start_time_ticks),
+        Some(pi) => (
+            pi.name,
+            pi.image_path,
+            pi.cmdline,
+            pi.user,
+            pi.start_time_ticks,
+        ),
         None => {
             let image_path = enrich::query_image(pid);
             (
@@ -215,6 +228,26 @@ fn resolve_proc_identity(pid: u32, cached: Option<ProcInfo>) -> (String, String,
             )
         }
     }
+}
+
+fn resolve_proc_topology(
+    pid: u32,
+    cached: Option<&ProcInfo>,
+) -> (u32, Vec<aten_schema::ParentChainEntry>, Option<String>) {
+    if let Some(info) = cached {
+        return (
+            info.ppid,
+            info.parent_chain.clone(),
+            info.integrity_level.clone(),
+        );
+    }
+    let ppid = enrich::ancestor_pids(pid, 1).first().copied().unwrap_or(0);
+    let parent_chain = if ppid != 0 {
+        enrich::parent_chain(ppid, 16)
+    } else {
+        Vec::new()
+    };
+    (ppid, parent_chain, enrich::query_integrity_level(pid))
 }
 
 /// Render `start_time_ticks` (0 = unknown) as the schema's string field.
@@ -253,8 +286,7 @@ where
     T: FnMut(),
 {
     let state = Arc::new(Mutex::new(SharedState::new()));
-    let emit_sink: Arc<Mutex<Box<dyn FnMut(Event) + Send>>> =
-        Arc::new(Mutex::new(Box::new(emit)));
+    let emit_sink: EmitSink = Arc::new(Mutex::new(Box::new(emit)));
     let host_id_proc = config.host_id.clone();
     let host_id_file = config.host_id.clone();
     let host_id_net = config.host_id.clone();
@@ -298,23 +330,21 @@ where
         n
     };
 
-    // `.any(ALL_KEYWORDS)` is critical: ferrisetw's `Provider::by_guid` defaults
-    // `MatchAnyKeyword = 0`, which under ETW semantics means "only events with
-    // keyword = 0 in the manifest fire" — i.e., excludes every event that has
-    // any keyword set. Microsoft-Windows-Kernel-File Event 12 (IRP_MJ_CREATE,
-    // the only event with a usable FileName field on every fire) is gated by
-    // `KERNEL_FILE_KEYWORD_CREATE = 0x80`, so without this the file callback
-    // received the Close/Cleanup/Write firehose (all keyword = 0) but never
-    // saw a Create. Symptom: process_exec and network_egress flowed but
-    // credential_access never fired no matter what was read. `0xFFFFFFFF_FFFFFFFF`
-    // = "enable every keyword the manifest defines" on all three providers;
-    // event_id filtering inside the callbacks does the actual narrowing.
+    // Event-ID filters are passed to EnableTraceEx2, so Windows discards
+    // unrelated events before they enter ferrisetw's callback thread. Keep the
+    // broad keyword mask only where provider manifests vary across Windows
+    // releases; Kernel-File Create has a stable dedicated 0x80 keyword.
     const ALL_KEYWORDS: u64 = 0xFFFFFFFF_FFFFFFFF;
+    const KERNEL_FILE_KEYWORD_CREATE: u64 = 0x80;
 
     let state_proc = state.clone();
     let emit_proc = emit_sink.clone();
     let process_provider = Provider::by_guid(KERNEL_PROCESS_GUID)
         .any(ALL_KEYWORDS)
+        .add_filter(EventFilter::ByEventIds(vec![
+            EVENT_ID_PROCESS_START,
+            EVENT_ID_PROCESS_STOP,
+        ]))
         .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
             if let Err(e) = handle_etw_event(
                 record,
@@ -332,7 +362,8 @@ where
     let state_file = state.clone();
     let emit_file = emit_sink.clone();
     let file_provider = Provider::by_guid(KERNEL_FILE_GUID)
-        .any(ALL_KEYWORDS)
+        .any(KERNEL_FILE_KEYWORD_CREATE)
+        .add_filter(EventFilter::ByEventIds(vec![EVENT_ID_FILE_CREATE]))
         .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
             if let Err(e) = handle_file_event(
                 record,
@@ -350,6 +381,10 @@ where
     let emit_net = emit_sink.clone();
     let network_provider = Provider::by_guid(KERNEL_NETWORK_GUID)
         .any(ALL_KEYWORDS)
+        .add_filter(EventFilter::ByEventIds(vec![
+            EVENT_ID_TCP_CONNECT_V4,
+            EVENT_ID_TCP_CONNECT_V6,
+        ]))
         .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
             if let Err(e) = handle_network_event(
                 record,
@@ -368,6 +403,7 @@ where
     let host_id_dns = config.host_id.clone();
     let dns_provider = Provider::by_guid(DNS_CLIENT_GUID)
         .any(ALL_KEYWORDS)
+        .add_filter(EventFilter::ByEventIds(vec![EVENT_ID_DNS_QUERY_COMPLETE]))
         .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
             if let Err(e) = handle_dns_event(
                 record,
@@ -415,12 +451,12 @@ fn handle_etw_event(
     agents: &[String],
     host_id: Option<&str>,
     state: &Arc<Mutex<SharedState>>,
-    emit: &Arc<Mutex<Box<dyn FnMut(Event) + Send>>>,
+    emit: &EmitSink,
 ) -> Result<()> {
-    // Only process Process/Start events for now. The provider also publishes
-    // ProcessStop (ID 2), ImageLoad (ID 5), etc.; we'll add the relevant ones
-    // when we wire credential and network probes.
-    if record.event_id() != EVENT_ID_PROCESS_START {
+    if !matches!(
+        record.event_id(),
+        EVENT_ID_PROCESS_START | EVENT_ID_PROCESS_STOP
+    ) {
         return Ok(());
     }
 
@@ -430,6 +466,17 @@ fn handle_etw_event(
     let parser = Parser::create(record, &schema);
 
     let pid: u32 = parser.try_parse("ProcessID").unwrap_or(0);
+    if record.event_id() == EVENT_ID_PROCESS_STOP {
+        if pid != 0 {
+            let mut guard = state.lock().expect("state lock");
+            if let Some(key) = guard.pid_to_key.remove(&pid) {
+                guard.table.forget(key);
+            }
+            guard.proc_info.remove(&(pid as i32));
+        }
+        return Ok(());
+    }
+
     let ppid: u32 = parser.try_parse("ParentProcessID").unwrap_or(0);
     let image_name: String = parser.try_parse("ImageName").unwrap_or_default();
     // The ProcessStart event carries the command line directly — authoritative
@@ -458,13 +505,14 @@ fn handle_etw_event(
     };
 
     let basename = image_basename(&image_name);
-    let is_agent_root = agents
-        .iter()
-        .any(|n| n.eq_ignore_ascii_case(&basename));
+    let is_agent_root = agents.iter().any(|n| n.eq_ignore_ascii_case(&basename));
 
     let mut guard = state.lock().expect("state lock");
     let parent_enrolled = match parent_key {
-        Some(pk) => guard.pid_to_key.get(&(pk.pid as u32)).and_then(|k| guard.table.get(*k)),
+        Some(pk) => guard
+            .pid_to_key
+            .get(&(pk.pid as u32))
+            .and_then(|k| guard.table.get(*k)),
         None => None,
     };
 
@@ -472,8 +520,8 @@ fn handle_etw_event(
         Some(guard.table.enroll(process_key, None))
     } else if parent_enrolled.is_some() {
         // Re-derive parent_key with the real key from the pid_to_key cache.
-        let resolved_parent_key = parent_key
-            .and_then(|pk| guard.pid_to_key.get(&(pk.pid as u32)).copied());
+        let resolved_parent_key =
+            parent_key.and_then(|pk| guard.pid_to_key.get(&(pk.pid as u32)).copied());
         Some(guard.table.enroll(process_key, resolved_parent_key))
     } else {
         guard.pid_to_key.remove(&pid);
@@ -507,12 +555,16 @@ fn handle_etw_event(
     } else {
         Vec::new()
     };
+    let integrity_level = enrich::query_integrity_level(pid);
 
     // Cache this process's identity (captured while it's alive) so later
     // Kernel-File / Kernel-Network events for the same PID can populate
     // name/path/cmdline/user/start_time without a live query that races exit.
     {
         let mut st = state.lock().expect("state lock");
+        if st.proc_info.len() >= PROCESS_CACHE_CAP {
+            st.proc_info.clear();
+        }
         st.proc_info.insert(
             pid as i32,
             ProcInfo {
@@ -521,6 +573,9 @@ fn handle_etw_event(
                 cmdline: cmdline.clone(),
                 user: user.clone(),
                 start_time_ticks: process_key.start_time_ticks,
+                ppid,
+                parent_chain: parent_chain.clone(),
+                integrity_level: integrity_level.clone(),
             },
         );
     }
@@ -538,7 +593,11 @@ fn handle_etw_event(
             "agent-descendant".to_string()
         },
         session_id: None,
-        user_id: if user.is_empty() { None } else { Some(user.clone()) },
+        user_id: if user.is_empty() {
+            None
+        } else {
+            Some(user.clone())
+        },
         source: Source {
             collector: "windows_etw".to_string(),
             probe: "Microsoft-Windows-Kernel-Process/ProcessStart".to_string(),
@@ -554,7 +613,7 @@ fn handle_etw_event(
                 cmdline,
                 cwd: String::new(),
                 user,
-                integrity_level: enrich::query_integrity_level(pid),
+                integrity_level,
                 parent_chain,
                 agent_root_pid,
             },
@@ -599,7 +658,7 @@ fn handle_file_event(
     locator: &SchemaLocator,
     host_id: Option<&str>,
     state: &Arc<Mutex<SharedState>>,
-    emit: &Arc<Mutex<Box<dyn FnMut(Event) + Send>>>,
+    emit: &EmitSink,
 ) -> Result<()> {
     if record.event_id() != EVENT_ID_FILE_CREATE {
         return Ok(());
@@ -698,14 +757,10 @@ fn handle_file_event(
     // them. Prefer the ProcessStart cache so a short-lived child that has
     // already exited still gets name/path/cmdline/user (a live query would
     // race the exit and return blanks).
+    let (immediate_parent, parent_chain, integrity_level) =
+        resolve_proc_topology(pid, cached.as_ref());
     let (process_name, image_path, cmdline, user, start_time_ticks) =
         resolve_proc_identity(pid, cached);
-    let immediate_parent = enrich::ancestor_pids(pid, 1).first().copied().unwrap_or(0);
-    let parent_chain = if immediate_parent != 0 {
-        enrich::parent_chain(immediate_parent, 16)
-    } else {
-        Vec::new()
-    };
 
     let event = Event {
         schema_version: SCHEMA_VERSION.to_string(),
@@ -720,7 +775,11 @@ fn handle_file_event(
             "agent-descendant".to_string()
         },
         session_id: None,
-        user_id: if user.is_empty() { None } else { Some(user.clone()) },
+        user_id: if user.is_empty() {
+            None
+        } else {
+            Some(user.clone())
+        },
         source: Source {
             collector: "windows_etw".to_string(),
             probe: "Microsoft-Windows-Kernel-File/Create".to_string(),
@@ -743,7 +802,7 @@ fn handle_file_event(
                 cmdline,
                 cwd: String::new(),
                 user,
-                integrity_level: enrich::query_integrity_level(pid),
+                integrity_level,
                 parent_chain,
                 agent_root_pid,
             },
@@ -784,7 +843,7 @@ fn emit_file_write(
     write_class: FileWriteClass,
     host_id: Option<&str>,
     state: &Arc<Mutex<SharedState>>,
-    emit: &Arc<Mutex<Box<dyn FnMut(Event) + Send>>>,
+    emit: &EmitSink,
 ) -> Result<()> {
     let pid: u32 = record.process_id();
     if pid == 0 {
@@ -810,14 +869,10 @@ fn emit_file_write(
     st.events_emitted += 1;
     drop(st);
 
+    let (immediate_parent, parent_chain, integrity_level) =
+        resolve_proc_topology(pid, cached.as_ref());
     let (process_name, image_path, cmdline, user, start_time_ticks) =
         resolve_proc_identity(pid, cached);
-    let immediate_parent = enrich::ancestor_pids(pid, 1).first().copied().unwrap_or(0);
-    let parent_chain = if immediate_parent != 0 {
-        enrich::parent_chain(immediate_parent, 16)
-    } else {
-        Vec::new()
-    };
 
     let event = Event {
         schema_version: SCHEMA_VERSION.to_string(),
@@ -832,7 +887,11 @@ fn emit_file_write(
             "agent-descendant".to_string()
         },
         session_id: None,
-        user_id: if user.is_empty() { None } else { Some(user.clone()) },
+        user_id: if user.is_empty() {
+            None
+        } else {
+            Some(user.clone())
+        },
         source: Source {
             collector: "windows_etw".to_string(),
             probe: "Microsoft-Windows-Kernel-File/Create".to_string(),
@@ -848,7 +907,7 @@ fn emit_file_write(
                 cmdline,
                 cwd: String::new(),
                 user,
-                integrity_level: enrich::query_integrity_level(pid),
+                integrity_level,
                 parent_chain,
                 agent_root_pid,
             },
@@ -892,7 +951,7 @@ fn handle_network_event(
     locator: &SchemaLocator,
     host_id: Option<&str>,
     state: &Arc<Mutex<SharedState>>,
-    emit: &Arc<Mutex<Box<dyn FnMut(Event) + Send>>>,
+    emit: &EmitSink,
 ) -> Result<()> {
     let evid = record.event_id();
     if evid != EVENT_ID_TCP_CONNECT_V4 && evid != EVENT_ID_TCP_CONNECT_V6 {
@@ -964,14 +1023,10 @@ fn handle_network_event(
 
     // Prefer the ProcessStart cache (see the file handler) over a live query
     // that would race a short-lived child's exit.
+    let (immediate_parent, parent_chain, integrity_level) =
+        resolve_proc_topology(pid, cached.as_ref());
     let (process_name, image_path, cmdline, user, start_time_ticks) =
         resolve_proc_identity(pid, cached);
-    let immediate_parent = enrich::ancestor_pids(pid, 1).first().copied().unwrap_or(0);
-    let parent_chain = if immediate_parent != 0 {
-        enrich::parent_chain(immediate_parent, 16)
-    } else {
-        Vec::new()
-    };
 
     let (dest_ip, dest_port) = match &endpoint {
         Endpoint::V4 { ip, port } => (ip.to_string(), *port),
@@ -992,7 +1047,11 @@ fn handle_network_event(
             "agent-descendant".to_string()
         },
         session_id: None,
-        user_id: if user.is_empty() { None } else { Some(user.clone()) },
+        user_id: if user.is_empty() {
+            None
+        } else {
+            Some(user.clone())
+        },
         source: Source {
             collector: "windows_etw".to_string(),
             probe: "Microsoft-Windows-Kernel-Network/TcpIp-Connect".to_string(),
@@ -1008,7 +1067,7 @@ fn handle_network_event(
                 cmdline,
                 cwd: String::new(),
                 user,
-                integrity_level: enrich::query_integrity_level(pid),
+                integrity_level,
                 parent_chain,
                 agent_root_pid,
             },
@@ -1056,7 +1115,7 @@ fn handle_dns_event(
     locator: &SchemaLocator,
     host_id: Option<&str>,
     state: &Arc<Mutex<SharedState>>,
-    emit: &Arc<Mutex<Box<dyn FnMut(Event) + Send>>>,
+    emit: &EmitSink,
 ) -> Result<()> {
     if record.event_id() != EVENT_ID_DNS_QUERY_COMPLETE {
         return Ok(());
@@ -1080,7 +1139,11 @@ fn handle_dns_event(
         };
         let cached = st.proc_info.get(&(pid as i32)).cloned();
         st.events_emitted += 1;
-        (Some(rec.agent_root.pid), rec.agent_root.pid == pid as i32, cached)
+        (
+            Some(rec.agent_root.pid),
+            rec.agent_root.pid == pid as i32,
+            cached,
+        )
     };
 
     // Only now — for an enrolled process — do the costly schema lookup + parse.
@@ -1096,14 +1159,10 @@ fn handle_dns_event(
     let qtype: u32 = parser.try_parse("QueryType").unwrap_or(0);
     let query_results: String = parser.try_parse("QueryResults").unwrap_or_default();
 
+    let (immediate_parent, parent_chain, integrity_level) =
+        resolve_proc_topology(pid, cached.as_ref());
     let (process_name, image_path, cmdline, user, start_time_ticks) =
         resolve_proc_identity(pid, cached);
-    let immediate_parent = enrich::ancestor_pids(pid, 1).first().copied().unwrap_or(0);
-    let parent_chain = if immediate_parent != 0 {
-        enrich::parent_chain(immediate_parent, 16)
-    } else {
-        Vec::new()
-    };
 
     let query_name = query_name_raw.trim_end_matches('.').to_lowercase();
     let answers = parse_dns_results(&query_results);
@@ -1121,7 +1180,11 @@ fn handle_dns_event(
             "agent-descendant".to_string()
         },
         session_id: None,
-        user_id: if user.is_empty() { None } else { Some(user.clone()) },
+        user_id: if user.is_empty() {
+            None
+        } else {
+            Some(user.clone())
+        },
         source: Source {
             collector: "windows_etw".to_string(),
             probe: "Microsoft-Windows-DNS-Client/QueryComplete".to_string(),
@@ -1137,7 +1200,7 @@ fn handle_dns_event(
                 cmdline,
                 cwd: String::new(),
                 user,
-                integrity_level: enrich::query_integrity_level(pid),
+                integrity_level,
                 parent_chain,
                 agent_root_pid,
             },
@@ -1200,9 +1263,8 @@ fn parse_dns_results(results: &str) -> Vec<String> {
                 Some(rest) => {
                     let after_num = rest
                         .trim_start()
-                        .splitn(2, char::is_whitespace)
-                        .nth(1)
-                        .unwrap_or("")
+                        .split_once(char::is_whitespace)
+                        .map_or("", |(_, value)| value)
                         .trim();
                     if after_num.is_empty() {
                         None
@@ -1255,7 +1317,7 @@ fn resolve_enrollment_for_pid(pid: u32, st: &mut SharedState) -> Option<Enrollme
 /// Handles both `\` (NT path) and `/` (some ETW providers emit forward
 /// slashes for the device prefix).
 fn image_basename(path: &str) -> String {
-    path.rsplit_once(|c| c == '\\' || c == '/')
+    path.rsplit_once(['\\', '/'])
         .map(|(_, base)| base.to_string())
         .unwrap_or_else(|| path.to_string())
 }
@@ -1281,8 +1343,14 @@ mod tests {
 
     #[test]
     fn image_basename_strips_nt_path() {
-        assert_eq!(image_basename(r"C:\Windows\System32\notepad.exe"), "notepad.exe");
-        assert_eq!(image_basename(r"\Device\HarddiskVolume3\notepad.exe"), "notepad.exe");
+        assert_eq!(
+            image_basename(r"C:\Windows\System32\notepad.exe"),
+            "notepad.exe"
+        );
+        assert_eq!(
+            image_basename(r"\Device\HarddiskVolume3\notepad.exe"),
+            "notepad.exe"
+        );
         assert_eq!(image_basename("notepad.exe"), "notepad.exe");
     }
 

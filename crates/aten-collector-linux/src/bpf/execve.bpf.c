@@ -25,14 +25,32 @@ struct exec_event {
     __u64 timestamp_ns;
     __u32 pid;
     __u32 uid;
+    __u32 kind;
     char comm[TASK_COMM_LEN];
     char filename[MAX_FILENAME_LEN];
 };
+
+#define EVENT_EXEC 1
+#define EVENT_EXIT 2
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);
 } events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} dropped_events SEC(".maps");
+
+static __always_inline void count_drop(void) {
+    __u32 key = 0;
+    __u64 *count = bpf_map_lookup_elem(&dropped_events, &key);
+    if (count)
+        (*count)++;
+}
 
 // Layout of the sched/sched_process_exec tracepoint args.
 // Format is stable across kernels and documented at
@@ -48,14 +66,14 @@ SEC("tracepoint/sched/sched_process_exec")
 int handle_exec(struct sched_exec_tp_args *ctx) {
     struct exec_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
     if (!event) {
-        // Ringbuf full. v0.x: drop and move on. v1.x should count drops via a
-        // counter map so we can surface "you're losing events" in the daemon log.
+        count_drop();
         return 0;
     }
 
     event->timestamp_ns = bpf_ktime_get_boot_ns();
     event->pid = bpf_get_current_pid_tgid() >> 32;
     event->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event->kind = EVENT_EXEC;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
     // The filename lives at ctx + (data_loc_filename & 0xFFFF). The high 16
@@ -65,6 +83,24 @@ int handle_exec(struct sched_exec_tp_args *ctx) {
     bpf_probe_read_kernel_str(event->filename, sizeof(event->filename),
                               (void *)ctx + filename_off);
 
+    bpf_ringbuf_submit(event, 0);
+    return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exit")
+int handle_exit(void *ctx) {
+    struct exec_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+    if (!event) {
+        count_drop();
+        return 0;
+    }
+
+    event->timestamp_ns = bpf_ktime_get_boot_ns();
+    event->pid = bpf_get_current_pid_tgid() >> 32;
+    event->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event->kind = EVENT_EXIT;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+    event->filename[0] = '\0';
     bpf_ringbuf_submit(event, 0);
     return 0;
 }

@@ -6,15 +6,14 @@
 //! Unlike the Linux collector (which polls a ringbuf inline on the calling
 //! thread), the macOS event producers run on threads we don't own — the ESF
 //! framework's dispatch queue and the netflow IPC listener thread. So this
-//! takes the *Windows* shape of the contract (`F: FnMut(Event) + Send +
-//! 'static`). All producers funnel finished `Event`s through a bounded
+//! All producers funnel finished `Event`s through a bounded
 //! `mpsc::sync_channel` to a single consumer — the calling thread — which is
 //! the only place `emit` and `tick` are ever called. No `Mutex` around `emit`,
-//! no lock contention on the hot path.
+//! no lock contention on the hot path, and the callbacks need not be `Send`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,7 +43,14 @@ pub struct SharedState {
     pub table: EnrollmentTable,
     /// Fast path: bare pid → key, so the hot handlers skip the libproc walk.
     pub pid_to_key: HashMap<i32, ProcessKey>,
+    pub(crate) proc_cache: HashMap<ProcessKey, CachedProcess>,
     pub events_seen: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedProcess {
+    pub snapshot: ProcSnapshot,
+    pub parent_chain: Vec<aten_schema::ParentChainEntry>,
 }
 
 impl SharedState {
@@ -52,6 +58,7 @@ impl SharedState {
         Self {
             table: EnrollmentTable::new(),
             pid_to_key: HashMap::new(),
+            proc_cache: HashMap::new(),
             events_seen: 0,
         }
     }
@@ -68,10 +75,11 @@ pub enum Msg {
 /// Drain at most this many events before yielding to `tick()`, so an event
 /// flood can't starve the daemon's transcript refresh.
 const DRAIN_BATCH: usize = 256;
+const PROCESS_CACHE_CAP: usize = 16_384;
 
 pub fn run<F>(config: CollectorConfig, stop: Arc<AtomicBool>, emit: F) -> Result<()>
 where
-    F: FnMut(Event) + Send + 'static,
+    F: FnMut(Event),
 {
     run_with_tick(config, stop, emit, || {})
 }
@@ -83,16 +91,20 @@ pub fn run_with_tick<F, T>(
     mut tick: T,
 ) -> Result<()>
 where
-    F: FnMut(Event) + Send + 'static,
+    F: FnMut(Event),
     T: FnMut(),
 {
     let (tx, rx) = mpsc::sync_channel::<Msg>(4096);
     let state = Arc::new(Mutex::new(SharedState::new()));
+    let dropped = Arc::new(AtomicU64::new(0));
 
     // Seed already-running agents — ESF NOTIFY_EXEC only fires post-subscribe.
     {
         let mut st = state.lock().expect("state lock");
-        let seeded = procinfo::rundown(&config.enrolled_agents, &mut st.table, &mut st.pid_to_key);
+        let SharedState {
+            table, pid_to_key, ..
+        } = &mut *st;
+        let seeded = procinfo::rundown(&config.enrolled_agents, table, pid_to_key);
         eprintln!("aten-macos: enrollment rundown seeded {seeded} agent root(s)");
     }
 
@@ -100,7 +112,7 @@ where
     // the netflow path can still run where ESF is denied.
     #[cfg(feature = "esf")]
     let _es_guard = {
-        match crate::esf::start(config.clone(), state.clone(), tx.clone()) {
+        match crate::esf::start(config.clone(), state.clone(), tx.clone(), dropped.clone()) {
             Ok(guard) => Some(guard),
             Err(e) => {
                 // NOT_PERMITTED (missing entitlement) is the common case in
@@ -112,7 +124,13 @@ where
     };
 
     // Network producer (sysext flows over UDS).
-    let _ipc_guard = netflow_ipc::spawn(config.clone(), state.clone(), tx.clone(), stop.clone())?;
+    let _ipc_guard = netflow_ipc::spawn(
+        config.clone(),
+        state.clone(),
+        tx.clone(),
+        stop.clone(),
+        dropped.clone(),
+    )?;
 
     eprintln!(
         "aten-macos: collector started (agents = {:?})",
@@ -151,6 +169,10 @@ where
             tick();
             last_tick = Instant::now();
         }
+    }
+    let dropped = dropped.load(Ordering::Relaxed);
+    if dropped > 0 {
+        eprintln!("aten-macos: producer queue dropped {dropped} event(s) total");
     }
     Ok(())
     // _es_guard and _ipc_guard drop here: ESF unsubscribes, IPC thread joins.
@@ -193,6 +215,36 @@ pub fn resolve_enrollment(pid: i32, state: &mut SharedState) -> Option<Enrollmen
         current = procinfo::snapshot(ppid);
     }
     None
+}
+
+pub(crate) fn process_enrichment(pid: i32, state: &Arc<Mutex<SharedState>>) -> CachedProcess {
+    if let Ok(guard) = state.lock() {
+        if let Some(key) = guard.pid_to_key.get(&pid).copied() {
+            if let Some(cached) = guard.proc_cache.get(&key) {
+                return cached.clone();
+            }
+        }
+    }
+    // libproc and NSS calls happen without the shared-state lock held.
+    let snapshot = procinfo::snapshot(pid);
+    let parent_chain = procinfo::parent_chain(pid, 16);
+    let cached = CachedProcess {
+        snapshot: snapshot.clone(),
+        parent_chain,
+    };
+    if snapshot.start_time_ticks != 0 {
+        let key = ProcessKey {
+            pid,
+            start_time_ticks: snapshot.start_time_ticks,
+        };
+        if let Ok(mut guard) = state.lock() {
+            if guard.proc_cache.len() >= PROCESS_CACHE_CAP {
+                guard.proc_cache.clear();
+            }
+            guard.proc_cache.insert(key, cached.clone());
+        }
+    }
+    cached
 }
 
 /// Build a `Process` block from a libproc snapshot. Used by the open and
@@ -256,7 +308,11 @@ pub fn monotonic_ns() -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    Some((ts.tv_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(ts.tv_nsec as u64))
+    Some(
+        (ts.tv_sec as u64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(ts.tv_nsec as u64),
+    )
 }
 
 #[cfg(test)]

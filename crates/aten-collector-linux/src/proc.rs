@@ -30,6 +30,38 @@ pub struct ProcSnapshot {
     pub start_time_ticks: u64,
 }
 
+/// Minimal process-tree fields used once at collector startup to seed agents
+/// that predate the eBPF attachment. Avoids cwd/cmdline/user reads for every
+/// host process during rundown.
+#[derive(Debug, Clone)]
+pub struct ProcIdentity {
+    pub pid: i32,
+    pub ppid: i32,
+    pub comm: String,
+    pub start_time_ticks: u64,
+}
+
+pub fn process_tree() -> Vec<ProcIdentity> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_string_lossy().parse::<i32>().ok()?;
+            let root = entry.path();
+            let comm = read_trim(root.join("comm"));
+            let (ppid, start_time_ticks) = parse_stat(root.join("stat"));
+            (start_time_ticks != 0).then_some(ProcIdentity {
+                pid,
+                ppid,
+                comm,
+                start_time_ticks,
+            })
+        })
+        .collect()
+}
+
 pub fn snapshot(pid: i32) -> ProcSnapshot {
     let root = PathBuf::from(format!("/proc/{pid}"));
     let comm = read_trim(root.join("comm"));
@@ -152,7 +184,10 @@ fn parse_stat(path: PathBuf) -> (i32, u64) {
     let fields: Vec<&str> = after.split_whitespace().collect();
     // After the comm, /proc/<pid>/stat field 3 (state) starts at index 0.
     // PPid is field 4 → index 1; starttime is field 22 → index 19.
-    let ppid = fields.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+    let ppid = fields
+        .get(1)
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(0);
     let start_time = fields
         .get(19)
         .and_then(|s| s.parse::<u64>().ok())

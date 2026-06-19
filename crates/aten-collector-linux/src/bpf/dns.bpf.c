@@ -16,6 +16,7 @@
 // AAAA together) so userspace tags these `Other`; and the resolved answers
 // would require a uretprobe walking `struct addrinfo` — left for later, the
 // schema's `answers` field is best-effort and stays empty on Linux for now.
+// A BPF-side PID map drops non-agent calls before reading user memory.
 //
 // We avoid vmlinux.h (same as the other probes). A uprobe's context IS a
 // `struct pt_regs`, so we hand-define the layout per arch and read the first
@@ -93,6 +94,50 @@ struct {
     __uint(max_entries, 256 * 1024);
 } dns_events SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} dropped_events SEC(".maps");
+
+static __always_inline void count_drop(void) {
+    __u32 key = 0;
+    __u64 *count = bpf_map_lookup_elem(&dropped_events, &key);
+    if (count)
+        (*count)++;
+}
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 16384);
+    __type(key, __u32);
+    __type(value, __u8);
+} enrolled_pids SEC(".maps");
+
+struct sched_fork_args {
+    __u64 __unused_pad;
+    char parent_comm[TASK_COMM_LEN];
+    __s32 parent_pid;
+    char child_comm[TASK_COMM_LEN];
+    __s32 child_pid;
+};
+
+SEC("tracepoint/sched/sched_process_fork")
+int track_fork(struct sched_fork_args *ctx) {
+    __u8 *enrolled = bpf_map_lookup_elem(&enrolled_pids, &ctx->parent_pid);
+    if (enrolled)
+        bpf_map_update_elem(&enrolled_pids, &ctx->child_pid, enrolled, BPF_ANY);
+    return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exit")
+int forget_exit(void *ctx) {
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_map_delete_elem(&enrolled_pids, &pid);
+    return 0;
+}
+
 // bpf_copy_from_user_str is a kfunc (kernel >= 6.11), not a classic helper, so
 // it's absent from libbpf's bundled bpf_helper_defs.h. Declare it as a __ksym
 // extern (signature cross-checked against this kernel's BTF); libbpf resolves
@@ -115,6 +160,10 @@ extern int bpf_copy_from_user_str(void *dst, __u32 dst__sz,
 // copy fixes both. Requires kernel >= 6.11 for bpf_copy_from_user_str.
 SEC("uprobe.s")
 int handle_getaddrinfo(struct pt_regs *ctx) {
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (!bpf_map_lookup_elem(&enrolled_pids, &pid)) {
+        return 0;
+    }
     const char *node = (const char *)ATEN_UPROBE_ARG0(ctx);
     if (!node) {
         return 0; // getaddrinfo(NULL, service, ...) — a service-only lookup
@@ -122,10 +171,11 @@ int handle_getaddrinfo(struct pt_regs *ctx) {
 
     struct dns_event *e = bpf_ringbuf_reserve(&dns_events, sizeof(*e), 0);
     if (!e) {
+        count_drop();
         return 0;
     }
     e->timestamp_ns = bpf_ktime_get_boot_ns();
-    e->pid = bpf_get_current_pid_tgid() >> 32;
+    e->pid = pid;
     e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
 

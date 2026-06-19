@@ -8,9 +8,11 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
 use aten_schema::{Event, EventKind, Origin, Role};
 use aten_transcript::IdentifierIndex;
+use chrono::{DateTime, Utc};
+
+const MAX_CACHED_INTENT_CHARS: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ToolCallEntry {
@@ -49,9 +51,6 @@ pub struct SessionState {
     /// field on kernel events.
     pub user_prompts: Vec<UserPromptEntry>,
     pub identifier_index: IdentifierIndex,
-    /// Tracks how many events from the transcript have been folded in. New
-    /// refreshes only look at events past this cursor.
-    pub processed_event_count: usize,
 }
 
 impl SessionState {
@@ -62,31 +61,20 @@ impl SessionState {
             cwd,
             ..Default::default()
         };
-        s.refresh(events);
+        s.ingest(events);
         s
     }
 
-    /// Update state from the current full event list. Append-only:
-    /// only events past `processed_event_count` get folded into
-    /// `tool_calls`. The identifier index is rebuilt from the full list
-    /// (cheap on dev-endpoint transcript sizes) so it always reflects
-    /// every prompt and tool_result ever seen.
-    ///
-    /// **Invariant**: `processed_event_count` always equals the full
-    /// event list's length after a successful refresh — so the next
-    /// call sees an accurate cursor. A prior version mistakenly set it
-    /// to the delta size, which caused the engine to re-emit older
-    /// events to the JSONL on every subsequent refresh (the "prompt
-    /// appears 5 times" symptom).
-    pub fn refresh(&mut self, events: &[Event]) {
-        if events.len() <= self.processed_event_count {
-            return;
-        }
-        for ev in &events[self.processed_event_count..] {
+    /// Fold a newly parsed event batch into this session. Callers pass only
+    /// appended transcript records, so work and allocation scale with the
+    /// delta rather than the lifetime size of the session.
+    pub fn ingest(&mut self, events: &[Event]) {
+        for ev in events {
             match &ev.kind {
                 EventKind::ToolCall(tc) => {
                     let ts_ns = parse_rfc3339_ns(&ev.timestamp).unwrap_or(i64::MAX);
-                    let input_text = tc.tool_input.to_string();
+                    let input_text =
+                        bounded_chars(&tc.tool_input.to_string(), MAX_CACHED_INTENT_CHARS);
                     self.tool_calls.push(ToolCallEntry {
                         id: tc.tool_call_id.clone(),
                         name: tc.tool_name.clone(),
@@ -98,21 +86,14 @@ impl SessionState {
                 EventKind::Prompt(p) if matches!(p.role, Role::User) => {
                     let ts_ns = parse_rfc3339_ns(&ev.timestamp).unwrap_or(i64::MAX);
                     self.user_prompts.push(UserPromptEntry {
-                        text: p.prompt_text.clone(),
+                        text: bounded_chars(&p.prompt_text, MAX_CACHED_INTENT_CHARS),
                         timestamp_ns: ts_ns,
                     });
                 }
                 _ => {}
             }
         }
-        self.tool_calls.sort_by_key(|tc| tc.timestamp_ns);
-        self.user_prompts.sort_by_key(|p| p.timestamp_ns);
-        // Incremental: only fold in the events new since the last refresh. The
-        // transcript is append-only (same contract as the loop above), so this
-        // avoids re-extracting the whole transcript every tick (O(n²)).
-        self.identifier_index
-            .ingest(&events[self.processed_event_count..], None);
-        self.processed_event_count = events.len();
+        self.identifier_index.ingest(events, None);
     }
 
     /// Most-recent user prompt with timestamp <= `event_ns`. Returns None
@@ -164,6 +145,14 @@ impl SessionState {
     }
 }
 
+fn bounded_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        text.chars().take(max).collect()
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OriginsFound {
     pub user_message: bool,
@@ -176,10 +165,9 @@ pub fn parse_rfc3339_ns(s: &str) -> Option<i64> {
     dt.timestamp_nanos_opt()
 }
 
-/// Read a transcript JSONL file and return (session_id, events). Picks the
-/// parser based on `dialect` — Claude Code's per-line format or Codex's
-/// session_meta-rooted envelope. Used by the engine to rebuild its session
-/// set on each refresh tick.
+/// Read a transcript JSONL file and return (session_id, events). Retained for
+/// one-shot callers; the attribution engine uses `TranscriptStreamParser` and
+/// byte offsets for live tailing.
 ///
 /// `Platform` is derived from the build target — events get stamped with
 /// the OS the *daemon* is running on, not the OS embedded in the transcript
@@ -248,9 +236,27 @@ mod tests {
     fn attribute_at_picks_most_recent_le() {
         let s = SessionState {
             tool_calls: vec![
-                ToolCallEntry { id: "t1".into(), name: "Bash".into(), input_text: "".into(), input_text_lower: "".into(), timestamp_ns: 100 },
-                ToolCallEntry { id: "t2".into(), name: "Bash".into(), input_text: "".into(), input_text_lower: "".into(), timestamp_ns: 200 },
-                ToolCallEntry { id: "t3".into(), name: "Bash".into(), input_text: "".into(), input_text_lower: "".into(), timestamp_ns: 300 },
+                ToolCallEntry {
+                    id: "t1".into(),
+                    name: "Bash".into(),
+                    input_text: "".into(),
+                    input_text_lower: "".into(),
+                    timestamp_ns: 100,
+                },
+                ToolCallEntry {
+                    id: "t2".into(),
+                    name: "Bash".into(),
+                    input_text: "".into(),
+                    input_text_lower: "".into(),
+                    timestamp_ns: 200,
+                },
+                ToolCallEntry {
+                    id: "t3".into(),
+                    name: "Bash".into(),
+                    input_text: "".into(),
+                    input_text_lower: "".into(),
+                    timestamp_ns: 300,
+                },
             ],
             ..Default::default()
         };

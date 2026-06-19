@@ -26,6 +26,11 @@ mod service;
 mod service_linux;
 mod sink;
 
+const MAX_PENDING_EVENTS: usize = 8_192;
+
+#[cfg(target_os = "windows")]
+type ConsoleHandler = std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>;
+
 /// Merged inputs for a daemon run, after layering CLI flags over the
 /// config file. Returned from `resolve_daemon_inputs` so the two
 /// platform-specific `run_daemon` impls share parsing logic.
@@ -62,14 +67,13 @@ pub(crate) fn resolve_daemon_inputs(
     transcript_paths.extend(cli_transcripts);
     transcript_paths.extend(cli_watch_dirs);
 
+    let configured_agents = if cfg.daemon.agents.is_empty() {
+        None
+    } else {
+        Some(cfg.daemon.agents)
+    };
     let agents = cli_agents
-        .or_else(|| {
-            if cfg.daemon.agents.is_empty() {
-                None
-            } else {
-                Some(cfg.daemon.agents)
-            }
-        })
+        .or(configured_agents)
         .unwrap_or_else(|| default_agents.iter().map(|s| s.to_string()).collect());
 
     let out_path = cli_out.or(cfg.output.file_path);
@@ -268,7 +272,15 @@ fn main() -> Result<()> {
             duration_secs,
             out,
             sink,
-        } => run_daemon(config, transcript, watch_dir, agents, duration_secs, out, sink)?,
+        } => run_daemon(
+            config,
+            transcript,
+            watch_dir,
+            agents,
+            duration_secs,
+            out,
+            sink,
+        )?,
         #[cfg(target_os = "windows")]
         Command::Install => service::install_service()?,
         #[cfg(target_os = "windows")]
@@ -346,6 +358,7 @@ pub(crate) fn run_daemon_loop_windows(
     inputs: DaemonInputs,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -414,8 +427,10 @@ pub(crate) fn run_daemon_loop_windows(
     // is FIFO by received_at.
     let pending: Arc<Mutex<std::collections::VecDeque<(Instant, aten_schema::Event)>>> =
         Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let pending_dropped = Arc::new(AtomicU64::new(0));
 
     let pending_emit = pending.clone();
+    let dropped_emit = pending_dropped.clone();
     let engine_tick = engine.clone();
     let pending_tick = pending.clone();
     let sink_tick = sink.clone();
@@ -428,7 +443,14 @@ pub(crate) fn run_daemon_loop_windows(
             // the tick callback below, where transcript refresh has had
             // a chance to fold in new tool_calls.
             let mut q = pending_emit.lock().expect("pending lock");
-            q.push_back((Instant::now(), event));
+            if q.len() >= MAX_PENDING_EVENTS {
+                let dropped = dropped_emit.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped.is_power_of_two() {
+                    eprintln!("aten: pending attribution queue full; dropped {dropped} event(s)");
+                }
+            } else {
+                q.push_back((Instant::now(), event));
+            }
         },
         || {
             // Transcript refresh tick.
@@ -499,6 +521,11 @@ pub(crate) fn run_daemon_loop_windows(
         }
         s.flush();
     }
+    engine.lock().expect("engine lock").flush_state()?;
+    let dropped = pending_dropped.load(Ordering::Relaxed);
+    if dropped > 0 {
+        eprintln!("aten: pending attribution queue dropped {dropped} event(s) total");
+    }
 
     eprintln!("aten daemon stopped");
     Ok(())
@@ -515,9 +542,7 @@ fn run_collect_windows(
     use std::sync::Arc;
 
     let cfg = aten_collector_windows::CollectorConfig {
-        enrolled_agents: agents.unwrap_or_else(|| {
-            vec!["claude.exe".into(), "codex.exe".into()]
-        }),
+        enrolled_agents: agents.unwrap_or_else(|| vec!["claude.exe".into(), "codex.exe".into()]),
         host_id: read_machine_guid_windows(),
     };
 
@@ -606,13 +631,13 @@ fn read_machine_guid_windows() -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn ctrlc_set_handler<F: FnMut() + Send + 'static>(mut handler: F) {
+fn ctrlc_set_handler<F: FnMut() + Send + 'static>(handler: F) {
     // Minimal Ctrl-C handler using Windows SetConsoleCtrlHandler. We avoid
     // adding the `ctrlc` crate since one boolean toggle is the entire job.
     use std::sync::OnceLock;
-    static HANDLER: OnceLock<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>> = OnceLock::new();
+    static HANDLER: OnceLock<ConsoleHandler> = OnceLock::new();
     let slot = HANDLER.get_or_init(|| std::sync::Mutex::new(None));
-    *slot.lock().expect("ctrlc slot") = Some(Box::new(move || handler()));
+    *slot.lock().expect("ctrlc slot") = Some(Box::new(handler));
 
     unsafe extern "system" fn raw(_ctrl_type: u32) -> windows::core::BOOL {
         if let Some(slot) = HANDLER.get() {
@@ -636,14 +661,11 @@ fn run_collect_linux(
     duration_secs: Option<u64>,
     out: Option<PathBuf>,
 ) -> Result<()> {
-    use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     let cfg = aten_collector_linux::CollectorConfig {
-        enrolled_agents: agents.unwrap_or_else(|| {
-            vec!["claude".into(), "codex".into()]
-        }),
+        enrolled_agents: agents.unwrap_or_else(|| vec!["claude".into(), "codex".into()]),
         host_id: read_machine_id(),
     };
 
@@ -681,20 +703,18 @@ fn run_collect_linux(
         });
     }
 
-    let sink: Box<dyn Write + Send> = match out {
-        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
-        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
-    };
+    let sink = sink::build_sink(sink::SinkKind::Jsonl, out.as_deref())?;
     let sink = std::sync::Mutex::new(sink);
 
-    eprintln!("aten collector starting (agents = {:?})", cfg.enrolled_agents);
+    eprintln!(
+        "aten collector starting (agents = {:?})",
+        cfg.enrolled_agents
+    );
 
     aten_collector_linux::run(cfg, stop, |event| {
         let mut s = sink.lock().expect("sink lock");
-        if let Ok(line) = serde_json::to_string(&event) {
-            let _ = writeln!(s, "{line}");
-            let _ = s.flush();
-        }
+        s.emit(&event);
+        s.flush();
     })?;
 
     eprintln!("aten collector stopped");
@@ -731,8 +751,7 @@ fn run_daemon(
     out: Option<PathBuf>,
     sink: Option<String>,
 ) -> Result<()> {
-    use std::cell::RefCell;
-    use std::io::Write;
+    use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -779,20 +798,7 @@ fn run_daemon(
         });
     }
 
-    let sink: Box<dyn Write + Send> = match inputs.out_path {
-        Some(ref path) => {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            Box::new(std::io::BufWriter::new(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?,
-            ))
-        }
-        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
-    };
+    let sink = sink::build_sink(inputs.sink_kind, inputs.out_path.as_deref())?;
     let sink = std::sync::Mutex::new(sink);
 
     // 100ms refresh tick + 500ms attribution buffer. See the matching
@@ -813,6 +819,7 @@ fn run_daemon(
     let last_refresh = std::cell::Cell::new(Instant::now());
     let pending: std::cell::RefCell<std::collections::VecDeque<(Instant, aten_schema::Event)>> =
         std::cell::RefCell::new(std::collections::VecDeque::new());
+    let pending_dropped = Cell::new(0u64);
 
     eprintln!(
         "aten daemon starting (agents = {:?}, transcript sources = {}, sessions loaded = {})",
@@ -827,7 +834,16 @@ fn run_daemon(
         |event| {
             // Enqueue; attribution + sink write happen in the tick
             // callback after the attribution_delay window has elapsed.
-            pending.borrow_mut().push_back((Instant::now(), event));
+            let mut queue = pending.borrow_mut();
+            if queue.len() >= MAX_PENDING_EVENTS {
+                let dropped = pending_dropped.get().saturating_add(1);
+                pending_dropped.set(dropped);
+                if dropped.is_power_of_two() {
+                    eprintln!("aten: pending attribution queue full; dropped {dropped} event(s)");
+                }
+            } else {
+                queue.push_back((Instant::now(), event));
+            }
         },
         || {
             if last_refresh.get().elapsed() >= refresh_every {
@@ -841,11 +857,9 @@ fn run_daemon(
                     if !new_events.is_empty() {
                         let mut s = sink.lock().expect("sink lock");
                         for ev in new_events {
-                            if let Ok(line) = serde_json::to_string(&ev) {
-                                let _ = writeln!(s, "{line}");
-                            }
+                            s.emit(&ev);
                         }
-                        let _ = s.flush();
+                        s.flush();
                     }
                 }
                 last_refresh.set(Instant::now());
@@ -871,11 +885,9 @@ fn run_daemon(
                 let mut s = sink.lock().expect("sink lock");
                 for mut ev in drained {
                     eng.attribute(&mut ev);
-                    if let Ok(line) = serde_json::to_string(&ev) {
-                        let _ = writeln!(s, "{line}");
-                    }
+                    s.emit(&ev);
                 }
-                let _ = s.flush();
+                s.flush();
             }
         },
     )?;
@@ -888,11 +900,16 @@ fn run_daemon(
         let mut s = sink.lock().expect("sink lock");
         for mut ev in remaining {
             eng.attribute(&mut ev);
-            if let Ok(line) = serde_json::to_string(&ev) {
-                let _ = writeln!(s, "{line}");
-            }
+            s.emit(&ev);
         }
-        let _ = s.flush();
+        s.flush();
+    }
+    engine.borrow_mut().flush_state()?;
+    if pending_dropped.get() > 0 {
+        eprintln!(
+            "aten: pending attribution queue dropped {} event(s) total",
+            pending_dropped.get()
+        );
     }
 
     eprintln!("aten daemon stopped");
@@ -975,13 +992,11 @@ fn run_collect_macos(
     duration_secs: Option<u64>,
     out: Option<PathBuf>,
 ) -> Result<()> {
-    use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     let cfg = aten_collector_macos::CollectorConfig {
-        enrolled_agents: agents
-            .unwrap_or_else(|| vec!["claude".into(), "codex".into()]),
+        enrolled_agents: agents.unwrap_or_else(|| vec!["claude".into(), "codex".into()]),
         host_id: macos_host_id(),
     };
 
@@ -995,10 +1010,7 @@ fn run_collect_macos(
         });
     }
 
-    let sink: Box<dyn Write + Send> = match out {
-        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
-        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
-    };
+    let sink = sink::build_sink(sink::SinkKind::Jsonl, out.as_deref())?;
     let sink = std::sync::Mutex::new(sink);
 
     eprintln!(
@@ -1008,10 +1020,8 @@ fn run_collect_macos(
 
     aten_collector_macos::run(cfg, stop, move |event| {
         let mut s = sink.lock().expect("sink lock");
-        if let Ok(line) = serde_json::to_string(&event) {
-            let _ = writeln!(s, "{line}");
-            let _ = s.flush();
-        }
+        s.emit(&event);
+        s.flush();
     })?;
 
     eprintln!("aten collector stopped");
@@ -1028,8 +1038,7 @@ fn run_daemon(
     out: Option<PathBuf>,
     sink: Option<String>,
 ) -> Result<()> {
-    use std::cell::RefCell;
-    use std::io::Write;
+    use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1074,20 +1083,7 @@ fn run_daemon(
         });
     }
 
-    let sink: Box<dyn Write + Send> = match inputs.out_path {
-        Some(ref path) => {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            Box::new(std::io::BufWriter::new(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?,
-            ))
-        }
-        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
-    };
+    let sink = sink::build_sink(inputs.sink_kind, inputs.out_path.as_deref())?;
     let sink = std::sync::Mutex::new(sink);
 
     // Same 100ms refresh / 2s attribution buffer as the Linux daemon — see the
@@ -1098,6 +1094,7 @@ fn run_daemon(
     let last_refresh = std::cell::Cell::new(Instant::now());
     let pending: std::cell::RefCell<std::collections::VecDeque<(Instant, aten_schema::Event)>> =
         std::cell::RefCell::new(std::collections::VecDeque::new());
+    let pending_dropped = Cell::new(0u64);
 
     eprintln!(
         "aten daemon starting (agents = {:?}, transcript sources = {}, sessions loaded = {})",
@@ -1109,8 +1106,17 @@ fn run_daemon(
     aten_collector_macos::run_with_tick(
         cfg,
         stop,
-        move |event| {
-            pending.borrow_mut().push_back((Instant::now(), event));
+        |event| {
+            let mut queue = pending.borrow_mut();
+            if queue.len() >= MAX_PENDING_EVENTS {
+                let dropped = pending_dropped.get().saturating_add(1);
+                pending_dropped.set(dropped);
+                if dropped.is_power_of_two() {
+                    eprintln!("aten: pending attribution queue full; dropped {dropped} event(s)");
+                }
+            } else {
+                queue.push_back((Instant::now(), event));
+            }
         },
         || {
             if last_refresh.get().elapsed() >= refresh_every {
@@ -1124,11 +1130,9 @@ fn run_daemon(
                     if !new_events.is_empty() {
                         let mut s = sink.lock().expect("sink lock");
                         for ev in new_events {
-                            if let Ok(line) = serde_json::to_string(&ev) {
-                                let _ = writeln!(s, "{line}");
-                            }
+                            s.emit(&ev);
                         }
-                        let _ = s.flush();
+                        s.flush();
                     }
                 }
                 last_refresh.set(Instant::now());
@@ -1153,11 +1157,9 @@ fn run_daemon(
                 let mut s = sink.lock().expect("sink lock");
                 for mut ev in drained {
                     eng.attribute(&mut ev);
-                    if let Ok(line) = serde_json::to_string(&ev) {
-                        let _ = writeln!(s, "{line}");
-                    }
+                    s.emit(&ev);
                 }
-                let _ = s.flush();
+                s.flush();
             }
         },
     )?;
@@ -1169,11 +1171,16 @@ fn run_daemon(
         let mut s = sink.lock().expect("sink lock");
         for mut ev in remaining {
             eng.attribute(&mut ev);
-            if let Ok(line) = serde_json::to_string(&ev) {
-                let _ = writeln!(s, "{line}");
-            }
+            s.emit(&ev);
         }
-        let _ = s.flush();
+        s.flush();
+    }
+    engine.borrow_mut().flush_state()?;
+    if pending_dropped.get() > 0 {
+        eprintln!(
+            "aten: pending attribution queue dropped {} event(s) total",
+            pending_dropped.get()
+        );
     }
 
     eprintln!("aten daemon stopped");
@@ -1190,11 +1197,7 @@ fn detect_platform() -> Platform {
     }
 }
 
-fn run_transcript(
-    transcript: PathBuf,
-    out: Option<PathBuf>,
-    idx: Option<PathBuf>,
-) -> Result<()> {
+fn run_transcript(transcript: PathBuf, out: Option<PathBuf>, idx: Option<PathBuf>) -> Result<()> {
     let content = fs::read_to_string(&transcript)
         .with_context(|| format!("read {}", transcript.display()))?;
 

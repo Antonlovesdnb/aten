@@ -106,17 +106,7 @@ pub fn default_config_path() -> PathBuf {
 
 /// Default events-JSONL output path. Service mode uses this when neither
 /// the config file nor CLI flags name an output.
+#[cfg(target_os = "windows")]
 pub fn default_output_path() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        windows_program_data_dir().join("events.jsonl")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        PathBuf::from("/var/log/aten/events.jsonl")
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    {
-        PathBuf::from("./aten-events.jsonl")
-    }
+    windows_program_data_dir().join("events.jsonl")
 }

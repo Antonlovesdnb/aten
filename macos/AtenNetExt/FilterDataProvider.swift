@@ -63,10 +63,12 @@ final class FilterDataProvider: NEFilterDataProvider {
         // remoteEndpoint is an NWHostEndpoint carrying host + port as strings.
         guard let remote = flow.remoteEndpoint as? NWHostEndpoint else { return }
         let host = remote.hostname
+        guard !isLocalDestination(host) else { return }
         let port = UInt16(remote.port) ?? 0
         // socketProtocol is an IPPROTO_* value.
         let proto = (flow.socketProtocol == IPPROTO_UDP) ? "udp" : "tcp"
         let pid = pidFromAuditToken(flow.sourceAppAuditToken)
+        guard pid != 0 else { return }
 
         let rec = FlowRecord(
             v: wireVersion,
@@ -77,6 +79,15 @@ final class FilterDataProvider: NEFilterDataProvider {
             timestamp: iso.string(from: Date())
         )
         writer.send(rec)
+    }
+
+    private func isLocalDestination(_ host: String) -> Bool {
+        let value = host.lowercased()
+        return value == "localhost"
+            || value == "::1"
+            || value.hasPrefix("127.")
+            || value.hasPrefix("169.254.")
+            || value.hasPrefix("fe80:")
     }
 
     /// Derive the source PID from the flow's audit token. `sourceAppAuditToken`
@@ -99,9 +110,13 @@ final class FilterDataProvider: NEFilterDataProvider {
 /// connection, reconnecting lazily if the collector isn't up yet or the socket
 /// drops.
 final class FlowWriter {
+    private static let maxPendingFrames = 1024
     private let path: String
     private var fd: Int32 = -1
     private let queue = DispatchQueue(label: "ai.aten.netext.writer")
+    private let slots = DispatchSemaphore(value: FlowWriter.maxPendingFrames)
+    private let dropLock = NSLock()
+    private var dropped: UInt64 = 0
     private let encoder = JSONEncoder()
 
     init(path: String) {
@@ -109,7 +124,12 @@ final class FlowWriter {
     }
 
     func send(_ rec: FlowRecord) {
+        guard slots.wait(timeout: .now()) == .success else {
+            recordDrop()
+            return
+        }
         queue.async { [weak self] in
+            defer { self?.slots.signal() }
             guard let self = self else { return }
             if self.fd < 0 {
                 self.connect()
@@ -123,6 +143,16 @@ final class FlowWriter {
                 // Connection dropped — close and let the next send reconnect.
                 self.close()
             }
+        }
+    }
+
+    private func recordDrop() {
+        dropLock.lock()
+        dropped += 1
+        let count = dropped
+        dropLock.unlock()
+        if count.nonzeroBitCount == 1 {
+            log.error("netflow writer queue full; dropped \(count) flow(s)")
         }
     }
 

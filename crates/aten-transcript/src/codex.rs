@@ -55,27 +55,38 @@ pub fn read_codex_transcript(
 ) -> anyhow::Result<(Vec<Event>, IdentifierIndex)> {
     let mut events: Vec<Event> = Vec::new();
     let mut session_id: Option<String> = None;
+    let mut cwd: Option<String> = None;
     for (lineno, line) in transcript_jsonl.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let rec: CodexRecord = match serde_json::from_str(line) {
-            Ok(r) => r,
+        match parse_codex_line(line, platform, &mut session_id, &mut cwd) {
+            Ok(parsed) => events.extend(parsed),
             Err(e) => {
                 eprintln!("codex transcript line {}: bad json: {e}", lineno + 1);
                 continue;
             }
-        };
-        events.extend(parse_codex_record(&rec, &mut session_id, platform));
+        }
     }
     let index = build_identifier_index(&events, home);
     Ok((events, index))
 }
 
+pub(crate) fn parse_codex_line(
+    line: &str,
+    platform: Platform,
+    session_id: &mut Option<String>,
+    cwd: &mut Option<String>,
+) -> serde_json::Result<Vec<Event>> {
+    let rec: CodexRecord = serde_json::from_str(line)?;
+    Ok(parse_codex_record(&rec, session_id, cwd, platform))
+}
+
 fn parse_codex_record(
     rec: &CodexRecord,
     session_id: &mut Option<String>,
+    cwd: &mut Option<String>,
     platform: Platform,
 ) -> Vec<Event> {
     let mut out: Vec<Event> = Vec::new();
@@ -90,6 +101,9 @@ fn parse_codex_record(
         "session_meta" => {
             if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
                 *session_id = Some(id.to_string());
+            }
+            if let Some(value) = payload.get("cwd").and_then(|v| v.as_str()) {
+                *cwd = Some(value.to_string());
             }
         }
         "event_msg" => {
@@ -256,7 +270,11 @@ mod tests {
     #[test]
     fn parses_user_message_tool_call_and_result() {
         let (events, idx) = read_codex_transcript(SAMPLE, Platform::Windows, None).unwrap();
-        assert_eq!(events.len(), 3, "expected user prompt + tool_call + tool_result");
+        assert_eq!(
+            events.len(),
+            3,
+            "expected user prompt + tool_call + tool_result"
+        );
 
         // All events should carry the session id from session_meta.
         for e in &events {

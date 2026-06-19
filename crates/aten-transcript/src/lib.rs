@@ -33,6 +33,57 @@ pub enum TranscriptDialect {
     Codex,
 }
 
+/// Stateful line parser for a growing transcript. Codex records only carry
+/// the session id and cwd in the opening `session_meta` line, so retaining
+/// those fields is what lets callers parse appended bytes without replaying
+/// the file prefix on every refresh.
+#[derive(Debug)]
+pub struct TranscriptStreamParser {
+    dialect: TranscriptDialect,
+    platform: Platform,
+    session_id: Option<String>,
+    cwd: Option<String>,
+}
+
+impl TranscriptStreamParser {
+    pub fn new(dialect: TranscriptDialect, platform: Platform) -> Self {
+        Self {
+            dialect,
+            platform,
+            session_id: None,
+            cwd: None,
+        }
+    }
+
+    /// Parse one JSONL record. A successful metadata record can legitimately
+    /// return no events while still updating `session_id` or `cwd`.
+    pub fn parse_line(&mut self, line: &str) -> serde_json::Result<Vec<Event>> {
+        match self.dialect {
+            TranscriptDialect::ClaudeCode => {
+                let rec: TranscriptRecord = serde_json::from_str(line)?;
+                if let Some(session_id) = rec.session_id.as_ref() {
+                    self.session_id = Some(session_id.clone());
+                }
+                if let Some(cwd) = rec.cwd.as_ref() {
+                    self.cwd = Some(cwd.clone());
+                }
+                Ok(parse_record(&rec, self.platform))
+            }
+            TranscriptDialect::Codex => {
+                codex::parse_codex_line(line, self.platform, &mut self.session_id, &mut self.cwd)
+            }
+        }
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+}
+
 /// Heuristic dialect detection from the transcript path. Avoids reading
 /// the file when the location is unambiguous. Falls back to Claude Code
 /// for paths that don't match either pattern — preserving v0.x behavior.
@@ -77,6 +128,8 @@ struct TranscriptRecord {
     uuid: Option<String>,
     #[serde(default)]
     timestamp: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default)]
     message: Option<Message>,
 }
@@ -395,6 +448,7 @@ mod tests {
             session_id: Some("s1".to_string()),
             uuid: Some("u1".to_string()),
             timestamp: Some("2026-05-27T19:08:02.110Z".to_string()),
+            cwd: None,
             message: Some(Message { content }),
         }
     }
@@ -405,6 +459,7 @@ mod tests {
             session_id: Some("s1".to_string()),
             uuid: Some("a1".to_string()),
             timestamp: Some("2026-05-27T19:08:02.940Z".to_string()),
+            cwd: None,
             message: Some(Message { content }),
         }
     }
@@ -654,7 +709,9 @@ mod tests {
         // sanity: attacker.com gained both origins across the two chunks
         let a = &inc.entries["attacker.com"];
         assert_eq!(a.first_seen_origin, Origin::UserMessage);
-        assert!(a.origins.contains(&Origin::UserMessage) && a.origins.contains(&Origin::ToolResult));
+        assert!(
+            a.origins.contains(&Origin::UserMessage) && a.origins.contains(&Origin::ToolResult)
+        );
     }
 
     /// The DNS-exfil fingerprint: a bare hostname surfaces ONLY in a poisoned

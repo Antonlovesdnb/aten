@@ -19,6 +19,7 @@
 //! adjustment are tagged `VERIFY:` — event-type constant paths, the
 //! `set_runtime_version` location, and the `EventOpen` file accessor name.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
@@ -31,11 +32,8 @@ use aten_schema::{
     ProcessExecPayload, Source, SCHEMA_VERSION,
 };
 
+use endpoint_sec::sys::es_event_type_t;
 use endpoint_sec::{Client, Event as EsEvent, Message};
-// VERIFY: event-type constants live in the -sys crate, re-exported here.
-use endpoint_sec::sys::es_event_type_t::{
-    ES_EVENT_TYPE_NOTIFY_EXEC, ES_EVENT_TYPE_NOTIFY_OPEN,
-};
 
 use crate::macos_impl::{self, CollectorConfig, Msg, SharedState};
 use crate::procinfo;
@@ -52,21 +50,27 @@ pub fn start(
     config: CollectorConfig,
     state: Arc<Mutex<SharedState>>,
     tx: SyncSender<Msg>,
+    dropped: Arc<AtomicU64>,
 ) -> Result<EsfGuard> {
-    // VERIFY: required before any other ES call so version-gated accessors
-    // (e.g. EventExec::cwd) behave correctly.
-    endpoint_sec::version::set_runtime_version();
+    // Required before any other ES call so version-gated client operations
+    // match the host instead of endpoint-sec's conservative 10.15 default.
+    let (major, minor, patch) = macos_version();
+    endpoint_sec::version::set_runtime_version(major, minor, patch);
 
     let handler = move |_client: &mut Client<'_>, msg: Message| {
         // A panic inside the handler must not unwind into the ES framework.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle_message(&msg, &config, &state, &tx);
+            handle_message(&msg, &config, &state, &tx, &dropped);
         }));
     };
 
     let mut client = Client::new(handler).map_err(|e| anyhow!("es_new_client failed: {e:?}"))?;
     client
-        .subscribe(&[ES_EVENT_TYPE_NOTIFY_EXEC, ES_EVENT_TYPE_NOTIFY_OPEN])
+        .subscribe(&[
+            es_event_type_t::ES_EVENT_TYPE_NOTIFY_EXEC,
+            es_event_type_t::ES_EVENT_TYPE_NOTIFY_OPEN,
+            es_event_type_t::ES_EVENT_TYPE_NOTIFY_EXIT,
+        ])
         .map_err(|e| anyhow!("es_subscribe failed: {e:?}"))?;
 
     Ok(EsfGuard { _client: client })
@@ -77,19 +81,38 @@ fn handle_message(
     config: &CollectorConfig,
     state: &Arc<Mutex<SharedState>>,
     tx: &SyncSender<Msg>,
+    dropped: &AtomicU64,
 ) {
     match msg.event() {
         Some(EsEvent::NotifyExec(exec)) => {
             if let Some(ev) = build_exec_event(&exec, config, state) {
-                let _ = tx.try_send(Msg::Event(Box::new(ev)));
+                send_event(tx, ev, dropped);
             }
         }
         Some(EsEvent::NotifyOpen(open)) => {
             if let Some(ev) = build_open_event(msg, &open, config, state) {
-                let _ = tx.try_send(Msg::Event(Box::new(ev)));
+                send_event(tx, ev, dropped);
+            }
+        }
+        Some(EsEvent::NotifyExit(_)) => {
+            let pid = msg.process().audit_token().pid();
+            if let Ok(mut st) = state.lock() {
+                if let Some(key) = st.pid_to_key.remove(&pid) {
+                    st.table.forget(key);
+                    st.proc_cache.remove(&key);
+                }
             }
         }
         _ => {}
+    }
+}
+
+fn send_event(tx: &SyncSender<Msg>, event: Event, dropped: &AtomicU64) {
+    if tx.try_send(Msg::Event(Box::new(event))).is_err() {
+        let count = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_power_of_two() {
+            eprintln!("aten-macos: producer queue full; dropped {count} event(s)");
+        }
     }
 }
 
@@ -213,6 +236,7 @@ fn build_open_event(
         let mut st = state.lock().ok()?;
         macos_impl::resolve_enrollment(pid, &mut st)?
     };
+    let cached = macos_impl::process_enrichment(pid, state);
     let is_agent_root = record.agent_root.pid == pid;
 
     // Suppress the agent reading its OWN config dotenv at startup; a descendant
@@ -221,10 +245,9 @@ fn build_open_event(
         return None;
     }
 
-    let snap = procinfo::snapshot(pid);
-    let chain = procinfo::parent_chain(pid, 16);
+    let snap = cached.snapshot;
     let process =
-        macos_impl::process_from_snapshot(&snap, Some(record.agent_root.pid), chain);
+        macos_impl::process_from_snapshot(&snap, Some(record.agent_root.pid), cached.parent_chain);
     let user = snap.user.clone();
 
     Some(Event {
@@ -266,4 +289,31 @@ fn systemtime_to_epoch_secs(t: Option<std::time::SystemTime>) -> u64 {
 
 fn osstr_to_string(s: &std::ffi::OsStr) -> String {
     s.to_string_lossy().into_owned()
+}
+
+/// Read the product version once at collector startup. `endpoint-sec` uses
+/// this to avoid invoking APIs newer than the running host. Fall back to the
+/// framework's minimum supported version if `sw_vers` is unavailable.
+fn macos_version() -> (u64, u64, u64) {
+    let output = std::process::Command::new("/usr/bin/sw_vers")
+        .arg("-productVersion")
+        .output();
+    let version = output
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok());
+    let mut parts = version
+        .as_deref()
+        .unwrap_or("10.15.0")
+        .trim()
+        .split('.')
+        .filter_map(|part| part.parse::<u64>().ok());
+    let major = parts.next().unwrap_or(10);
+    let minor = parts.next().unwrap_or(15);
+    let patch = parts.next().unwrap_or(0);
+    if major < 10 || (major == 10 && minor < 15) {
+        (10, 15, 0)
+    } else {
+        (major, minor, patch)
+    }
 }

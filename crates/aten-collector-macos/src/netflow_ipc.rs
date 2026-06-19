@@ -18,7 +18,7 @@
 use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,7 +32,6 @@ use aten_schema::{
 };
 
 use crate::macos_impl::{self, CollectorConfig, Msg, SharedState};
-use crate::procinfo;
 
 pub const SOCKET_DIR: &str = "/var/run/aten";
 pub const SOCKET_PATH: &str = "/var/run/aten/netflow.sock";
@@ -74,14 +73,14 @@ pub fn spawn(
     state: Arc<Mutex<SharedState>>,
     tx: SyncSender<Msg>,
     stop: Arc<AtomicBool>,
+    dropped: Arc<AtomicU64>,
 ) -> Result<IpcGuard> {
-    std::fs::create_dir_all(SOCKET_DIR)
-        .with_context(|| format!("creating {SOCKET_DIR}"))?;
+    std::fs::create_dir_all(SOCKET_DIR).with_context(|| format!("creating {SOCKET_DIR}"))?;
     restrict_dir(SOCKET_DIR);
     // A stale socket from a previous run blocks bind() with EADDRINUSE.
     let _ = std::fs::remove_file(SOCKET_PATH);
-    let listener = UnixListener::bind(SOCKET_PATH)
-        .with_context(|| format!("binding {SOCKET_PATH}"))?;
+    let listener =
+        UnixListener::bind(SOCKET_PATH).with_context(|| format!("binding {SOCKET_PATH}"))?;
     // Non-blocking accept so the thread can observe `stop` even with no peer.
     listener
         .set_nonblocking(true)
@@ -89,7 +88,7 @@ pub fn spawn(
 
     let handle = std::thread::Builder::new()
         .name("aten-netflow".into())
-        .spawn(move || accept_loop(listener, &config, &state, &tx, &stop))
+        .spawn(move || accept_loop(listener, &config, &state, &tx, &stop, &dropped))
         .context("spawning netflow IPC thread")?;
 
     Ok(IpcGuard {
@@ -103,13 +102,14 @@ fn accept_loop(
     state: &Arc<Mutex<SharedState>>,
     tx: &SyncSender<Msg>,
     stop: &Arc<AtomicBool>,
+    dropped: &AtomicU64,
 ) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _addr)) => {
                 // One connection at a time is fine — the sysext holds a single
                 // long-lived connection. Serve it until it closes or stop flips.
-                serve_conn(stream, config, state, tx, stop);
+                serve_conn(stream, config, state, tx, stop, dropped);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -125,6 +125,7 @@ fn serve_conn(
     state: &Arc<Mutex<SharedState>>,
     tx: &SyncSender<Msg>,
     stop: &Arc<AtomicBool>,
+    dropped: &AtomicU64,
 ) {
     // Blocking reads with a timeout so we can re-check `stop` between frames.
     let _ = stream.set_nonblocking(false);
@@ -139,7 +140,14 @@ fn serve_conn(
                 if let Ok(rec) = serde_json::from_slice::<FlowRecord>(&bytes) {
                     if let Some(ev) = build_network_event(&rec, config, state) {
                         // Drop on full rather than block the IPC reader.
-                        let _ = tx.try_send(Msg::Event(Box::new(ev)));
+                        if tx.try_send(Msg::Event(Box::new(ev))).is_err() {
+                            let count = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                            if count.is_power_of_two() {
+                                eprintln!(
+                                    "aten-macos: producer queue full; dropped {count} event(s)"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -182,6 +190,9 @@ fn build_network_event(
     config: &CollectorConfig,
     state: &Arc<Mutex<SharedState>>,
 ) -> Option<Event> {
+    if rec.v != 1 {
+        return None;
+    }
     let ip: std::net::IpAddr = rec.remote_ip.parse().ok()?;
     let endpoint = match ip {
         std::net::IpAddr::V4(v4) => Endpoint::V4 {
@@ -204,9 +215,10 @@ fn build_network_event(
         let mut st = state.lock().ok()?;
         macos_impl::resolve_enrollment(pid, &mut st)?
     };
+    let cached = macos_impl::process_enrichment(pid, state);
 
-    let snap = procinfo::snapshot(pid);
-    let chain = procinfo::parent_chain(pid, 16);
+    let snap = cached.snapshot;
+    let chain = cached.parent_chain;
     let is_agent_root = record.agent_root.pid == pid;
     let attributed_by_descent = !is_agent_root;
     let agent_root_pid = Some(record.agent_root.pid);
@@ -282,6 +294,7 @@ mod tests {
     fn flow_record_parses_minimal_json() {
         let json = br#"{"v":1,"pid":4242,"remote_ip":"203.0.113.9","port":443,"protocol":"tcp"}"#;
         let rec: FlowRecord = serde_json::from_slice(json).unwrap();
+        assert_eq!(rec.v, 1);
         assert_eq!(rec.pid, 4242);
         assert_eq!(rec.port, 443);
         assert_eq!(rec.remote_ip, "203.0.113.9");
