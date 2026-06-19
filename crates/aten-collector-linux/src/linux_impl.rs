@@ -653,7 +653,6 @@ where
 
     let pid = raw.pid as i32;
     let filename = nul_str(&raw.filename);
-    let bpf_comm = nul_str(&raw.comm).to_string();
 
     // Write-intent opens to a sensitive path become file_write (mirrors the
     // Windows Create-disposition split). A read-intent open of a credential
@@ -693,12 +692,12 @@ where
     }
 
     let process_name = if !snap.comm.is_empty() {
-        snap.comm.clone()
+        snap.comm
     } else {
-        bpf_comm.clone()
+        nul_str(&raw.comm).to_string()
     };
     let user = if !snap.user.is_empty() {
-        snap.user.clone()
+        snap.user
     } else {
         raw.uid.to_string()
     };
@@ -726,9 +725,9 @@ where
                 ppid: snap.ppid,
                 start_time: snap.start_time_ticks.to_string(),
                 name: process_name,
-                path: snap.exe_path.clone(),
-                cmdline: snap.cmdline.clone(),
-                cwd: snap.cwd.clone(),
+                path: snap.exe_path,
+                cmdline: snap.cmdline,
+                cwd: snap.cwd,
                 user,
                 integrity_level: None,
                 parent_chain: chain,
@@ -794,14 +793,13 @@ where
     let chain = cached.parent_chain;
     let attributed_by_descent = !is_agent_root;
 
-    let bpf_comm = nul_str(&raw.comm).to_string();
     let process_name = if !snap.comm.is_empty() {
-        snap.comm.clone()
+        snap.comm
     } else {
-        bpf_comm
+        nul_str(&raw.comm).to_string()
     };
     let user = if !snap.user.is_empty() {
-        snap.user.clone()
+        snap.user
     } else {
         raw.uid.to_string()
     };
@@ -831,9 +829,9 @@ where
                 ppid: snap.ppid,
                 start_time: snap.start_time_ticks.to_string(),
                 name: process_name,
-                path: snap.exe_path.clone(),
-                cmdline: snap.cmdline.clone(),
-                cwd: snap.cwd.clone(),
+                path: snap.exe_path,
+                cmdline: snap.cmdline,
+                cwd: snap.cwd,
                 user,
                 integrity_level: None,
                 parent_chain: chain,
@@ -898,14 +896,13 @@ where
     let is_agent_root = record.agent_root.pid == pid;
     let attributed_by_descent = !is_agent_root;
 
-    let bpf_comm = nul_str(&raw.comm).to_string();
     let process_name = if !snap.comm.is_empty() {
-        snap.comm.clone()
+        snap.comm
     } else {
-        bpf_comm
+        nul_str(&raw.comm).to_string()
     };
     let user = if !snap.user.is_empty() {
-        snap.user.clone()
+        snap.user
     } else {
         raw.uid.to_string()
     };
@@ -935,9 +932,9 @@ where
                 ppid: snap.ppid,
                 start_time: snap.start_time_ticks.to_string(),
                 name: process_name,
-                path: snap.exe_path.clone(),
-                cmdline: snap.cmdline.clone(),
-                cwd: snap.cwd.clone(),
+                path: snap.exe_path,
+                cmdline: snap.cmdline,
+                cwd: snap.cwd,
                 user,
                 integrity_level: None,
                 parent_chain: chain,
@@ -1037,14 +1034,15 @@ fn process_enrichment(pid: i32, state: &mut SharedState) -> CachedProcess {
     }
     let snapshot = proc::snapshot(pid);
     let parent_chain = proc::parent_chain_from(&snapshot, 16);
+    let start_time_ticks = snapshot.start_time_ticks;
     let cached = CachedProcess {
-        snapshot: snapshot.clone(),
+        snapshot,
         parent_chain,
     };
-    if snapshot.start_time_ticks != 0 {
+    if start_time_ticks != 0 {
         let key = ProcessKey {
             pid,
-            start_time_ticks: snapshot.start_time_ticks,
+            start_time_ticks,
         };
         if state.proc_cache.len() >= PROCESS_CACHE_CAP {
             state.proc_cache.clear();
@@ -1159,14 +1157,13 @@ where
     let is_agent_root = record.agent_root.pid == pid;
     let attributed_by_descent = !is_agent_root;
 
-    let bpf_comm = nul_str(&raw.comm).to_string();
     let process_name = if !snap.comm.is_empty() {
-        snap.comm.clone()
+        snap.comm
     } else {
-        bpf_comm.clone()
+        nul_str(&raw.comm).to_string()
     };
     let user = if !snap.user.is_empty() {
-        snap.user.clone()
+        snap.user
     } else {
         raw.uid.to_string()
     };
@@ -1192,9 +1189,9 @@ where
                 ppid: snap.ppid,
                 start_time: snap.start_time_ticks.to_string(),
                 name: process_name,
-                path: snap.exe_path.clone(),
-                cmdline: snap.cmdline.clone(),
-                cwd: snap.cwd.clone(),
+                path: snap.exe_path,
+                cmdline: snap.cmdline,
+                cwd: snap.cwd,
                 user,
                 integrity_level: None,
                 parent_chain: chain,

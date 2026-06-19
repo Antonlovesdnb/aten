@@ -28,8 +28,14 @@ use aten_schema::CredentialClass;
 /// collector rather than emitting `credential_class=none` to the SIEM.
 pub fn classify(path: &str) -> CredentialClass {
     // Normalize Windows separators to POSIX so a single set of suffix patterns
-    // works for both platforms. No-op for inputs that don't contain `\`.
-    let p = path.to_lowercase().replace('\\', "/");
+    // works for both platforms. `replace` allocates a second String even when
+    // it changes nothing, so skip it for backslash-free paths — the common
+    // case on Linux (every openat) and any POSIX-style input.
+    let p = if path.contains('\\') {
+        path.to_lowercase().replace('\\', "/")
+    } else {
+        path.to_lowercase()
+    };
 
     if p.ends_with("/.aws/credentials") || p.ends_with("/.aws/config") {
         return CredentialClass::AwsCredentials;

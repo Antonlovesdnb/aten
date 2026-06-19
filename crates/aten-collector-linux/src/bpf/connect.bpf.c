@@ -91,6 +91,18 @@ int handle_connect(struct sys_enter_connect_args *ctx) {
     if (!bpf_map_lookup_elem(&enrolled_pids, &pid)) {
         return 0;
     }
+    // Drop non-IP socket families (AF_UNIX and friends) before reserving a
+    // ringbuf record. Userspace only emits AF_INET/AF_INET6 egress and maps
+    // every other family to `Other`, which it discards — so this filters
+    // exactly what would be dropped anyway, but saves the reserve + 28-byte
+    // copy + ringbuf wakeup for the local-socket chatter (D-Bus, language
+    // servers, container runtimes) that agents generate constantly. Reads
+    // just the 2-byte sa_family from the user sockaddr.
+    __u16 family = 0;
+    bpf_probe_read_user(&family, sizeof(family), ctx->uservaddr);
+    if (family != 2 /* AF_INET */ && family != 10 /* AF_INET6 */) {
+        return 0;
+    }
     struct connect_event *e = bpf_ringbuf_reserve(&connect_events, sizeof(*e), 0);
     if (!e) {
         count_drop();
