@@ -15,7 +15,10 @@
 
 use std::io;
 
-use aten_schema::{Event, EventKind};
+use aten_schema::{
+    AccessType, CredentialClass, DnsQueryType, Event, EventKind, FileWriteClass, Protocol, Role,
+    ResultStatus,
+};
 use windows::core::GUID;
 use windows::Win32::System::Diagnostics::Etw::{
     EventRegister, EventUnregister, EventWrite, EVENT_DATA_DESCRIPTOR, EVENT_DESCRIPTOR, REGHANDLE,
@@ -168,13 +171,77 @@ fn iv(v: i32) -> Field {
     Field::I(v)
 }
 
-/// Serialize a serde enum to its wire string (e.g. `aws_credentials`, `tcp`)
-/// by stripping the JSON quotes.
-fn enum_str<T: serde::Serialize>(v: &T) -> String {
-    serde_json::to_string(v)
-        .ok()
-        .map(|s| s.trim_matches('"').to_string())
-        .unwrap_or_default()
+// Wire strings for the schema enums emitted as ETW template fields. Hand-mapped
+// (not via serde_json) so each emitted event avoids a serde round-trip plus two
+// heap allocations per enum field. The `wire_strings_match_serde` test asserts
+// these stay in lockstep with the serde `rename_all` derivation, so a schema
+// rename can't silently drift the channel's field values.
+fn cred_class_wire(v: &CredentialClass) -> &'static str {
+    match v {
+        CredentialClass::AwsCredentials => "aws_credentials",
+        CredentialClass::AzureCredentials => "azure_credentials",
+        CredentialClass::GcpCredentials => "gcp_credentials",
+        CredentialClass::SshPrivateKey => "ssh_private_key",
+        CredentialClass::GitCredentials => "git_credentials",
+        CredentialClass::DpapiBlob => "dpapi_blob",
+        CredentialClass::CredentialManager => "credential_manager",
+        CredentialClass::BrowserCookies => "browser_cookies",
+        CredentialClass::KubeConfig => "kube_config",
+        CredentialClass::GenericDotenv => "generic_dotenv",
+        CredentialClass::None => "none",
+    }
+}
+
+fn access_type_wire(v: &AccessType) -> &'static str {
+    match v {
+        AccessType::Read => "read",
+        AccessType::Write => "write",
+        AccessType::Open => "open",
+    }
+}
+
+fn protocol_wire(v: &Protocol) -> &'static str {
+    match v {
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
+    }
+}
+
+fn dns_type_wire(v: &DnsQueryType) -> &'static str {
+    match v {
+        DnsQueryType::A => "a",
+        DnsQueryType::Aaaa => "aaaa",
+        DnsQueryType::Cname => "cname",
+        DnsQueryType::Txt => "txt",
+        DnsQueryType::Mx => "mx",
+        DnsQueryType::Ns => "ns",
+        DnsQueryType::Ptr => "ptr",
+        DnsQueryType::Srv => "srv",
+        DnsQueryType::Soa => "soa",
+        DnsQueryType::Other => "other",
+    }
+}
+
+fn write_class_wire(v: &FileWriteClass) -> &'static str {
+    match v {
+        FileWriteClass::AgentConfig => "agent_config",
+        FileWriteClass::Executable => "executable",
+    }
+}
+
+fn role_wire(v: &Role) -> &'static str {
+    match v {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+    }
+}
+
+fn result_status_wire(v: &ResultStatus) -> &'static str {
+    match v {
+        ResultStatus::Success => "success",
+        ResultStatus::Error => "error",
+    }
 }
 
 /// Fields 1-16 shared by the kernel templates (t_proc_exec / t_cred / t_net).
@@ -233,8 +300,8 @@ fn fields_for(ev: &Event, json: &str) -> Vec<Field> {
         EventKind::CredentialAccess(p) => {
             let mut f = kernel_common(ev, &p.process, &p.attribution);
             f.push(s(&p.file_path));
-            f.push(s(&enum_str(&p.credential_class)));
-            f.push(s(&enum_str(&p.access_type)));
+            f.push(s(cred_class_wire(&p.credential_class)));
+            f.push(s(access_type_wire(&p.access_type)));
             f.push(s(json));
             f
         }
@@ -242,14 +309,14 @@ fn fields_for(ev: &Event, json: &str) -> Vec<Field> {
             let mut f = kernel_common(ev, &p.process, &p.attribution);
             f.push(s(&p.dest_ip));
             f.push(iv(p.dest_port as i32));
-            f.push(s(&enum_str(&p.protocol)));
+            f.push(s(protocol_wire(&p.protocol)));
             f.push(so(p.dest_host.as_deref()));
             f.push(s(json));
             f
         }
         EventKind::Prompt(p) => {
             let mut f = envelope5(ev);
-            f.push(s(&enum_str(&p.role)));
+            f.push(s(role_wire(&p.role)));
             f.push(s(&p.prompt_summary));
             f.push(s(json));
             f
@@ -265,7 +332,7 @@ fn fields_for(ev: &Event, json: &str) -> Vec<Field> {
         EventKind::ToolResult(p) => {
             let mut f = envelope5(ev);
             f.push(s(&p.tool_call_id));
-            f.push(s(&enum_str(&p.result_status)));
+            f.push(s(result_status_wire(&p.result_status)));
             f.push(s(&p.result_summary));
             f.push(s(json));
             f
@@ -273,7 +340,7 @@ fn fields_for(ev: &Event, json: &str) -> Vec<Field> {
         EventKind::FileWrite(p) => {
             let mut f = kernel_common(ev, &p.process, &p.attribution);
             f.push(s(&p.file_path));
-            f.push(s(&enum_str(&p.write_class)));
+            f.push(s(write_class_wire(&p.write_class)));
             // BytesWritten as a string: the number, or "" when the probe only
             // saw the open-for-write (Option::None).
             f.push(s(&p
@@ -286,7 +353,7 @@ fn fields_for(ev: &Event, json: &str) -> Vec<Field> {
         EventKind::DnsQuery(p) => {
             let mut f = kernel_common(ev, &p.process, &p.attribution);
             f.push(s(&p.query_name));
-            f.push(s(&enum_str(&p.query_type)));
+            f.push(s(dns_type_wire(&p.query_type)));
             // Answers flattened comma-separated; "" when only the query was seen.
             f.push(s(&p.answers.join(",")));
             f.push(s(json));
@@ -427,14 +494,55 @@ mod tests {
         assert_eq!(parent_chain_str(&[]), "");
     }
 
+    /// The hand-mapped wire strings MUST equal serde's `rename_all` output for
+    /// every variant — otherwise the ETW channel's typed fields silently drift
+    /// from the JSONL/schema wire format. Compare against serde directly so a
+    /// schema rename breaks this test rather than production output.
     #[test]
-    fn enum_str_strips_quotes() {
-        assert_eq!(
-            enum_str(&CredentialClass::AwsCredentials),
-            "aws_credentials"
-        );
-        assert_eq!(enum_str(&Protocol::Tcp), "tcp");
-        assert_eq!(enum_str(&AccessType::Open), "open");
+    fn wire_strings_match_serde() {
+        fn serde_wire<T: serde::Serialize>(v: &T) -> String {
+            serde_json::to_string(v)
+                .unwrap()
+                .trim_matches('"')
+                .to_string()
+        }
+        use aten_schema::{
+            AccessType::*, CredentialClass::*, DnsQueryType::*, FileWriteClass::*, Protocol::*,
+            ResultStatus::*, Role::*,
+        };
+        for v in [
+            AwsCredentials,
+            AzureCredentials,
+            GcpCredentials,
+            SshPrivateKey,
+            GitCredentials,
+            DpapiBlob,
+            CredentialManager,
+            BrowserCookies,
+            KubeConfig,
+            GenericDotenv,
+            CredentialClass::None,
+        ] {
+            assert_eq!(cred_class_wire(&v), serde_wire(&v), "{v:?}");
+        }
+        for v in [Read, Write, Open] {
+            assert_eq!(access_type_wire(&v), serde_wire(&v), "{v:?}");
+        }
+        for v in [Tcp, Udp] {
+            assert_eq!(protocol_wire(&v), serde_wire(&v), "{v:?}");
+        }
+        for v in [A, Aaaa, Cname, Txt, Mx, Ns, Ptr, Srv, Soa, Other] {
+            assert_eq!(dns_type_wire(&v), serde_wire(&v), "{v:?}");
+        }
+        for v in [AgentConfig, Executable] {
+            assert_eq!(write_class_wire(&v), serde_wire(&v), "{v:?}");
+        }
+        for v in [User, Assistant, System] {
+            assert_eq!(role_wire(&v), serde_wire(&v), "{v:?}");
+        }
+        for v in [Success, Error] {
+            assert_eq!(result_status_wire(&v), serde_wire(&v), "{v:?}");
+        }
     }
 
     /// The field count of each builder MUST equal its template's `<data>` count
