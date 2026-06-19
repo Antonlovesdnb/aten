@@ -45,14 +45,21 @@ pub fn event_id_for(kind: &EventKind) -> u16 {
         EventKind::Prompt(_) => 10,
         EventKind::ToolCall(_) => 11,
         EventKind::ToolResult(_) => 12,
+        // Daemon self-telemetry. Not yet declared in aten.man, so Event Viewer
+        // won't render a typed template, but the write still lands on the
+        // channel (RawJson carries the payload) for WEF/SIEM raw collection.
+        // Add a `t_status` template + this id to the manifest to get rendering.
+        EventKind::CollectorStatus(_) => 20,
     }
 }
 
 fn level_for(kind: &EventKind) -> u8 {
     match kind {
-        EventKind::CredentialAccess(_) | EventKind::NetworkEgress(_) | EventKind::FileWrite(_) => {
-            LEVEL_WARNING
-        }
+        EventKind::CredentialAccess(_)
+        | EventKind::NetworkEgress(_)
+        | EventKind::FileWrite(_)
+        // A dropped-event marker is a warning: it means telemetry was lost.
+        | EventKind::CollectorStatus(_) => LEVEL_WARNING,
         // A DNS query on its own is benign (agents resolve their own API
         // hosts constantly); the SIEM rule elevates it by joining to origin.
         _ => LEVEL_INFORMATIONAL,
@@ -68,7 +75,10 @@ fn pid_for(kind: &EventKind) -> i32 {
         EventKind::NetworkEgress(p) => p.process.pid,
         EventKind::FileWrite(p) => p.process.pid,
         EventKind::DnsQuery(p) => p.process.pid,
-        EventKind::Prompt(_) | EventKind::ToolCall(_) | EventKind::ToolResult(_) => 0,
+        EventKind::Prompt(_)
+        | EventKind::ToolCall(_)
+        | EventKind::ToolResult(_)
+        | EventKind::CollectorStatus(_) => 0,
     }
 }
 
@@ -283,7 +293,7 @@ fn fields_for(ev: &Event, json: &str) -> Vec<Field> {
             f
         }
         // t_generic: Timestamp, HostId, AgentId, Pid, RawJson.
-        EventKind::ProcessExit(_) => vec![
+        EventKind::ProcessExit(_) | EventKind::CollectorStatus(_) => vec![
             s(&ev.timestamp),
             so(ev.host_id.as_deref()),
             s(&ev.agent_id),

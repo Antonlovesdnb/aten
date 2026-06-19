@@ -93,6 +93,15 @@ impl SessionState {
                 _ => {}
             }
         }
+        // `attribute_at` and `most_recent_user_prompt_before` binary-search
+        // these vecs with `partition_point`, which requires them ordered by
+        // `timestamp_ns`. Records normally arrive append-ordered, but a
+        // flush-reordered record or an unparseable timestamp (folded in as
+        // `i64::MAX`) would otherwise sit out of order and corrupt the search.
+        // A stable sort of the now-mostly-sorted vec is near-linear and keeps
+        // the invariant the old full-reparse `refresh()` maintained.
+        self.tool_calls.sort_by_key(|tc| tc.timestamp_ns);
+        self.user_prompts.sort_by_key(|p| p.timestamp_ns);
         self.identifier_index.ingest(events, None);
     }
 

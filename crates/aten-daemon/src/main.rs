@@ -28,6 +28,41 @@ mod sink;
 
 const MAX_PENDING_EVENTS: usize = 8_192;
 
+/// Build a `collector_status` event recording that the daemon dropped kernel
+/// events because its pending-attribution queue was full. Emitted into the same
+/// sink as real events so a downstream SIEM sees the telemetry gap explicitly
+/// rather than having to notice missing data. `pending_dropped` is the
+/// cumulative total since start; `since_last` is the delta since the previous
+/// status event (so a rule can alert on rate, not just total).
+fn pending_drop_status_event(
+    host_id: Option<String>,
+    pending_dropped: u64,
+    since_last: u64,
+) -> aten_schema::Event {
+    aten_schema::Event {
+        schema_version: aten_schema::SCHEMA_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        monotonic_ns: None,
+        platform: detect_platform(),
+        host_id,
+        agent_id: "aten-daemon".to_string(),
+        session_id: None,
+        user_id: None,
+        source: aten_schema::Source {
+            collector: "daemon".to_string(),
+            probe: "pending_queue".to_string(),
+            host_pid: None,
+        },
+        kind: aten_schema::EventKind::CollectorStatus(aten_schema::CollectorStatusPayload {
+            pending_dropped,
+            dropped_since_last: since_last,
+            reason: "pending attribution queue full; kernel events dropped before attribution"
+                .to_string(),
+        }),
+    }
+}
+
 #[cfg(target_os = "windows")]
 type ConsoleHandler = std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>;
 
@@ -434,6 +469,9 @@ pub(crate) fn run_daemon_loop_windows(
     let engine_tick = engine.clone();
     let pending_tick = pending.clone();
     let sink_tick = sink.clone();
+    let dropped_tick = pending_dropped.clone();
+    let host_id_tick = host_id.clone();
+    let last_status_dropped = std::cell::Cell::new(0u64);
     aten_collector_windows::run_with_tick(
         cfg,
         stop.clone(),
@@ -500,6 +538,23 @@ pub(crate) fn run_daemon_loop_windows(
                     eng.attribute(&mut ev);
                     s.emit(&ev);
                 }
+                s.flush();
+            }
+
+            // Surface pending-queue drops into the event stream (not just
+            // stderr) so a SIEM sees the telemetry gap. At most one status
+            // event per tick, when the cumulative drop count advanced.
+            let total_dropped = dropped_tick.load(Ordering::Relaxed);
+            let prev_dropped = last_status_dropped.get();
+            if total_dropped > prev_dropped {
+                last_status_dropped.set(total_dropped);
+                let status = pending_drop_status_event(
+                    host_id_tick.clone(),
+                    total_dropped,
+                    total_dropped - prev_dropped,
+                );
+                let mut s = sink_tick.lock().expect("sink lock");
+                s.emit(&status);
                 s.flush();
             }
         },
@@ -820,6 +875,8 @@ fn run_daemon(
     let pending: std::cell::RefCell<std::collections::VecDeque<(Instant, aten_schema::Event)>> =
         std::cell::RefCell::new(std::collections::VecDeque::new());
     let pending_dropped = Cell::new(0u64);
+    let last_status_dropped = Cell::new(0u64);
+    let daemon_host_id = read_machine_id();
 
     eprintln!(
         "aten daemon starting (agents = {:?}, transcript sources = {}, sessions loaded = {})",
@@ -887,6 +944,23 @@ fn run_daemon(
                     eng.attribute(&mut ev);
                     s.emit(&ev);
                 }
+                s.flush();
+            }
+
+            // Surface pending-queue drops into the event stream (not just
+            // stderr) so a SIEM sees the telemetry gap. One status event per
+            // tick at most, when the cumulative drop count advanced.
+            let total_dropped = pending_dropped.get();
+            let prev_dropped = last_status_dropped.get();
+            if total_dropped > prev_dropped {
+                last_status_dropped.set(total_dropped);
+                let status = pending_drop_status_event(
+                    daemon_host_id.clone(),
+                    total_dropped,
+                    total_dropped - prev_dropped,
+                );
+                let mut s = sink.lock().expect("sink lock");
+                s.emit(&status);
                 s.flush();
             }
         },
@@ -1095,6 +1169,8 @@ fn run_daemon(
     let pending: std::cell::RefCell<std::collections::VecDeque<(Instant, aten_schema::Event)>> =
         std::cell::RefCell::new(std::collections::VecDeque::new());
     let pending_dropped = Cell::new(0u64);
+    let last_status_dropped = Cell::new(0u64);
+    let daemon_host_id = macos_host_id();
 
     eprintln!(
         "aten daemon starting (agents = {:?}, transcript sources = {}, sessions loaded = {})",
@@ -1159,6 +1235,23 @@ fn run_daemon(
                     eng.attribute(&mut ev);
                     s.emit(&ev);
                 }
+                s.flush();
+            }
+
+            // Surface pending-queue drops into the event stream (not just
+            // stderr) so a SIEM sees the telemetry gap. One status event per
+            // tick at most, when the cumulative drop count advanced.
+            let total_dropped = pending_dropped.get();
+            let prev_dropped = last_status_dropped.get();
+            if total_dropped > prev_dropped {
+                last_status_dropped.set(total_dropped);
+                let status = pending_drop_status_event(
+                    daemon_host_id.clone(),
+                    total_dropped,
+                    total_dropped - prev_dropped,
+                );
+                let mut s = sink.lock().expect("sink lock");
+                s.emit(&status);
                 s.flush();
             }
         },
@@ -1236,6 +1329,7 @@ fn run_transcript(transcript: PathBuf, out: Option<PathBuf>, idx: Option<PathBuf
             aten_schema::EventKind::NetworkEgress(_) => "network_egress",
             aten_schema::EventKind::DnsQuery(_) => "dns_query",
             aten_schema::EventKind::FileWrite(_) => "file_write",
+            aten_schema::EventKind::CollectorStatus(_) => "collector_status",
         };
         *by_type.entry(key).or_insert(0) += 1;
     }

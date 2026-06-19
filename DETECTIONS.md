@@ -203,6 +203,22 @@ SELECT process.cmdline, triggering_prompt
 
 ---
 
+## Collector health
+
+### HEALTH-1 — Telemetry gap (dropped events)
+**Severity: medium.** ATEN emits a `collector_status` event when its bounded attribution buffer overflows and it has to drop kernel events. This is a *self-report of missing data* — every gap is a window where a real detection could have been silenced, so it's worth alerting on directly rather than discovering after an incident.
+
+```
+FROM collector_status
+GROUP BY host_id
+SELECT max(pending_dropped) as total_dropped, sum(dropped_since_last) as dropped_in_window
+HAVING total_dropped > 0
+```
+
+**False positives:** none in the detection sense — this is ATEN telling you it dropped data. A steady stream of these means a host is producing events faster than the daemon can attribute and write them; investigate load (an unusually busy agent, a fork storm) or relax the bound. Note this covers only the daemon's pending-queue drops surfaced into the stream; collector-internal drops (eBPF ringbuf saturation, the macOS producer queue) are still reported only to the daemon's stderr.
+
+---
+
 ## Tuning notes
 
 - **Baseline first.** Run ATEN in an environment for a week and look at what CRED-1 and EXFIL-1 surface *normally*. The legitimate `(process.name, credential_class)` and `(process.name, dest_host)` pairs become your allowlists.

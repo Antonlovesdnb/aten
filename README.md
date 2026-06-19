@@ -11,7 +11,7 @@ It collects two kinds of telemetry and links them:
 
 Each action event is tagged with the session and the specific tool call it came from. That link is the part you can't get from either source on its own. It lets you ask, for example, whether a process the agent spawned read credentials that nobody in the session — not the user, not the model, not a tool result — ever mentioned.
 
-Linux and Windows are built and verified end to end. macOS is written but not yet tested on hardware. Schema is at v0.5. ATEN only observes — it does not block or kill anything; acting on what it sees is left to your SIEM rules.
+Linux and Windows are built and verified end to end. macOS is written but not yet tested on hardware. Schema is at v0.6. ATEN only observes — it does not block or kill anything; acting on what it sees is left to your SIEM rules.
 
 ## How it works, step by step
 
@@ -61,6 +61,10 @@ Every action event also carries:
 
 - a `process` block — pid, ppid, start time, name, path, command line, working directory, user, Windows integrity level, the parent process chain (each link with its pid), and `agent_root_pid` (the enrolled agent at the top of the tree).
 - an envelope shared by all events — `schema_version`, `event_id`, `timestamp`, `platform`, `host_id`, `agent_id`, `session_id`, `user_id`.
+
+### Daemon self-telemetry
+
+One more event isn't intent or action: `collector_status`. ATEN buffers kernel events briefly to attribute them, and that buffer is bounded — under a flood it can fill and drop events rather than grow without limit. When that happens the daemon emits a `collector_status` event into the same stream (`pending_dropped`, `dropped_since_last`, `reason`) so a telemetry gap shows up as a record your SIEM can alert on, instead of as silently missing data.
 
 ### The attribution block (added to every action event)
 

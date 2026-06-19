@@ -155,6 +155,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "uuid",
  "windows 0.62.2",
  "windows-service",
 ]

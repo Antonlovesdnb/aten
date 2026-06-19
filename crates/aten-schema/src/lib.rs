@@ -51,7 +51,12 @@ use serde::{Deserialize, Serialize};
 ///   only for these "sensitive" classes — ordinary writes by enrolled
 ///   processes are dropped at the collector, same noise discipline as
 ///   the credential path.
-pub const SCHEMA_VERSION: &str = "0.5";
+/// - 0.6: `collector_status` — daemon self-telemetry. Emitted (not by a
+///   kernel probe) when ATEN drops events it can't keep up with, so a
+///   downstream SIEM sees an explicit telemetry-gap marker instead of
+///   silent loss. Additive: carries no `process`/`attribution` block and
+///   no existing consumer is affected.
+pub const SCHEMA_VERSION: &str = "0.6";
 
 /// One link in a process's ancestor chain. Same order semantics as the
 /// old `Vec<String>` (root → immediate parent, excludes the event's own
@@ -116,6 +121,7 @@ pub enum EventKind {
     NetworkEgress(NetworkEgressPayload),
     DnsQuery(DnsQueryPayload),
     FileWrite(FileWritePayload),
+    CollectorStatus(CollectorStatusPayload),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -376,6 +382,23 @@ pub struct FileWritePayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
     pub write_class: FileWriteClass,
+}
+
+/// Daemon self-telemetry, emitted when ATEN has to drop events it can't keep
+/// up with. It exists so a downstream SIEM sees an explicit marker of a
+/// telemetry gap rather than silent loss. Unlike the action events it carries
+/// no `process` or `attribution` block — it describes the collector itself,
+/// not an observed action. `event_type` serializes as `collector_status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectorStatusPayload {
+    /// Cumulative count, since daemon start, of kernel events dropped before
+    /// attribution because the in-process pending queue was full.
+    pub pending_dropped: u64,
+    /// How many of those drops are newly observed since the previous
+    /// `collector_status` event — lets a rule alert on a rate, not just a total.
+    pub dropped_since_last: u64,
+    /// Human-readable description of what was dropped and why.
+    pub reason: String,
 }
 
 /// Where an identifier surfaced for the first time in a session. Drives the
