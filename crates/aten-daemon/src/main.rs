@@ -55,7 +55,7 @@ fn pending_drop_status_event(
             host_pid: None,
         },
         kind: aten_schema::EventKind::CollectorStatus(aten_schema::CollectorStatusPayload {
-            pending_dropped,
+            dropped_total: pending_dropped,
             dropped_since_last: since_last,
             reason: "pending attribution queue full; kernel events dropped before attribution"
                 .to_string(),

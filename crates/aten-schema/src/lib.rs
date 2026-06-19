@@ -391,11 +391,15 @@ pub struct FileWritePayload {
 /// not an observed action. `event_type` serializes as `collector_status`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectorStatusPayload {
-    /// Cumulative count, since daemon start, of kernel events dropped before
-    /// attribution because the in-process pending queue was full.
-    pub pending_dropped: u64,
+    /// Cumulative count, since process start, of events dropped from this
+    /// source. The envelope's `source` block says which stage dropped them —
+    /// e.g. `{collector: "daemon", probe: "pending_queue"}` for the daemon's
+    /// attribution buffer, or `{collector: "linux_ebpf", probe: "ringbuf"}`
+    /// for kernel ring-buffer saturation.
+    pub dropped_total: u64,
     /// How many of those drops are newly observed since the previous
-    /// `collector_status` event — lets a rule alert on a rate, not just a total.
+    /// `collector_status` event from the same source — lets a rule alert on a
+    /// rate, not just a total.
     pub dropped_since_last: u64,
     /// Human-readable description of what was dropped and why.
     pub reason: String,

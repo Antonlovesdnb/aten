@@ -12,9 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use aten_schema::{
-    AccessType, Attribution, CredentialAccessPayload, CredentialClass, DnsQueryPayload,
-    DnsQueryType, Event, EventKind, FileWriteClass, FileWritePayload, NetworkEgressPayload,
-    Platform, Process, ProcessExecPayload, Protocol, Source, SCHEMA_VERSION,
+    AccessType, Attribution, CollectorStatusPayload, CredentialAccessPayload, CredentialClass,
+    DnsQueryPayload, DnsQueryType, Event, EventKind, FileWriteClass, FileWritePayload,
+    NetworkEgressPayload, Platform, Process, ProcessExecPayload, Protocol, Source, SCHEMA_VERSION,
 };
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, MapFlags, OpenObject, UprobeOpts};
@@ -419,6 +419,39 @@ where
                         current[index]
                     );
                 }
+            }
+            // Surface ring-buffer drops into the event stream (not just stderr)
+            // so a SIEM sees the telemetry gap. Aggregate across the four probe
+            // ringbuffers; the envelope's `source.probe = ringbuf` distinguishes
+            // these from the daemon's pending-queue drops. Safe to borrow
+            // `emit_cell` here: no ringbuf callback is active once `poll`
+            // returned.
+            let total_now: u64 = current.iter().sum();
+            let total_prev: u64 = prior_drops.iter().sum();
+            if total_now > total_prev {
+                let status = Event {
+                    schema_version: SCHEMA_VERSION.to_string(),
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: rfc3339_now(),
+                    monotonic_ns: None,
+                    platform: Platform::Linux,
+                    host_id: host_id.clone(),
+                    agent_id: "aten-collector".to_string(),
+                    session_id: None,
+                    user_id: None,
+                    source: Source {
+                        collector: "linux_ebpf".to_string(),
+                        probe: "ringbuf".to_string(),
+                        host_pid: None,
+                    },
+                    kind: EventKind::CollectorStatus(CollectorStatusPayload {
+                        dropped_total: total_now,
+                        dropped_since_last: total_now - total_prev,
+                        reason: "eBPF ring buffer full; kernel events dropped before userspace"
+                            .to_string(),
+                    }),
+                };
+                (*emit_cell.borrow_mut())(status);
             }
             prior_drops = current;
             last_drop_check = Instant::now();
@@ -1286,6 +1319,18 @@ fn rfc3339_from_boot_ns(boot_ns: u64) -> String {
 fn format_rfc3339(secs: i64, nsec: u32) -> String {
     let (year, month, day, hour, minute, second) = unix_to_civil(secs);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nsec:09}Z")
+}
+
+/// Current wall-clock time as an RFC 3339 string. Used for collector status
+/// events that aren't tied to a specific kernel-event timestamp.
+fn rfc3339_now() -> String {
+    let wall_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+    let secs = (wall_ns / 1_000_000_000) as i64;
+    let nsec = (wall_ns % 1_000_000_000) as u32;
+    format_rfc3339(secs, nsec)
 }
 
 fn unix_to_civil(unix_secs: i64) -> (i32, u32, u32, u32, u32, u32) {

@@ -206,16 +206,16 @@ SELECT process.cmdline, triggering_prompt
 ## Collector health
 
 ### HEALTH-1 — Telemetry gap (dropped events)
-**Severity: medium.** ATEN emits a `collector_status` event when its bounded attribution buffer overflows and it has to drop kernel events. This is a *self-report of missing data* — every gap is a window where a real detection could have been silenced, so it's worth alerting on directly rather than discovering after an incident.
+**Severity: medium.** ATEN emits a `collector_status` event whenever a drop counter advances — the daemon's bounded attribution buffer, an eBPF ring buffer, or the macOS producer queue. This is a *self-report of missing data*: every gap is a window where a real detection could have been silenced, so it's worth alerting on directly rather than discovering after an incident. The envelope's `source.probe` names the stage (`pending_queue`, `ringbuf`, `producer_queue`).
 
 ```
 FROM collector_status
-GROUP BY host_id
-SELECT max(pending_dropped) as total_dropped, sum(dropped_since_last) as dropped_in_window
+GROUP BY host_id, source.probe
+SELECT max(dropped_total) as total_dropped, sum(dropped_since_last) as dropped_in_window
 HAVING total_dropped > 0
 ```
 
-**False positives:** none in the detection sense — this is ATEN telling you it dropped data. A steady stream of these means a host is producing events faster than the daemon can attribute and write them; investigate load (an unusually busy agent, a fork storm) or relax the bound. Note this covers only the daemon's pending-queue drops surfaced into the stream; collector-internal drops (eBPF ringbuf saturation, the macOS producer queue) are still reported only to the daemon's stderr.
+**False positives:** none in the detection sense — this is ATEN telling you it dropped data. A steady stream means a host is producing events faster than ATEN can attribute and write them; investigate load (an unusually busy agent, a fork storm) or relax the bound. Coverage note: the Windows ETW collector has no internal drop counter, so on Windows this surfaces only the daemon pending-queue drops (ETW session-level loss, if any, isn't yet tracked).
 
 ---
 

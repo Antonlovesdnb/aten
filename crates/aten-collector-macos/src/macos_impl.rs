@@ -21,7 +21,10 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use aten_collector_linux::enroll::{EnrollmentRecord, EnrollmentTable, ProcessKey};
-use aten_schema::{Attribution, Event, Process};
+use aten_schema::{
+    Attribution, CollectorStatusPayload, Event, EventKind, Platform, Process, Source,
+    SCHEMA_VERSION,
+};
 
 use crate::netflow_ipc;
 use crate::procinfo::{self, ProcSnapshot};
@@ -140,6 +143,7 @@ where
     // Consumer loop on the calling thread — the only `emit`/`tick` site.
     let mut last_tick = Instant::now();
     let tick_every = Duration::from_millis(200);
+    let mut last_status_dropped = 0u64;
     while !stop.load(Ordering::Relaxed) {
         // Drain a bounded batch without blocking.
         let mut drained = 0usize;
@@ -168,6 +172,38 @@ where
         if last_tick.elapsed() >= tick_every {
             tick();
             last_tick = Instant::now();
+
+            // Surface producer-queue drops into the event stream (not just
+            // stderr) so a SIEM sees the telemetry gap. `source.probe =
+            // producer_queue` distinguishes these from the daemon's pending
+            // queue. Emitted on the consumer thread, the only `emit` site.
+            let total_now = dropped.load(Ordering::Relaxed);
+            if total_now > last_status_dropped {
+                let status = Event {
+                    schema_version: SCHEMA_VERSION.to_string(),
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now_rfc3339(),
+                    monotonic_ns: None,
+                    platform: Platform::Macos,
+                    host_id: config.host_id.clone(),
+                    agent_id: "aten-collector".to_string(),
+                    session_id: None,
+                    user_id: None,
+                    source: Source {
+                        collector: "macos".to_string(),
+                        probe: "producer_queue".to_string(),
+                        host_pid: None,
+                    },
+                    kind: EventKind::CollectorStatus(CollectorStatusPayload {
+                        dropped_total: total_now,
+                        dropped_since_last: total_now - last_status_dropped,
+                        reason: "producer queue full; events dropped before the consumer"
+                            .to_string(),
+                    }),
+                };
+                emit(status);
+                last_status_dropped = total_now;
+            }
         }
     }
     let dropped = dropped.load(Ordering::Relaxed);

@@ -64,7 +64,7 @@ Every action event also carries:
 
 ### Daemon self-telemetry
 
-One more event isn't intent or action: `collector_status`. ATEN buffers kernel events briefly to attribute them, and that buffer is bounded — under a flood it can fill and drop events rather than grow without limit. When that happens the daemon emits a `collector_status` event into the same stream (`pending_dropped`, `dropped_since_last`, `reason`) so a telemetry gap shows up as a record your SIEM can alert on, instead of as silently missing data.
+One more event isn't intent or action: `collector_status`. ATEN drops events rather than grow without bound when something can't keep up — the daemon's bounded attribution buffer under a flood, or a kernel ring buffer / producer queue saturating before userspace drains it. Whenever a drop counter advances, a `collector_status` event goes into the same stream (`dropped_total`, `dropped_since_last`, `reason`, with the envelope's `source` naming which stage dropped — e.g. `pending_queue`, `ringbuf`, `producer_queue`). A telemetry gap thus shows up as a record your SIEM can alert on, instead of as silently missing data.
 
 ### The attribution block (added to every action event)
 
