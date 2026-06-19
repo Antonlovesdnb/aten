@@ -140,17 +140,36 @@ impl SessionState {
         let mut out = OriginsFound::default();
         for ident in aten_transcript::extract(text) {
             let norm = aten_transcript::normalize(&ident, None);
-            if let Some(entry) = self.identifier_index.entries.get(&norm) {
-                for o in &entry.origins {
-                    match o {
-                        Origin::UserMessage => out.user_message = true,
-                        Origin::AssistantMessage => out.assistant_message = true,
-                        Origin::ToolResult => out.tool_result = true,
-                    }
+            self.fold_origins(&norm, &mut out);
+        }
+        out
+    }
+
+    /// Origins of a single, already-atomic identifier token — a destination
+    /// IP/host, a DNS query name, a resolved answer. These don't need the
+    /// regex `extract()` sweep `origins_for_text` runs for free-form text
+    /// (a cmdline): the token is itself the identifier, so we normalize and
+    /// do one O(1) index lookup, exactly as the credential/file arms do.
+    /// Equivalent to `origins_for_text` for atomic tokens (extract returns
+    /// such a token unchanged), but skips the per-event regex battery.
+    pub fn origins_for_token(&self, token: &str) -> OriginsFound {
+        let mut out = OriginsFound::default();
+        let norm = aten_transcript::normalize(token, None);
+        self.fold_origins(&norm, &mut out);
+        out
+    }
+
+    /// Merge the origins recorded for one normalized identifier into `out`.
+    fn fold_origins(&self, norm: &str, out: &mut OriginsFound) {
+        if let Some(entry) = self.identifier_index.entries.get(norm) {
+            for o in &entry.origins {
+                match o {
+                    Origin::UserMessage => out.user_message = true,
+                    Origin::AssistantMessage => out.assistant_message = true,
+                    Origin::ToolResult => out.tool_result = true,
                 }
             }
         }
-        out
     }
 }
 

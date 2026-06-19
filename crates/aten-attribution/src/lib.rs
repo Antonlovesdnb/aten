@@ -559,9 +559,9 @@ impl AttributionEngine {
                 }
                 n.attribution.triggering_command = triggering_command;
                 n.attribution.triggering_prompt = triggering_prompt;
-                let mut origins = session.origins_for_text(&ip);
+                let mut origins = session.origins_for_token(&ip);
                 if !host.is_empty() {
-                    let host_origins = session.origins_for_text(&host);
+                    let host_origins = session.origins_for_token(&host);
                     origins.user_message |= host_origins.user_message;
                     origins.assistant_message |= host_origins.assistant_message;
                     origins.tool_result |= host_origins.tool_result;
@@ -585,11 +585,11 @@ impl AttributionEngine {
                 }
                 d.attribution.triggering_command = triggering_command;
                 d.attribution.triggering_prompt = triggering_prompt;
-                let mut origins = session.origins_for_text(&name);
+                let mut origins = session.origins_for_token(&name);
                 // Resolved answers may themselves be identifiers the model was
                 // handed (e.g. a tool_result that named the IP directly).
                 for ip in &d.answers {
-                    let ip_origins = session.origins_for_text(ip);
+                    let ip_origins = session.origins_for_token(ip);
                     origins.user_message |= ip_origins.user_message;
                     origins.assistant_message |= ip_origins.assistant_message;
                     origins.tool_result |= ip_origins.tool_result;
