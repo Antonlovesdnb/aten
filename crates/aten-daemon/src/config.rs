@@ -5,12 +5,11 @@
 //! - Windows: `%ProgramData%\aten\config.toml`
 //! - Linux:   `/etc/aten/config.toml`
 //!
-//! Every field is optional in the TOML so a partial config is valid — the
-//! `Config::merge` semantics layer CLI overrides on top of file values on
-//! top of these defaults. The defaults assume single-user Windows install
-//! and discover transcripts under the current user's home; in service
-//! mode (where the daemon runs as LocalSystem) the install step writes a
-//! config that names the actual user's directories explicitly.
+//! Every field is optional in the TOML so a partial config is valid — CLI
+//! overrides layer on top of file values and then built-in defaults. If neither
+//! config nor CLI names transcript sources, the daemon discovers standard
+//! Claude/Codex transcript directories that exist under the current user and
+//! common multi-user profile roots.
 
 use std::path::PathBuf;
 
@@ -41,8 +40,9 @@ pub struct DaemonSection {
 #[serde(deny_unknown_fields)]
 pub struct TranscriptsSection {
     /// Directories scanned recursively for `*.jsonl` files. Dialect is
-    /// auto-detected per file from path. Service-mode default points at
-    /// `%USERPROFILE%\.claude\projects` and `\.codex\sessions`.
+    /// auto-detected per file from path/content. If unset, daemon mode scans
+    /// existing `.claude/projects` and `.codex/sessions` directories under
+    /// standard user profile roots.
     #[serde(default)]
     pub watch_dirs: Vec<PathBuf>,
     /// Individual transcript files. Used by single-session test harnesses;

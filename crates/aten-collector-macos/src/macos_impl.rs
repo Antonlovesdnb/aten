@@ -80,6 +80,34 @@ pub enum Msg {
 const DRAIN_BATCH: usize = 256;
 const PROCESS_CACHE_CAP: usize = 16_384;
 
+fn producer_drop_status_event(
+    host_id: Option<String>,
+    total_dropped: u64,
+    since_last: u64,
+) -> Event {
+    Event {
+        schema_version: SCHEMA_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: now_rfc3339(),
+        monotonic_ns: None,
+        platform: Platform::Macos,
+        host_id,
+        agent_id: "aten-collector".to_string(),
+        session_id: None,
+        user_id: None,
+        source: Source {
+            collector: "macos".to_string(),
+            probe: "producer_queue".to_string(),
+            host_pid: None,
+        },
+        kind: EventKind::CollectorStatus(CollectorStatusPayload {
+            dropped_total: total_dropped,
+            dropped_since_last: since_last,
+            reason: "producer queue full; events dropped before the consumer".to_string(),
+        }),
+    }
+}
+
 pub fn run<F>(config: CollectorConfig, stop: Arc<AtomicBool>, emit: F) -> Result<()>
 where
     F: FnMut(Event),
@@ -179,34 +207,25 @@ where
             // queue. Emitted on the consumer thread, the only `emit` site.
             let total_now = dropped.load(Ordering::Relaxed);
             if total_now > last_status_dropped {
-                let status = Event {
-                    schema_version: SCHEMA_VERSION.to_string(),
-                    event_id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: now_rfc3339(),
-                    monotonic_ns: None,
-                    platform: Platform::Macos,
-                    host_id: config.host_id.clone(),
-                    agent_id: "aten-collector".to_string(),
-                    session_id: None,
-                    user_id: None,
-                    source: Source {
-                        collector: "macos".to_string(),
-                        probe: "producer_queue".to_string(),
-                        host_pid: None,
-                    },
-                    kind: EventKind::CollectorStatus(CollectorStatusPayload {
-                        dropped_total: total_now,
-                        dropped_since_last: total_now - last_status_dropped,
-                        reason: "producer queue full; events dropped before the consumer"
-                            .to_string(),
-                    }),
-                };
+                let status = producer_drop_status_event(
+                    config.host_id.clone(),
+                    total_now,
+                    total_now - last_status_dropped,
+                );
                 emit(status);
                 last_status_dropped = total_now;
             }
         }
     }
     let dropped = dropped.load(Ordering::Relaxed);
+    if dropped > last_status_dropped {
+        let status = producer_drop_status_event(
+            config.host_id.clone(),
+            dropped,
+            dropped - last_status_dropped,
+        );
+        emit(status);
+    }
     if dropped > 0 {
         eprintln!("aten-macos: producer queue dropped {dropped} event(s) total");
     }

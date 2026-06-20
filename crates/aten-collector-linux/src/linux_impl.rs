@@ -429,28 +429,8 @@ where
             let total_now: u64 = current.iter().sum();
             let total_prev: u64 = prior_drops.iter().sum();
             if total_now > total_prev {
-                let status = Event {
-                    schema_version: SCHEMA_VERSION.to_string(),
-                    event_id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: rfc3339_now(),
-                    monotonic_ns: None,
-                    platform: Platform::Linux,
-                    host_id: host_id.clone(),
-                    agent_id: "aten-collector".to_string(),
-                    session_id: None,
-                    user_id: None,
-                    source: Source {
-                        collector: "linux_ebpf".to_string(),
-                        probe: "ringbuf".to_string(),
-                        host_pid: None,
-                    },
-                    kind: EventKind::CollectorStatus(CollectorStatusPayload {
-                        dropped_total: total_now,
-                        dropped_since_last: total_now - total_prev,
-                        reason: "eBPF ring buffer full; kernel events dropped before userspace"
-                            .to_string(),
-                    }),
-                };
+                let status =
+                    ringbuf_drop_status_event(host_id.clone(), total_now, total_now - total_prev);
                 (*emit_cell.borrow_mut())(status);
             }
             prior_drops = current;
@@ -459,7 +439,48 @@ where
         tick();
     }
 
+    let current = [
+        bpf_drop_count(&exec_maps.dropped_events),
+        bpf_drop_count(&cred_maps.dropped_events),
+        bpf_drop_count(&conn_maps.dropped_events),
+        dns_maps.map_or(0, |maps| bpf_drop_count(&maps.dropped_events)),
+    ];
+    let total_now: u64 = current.iter().sum();
+    let total_prev: u64 = prior_drops.iter().sum();
+    if total_now > total_prev {
+        let status = ringbuf_drop_status_event(host_id.clone(), total_now, total_now - total_prev);
+        (*emit_cell.borrow_mut())(status);
+    }
+
     Ok(())
+}
+
+fn ringbuf_drop_status_event(
+    host_id: Option<String>,
+    dropped_total: u64,
+    dropped_since_last: u64,
+) -> Event {
+    Event {
+        schema_version: SCHEMA_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: rfc3339_now(),
+        monotonic_ns: None,
+        platform: Platform::Linux,
+        host_id,
+        agent_id: "aten-collector".to_string(),
+        session_id: None,
+        user_id: None,
+        source: Source {
+            collector: "linux_ebpf".to_string(),
+            probe: "ringbuf".to_string(),
+            host_pid: None,
+        },
+        kind: EventKind::CollectorStatus(CollectorStatusPayload {
+            dropped_total,
+            dropped_since_last,
+            reason: "eBPF ring buffer full; kernel events dropped before userspace".to_string(),
+        }),
+    }
 }
 
 fn bpf_drop_count<M: MapCore + ?Sized>(map: &M) -> u64 {
@@ -658,14 +679,15 @@ where
     // Windows Create-disposition split). A read-intent open of a credential
     // file stays credential_access below. Classify before any enrollment work,
     // same drop-99%-cheaply ordering as the credential path.
-    if is_write_intent(raw.flags) {
+    let write_intent = is_write_intent(raw.flags);
+    if write_intent {
         if let Some(write_class) = filewrite::classify(filename) {
             return emit_file_write(&raw, filename, write_class, state, host_id, emit);
         }
     }
 
     // 99%+ of opens are not credentials — classify FIRST, then check enrollment.
-    let class = credentials::classify(filename);
+    let class = credentials::classify_for_access(filename, write_intent);
     if class == CredentialClass::None {
         return Ok(());
     }

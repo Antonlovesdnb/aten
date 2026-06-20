@@ -96,6 +96,31 @@ pub fn detect_dialect_from_path(path: &std::path::Path) -> TranscriptDialect {
     }
 }
 
+/// Heuristic dialect detection from one JSONL record. Used as a content sniff
+/// when a caller supplied an individual file outside the standard Claude/Codex
+/// directory layouts, or when those layouts drift. Returns `None` for metadata
+/// or malformed lines that don't identify either format.
+pub fn detect_dialect_from_line(line: &str) -> Option<TranscriptDialect> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("session_meta" | "response_item" | "event_msg") => Some(TranscriptDialect::Codex),
+        Some(_) if v.get("sessionId").is_some() || v.get("message").is_some() => {
+            Some(TranscriptDialect::ClaudeCode)
+        }
+        _ if v.get("sessionId").is_some() || v.get("message").is_some() => {
+            Some(TranscriptDialect::ClaudeCode)
+        }
+        _ => None,
+    }
+}
+
+/// Path heuristic plus optional content sniff. Content wins when recognized.
+pub fn detect_dialect(path: &std::path::Path, first_line: Option<&str>) -> TranscriptDialect {
+    first_line
+        .and_then(detect_dialect_from_line)
+        .unwrap_or_else(|| detect_dialect_from_path(path))
+}
+
 /// Dispatch to the right parser. Used by callers that don't want to know
 /// the dialect at the call site (the attribution engine and the
 /// `aten transcript` CLI subcommand).
@@ -542,6 +567,32 @@ mod tests {
             let rec: TranscriptRecord = serde_json::from_value(m).unwrap();
             assert!(parse_record(&rec, Platform::Linux).is_empty());
         }
+    }
+
+    #[test]
+    fn dialect_sniff_uses_content_when_path_is_ambiguous() {
+        let codex = r#"{"type":"session_meta","payload":{"id":"sess","cwd":"/tmp"}}"#;
+        assert_eq!(
+            detect_dialect_from_line(codex),
+            Some(TranscriptDialect::Codex)
+        );
+        assert_eq!(
+            detect_dialect(std::path::Path::new("/tmp/ambiguous.jsonl"), Some(codex)),
+            TranscriptDialect::Codex
+        );
+
+        let claude = r#"{"type":"user","sessionId":"sess","message":{"content":"hi"}}"#;
+        assert_eq!(
+            detect_dialect_from_line(claude),
+            Some(TranscriptDialect::ClaudeCode)
+        );
+        assert_eq!(
+            detect_dialect(
+                std::path::Path::new("/tmp/rollout-fake.jsonl"),
+                Some(claude),
+            ),
+            TranscriptDialect::ClaudeCode
+        );
     }
 
     /// The crime scene from scenario-prompt-injection.md: identifier first appears

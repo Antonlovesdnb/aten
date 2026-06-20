@@ -89,8 +89,22 @@ struct sys_enter_openat_args {
     __u64 mode;           // 40..48
 };
 
-SEC("tracepoint/syscalls/sys_enter_openat")
-int handle_openat(struct sys_enter_openat_args *ctx) {
+struct open_how_local {
+    __u64 flags;
+    __u64 mode;
+    __u64 resolve;
+};
+
+struct sys_enter_openat2_args {
+    __u64 __unused_pad;          // 0..8   common header
+    __s64 __syscall_nr;          // 8..16
+    __s64 dfd;                   // 16..24
+    const char *filename;        // 24..32
+    const struct open_how_local *how; // 32..40
+    __u64 size;                  // 40..48
+};
+
+static __always_inline int emit_open_event(const char *filename, __s64 flags) {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (!bpf_map_lookup_elem(&enrolled_pids, &pid)) {
         return 0;
@@ -103,11 +117,23 @@ int handle_openat(struct sys_enter_openat_args *ctx) {
     e->timestamp_ns = bpf_ktime_get_boot_ns();
     e->pid = pid;
     e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
-    e->flags = (__s32)ctx->flags;
+    e->flags = (__s32)flags;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    bpf_probe_read_user_str(e->filename, sizeof(e->filename), ctx->filename);
+    bpf_probe_read_user_str(e->filename, sizeof(e->filename), filename);
     bpf_ringbuf_submit(e, 0);
     return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_openat")
+int handle_openat(struct sys_enter_openat_args *ctx) {
+    return emit_open_event(ctx->filename, ctx->flags);
+}
+
+SEC("tracepoint/syscalls/sys_enter_openat2")
+int handle_openat2(struct sys_enter_openat2_args *ctx) {
+    struct open_how_local how = {};
+    bpf_probe_read_user(&how, sizeof(how), ctx->how);
+    return emit_open_event(ctx->filename, (__s64)how.flags);
 }
 
 char LICENSE[] SEC("license") = "GPL";

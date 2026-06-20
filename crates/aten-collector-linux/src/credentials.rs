@@ -27,6 +27,14 @@ use aten_schema::CredentialClass;
 /// don't look like credentials — the caller should drop those events at the
 /// collector rather than emitting `credential_class=none` to the SIEM.
 pub fn classify(path: &str) -> CredentialClass {
+    classify_for_access(path, false)
+}
+
+/// Best-effort classification with access intent. Most credential files are
+/// sensitive on read and write; a few are mainly persistence-sensitive write
+/// targets (`authorized_keys`). Callers that can infer write intent should pass
+/// it so those paths are not silently missed while read-only opens stay quiet.
+pub fn classify_for_access(path: &str, write_intent: bool) -> CredentialClass {
     // Normalize Windows separators to POSIX so a single set of suffix patterns
     // works for both platforms. `replace` allocates a second String even when
     // it changes nothing, so skip it for backslash-free paths — the common
@@ -37,18 +45,27 @@ pub fn classify(path: &str) -> CredentialClass {
         path.to_lowercase()
     };
 
-    if p.ends_with("/.aws/credentials") || p.ends_with("/.aws/config") {
+    if ends_with_path(&p, ".aws/credentials")
+        || ends_with_path(&p, ".aws/config")
+        || contains_path(&p, ".aws/sso/cache/")
+        || contains_path(&p, ".aws/cli/cache/")
+    {
         return CredentialClass::AwsCredentials;
     }
-    if p.contains("/.azure/") {
+    if contains_path(&p, ".azure/")
+        || contains_path(&p, "appdata/local/.identityservice/")
+        || contains_path(&p, "appdata/local/microsoft/identitycache/")
+    {
         return CredentialClass::AzureCredentials;
     }
-    if p.contains("/.config/gcloud/") {
+    if contains_path(&p, ".config/gcloud/") || contains_path(&p, "appdata/roaming/gcloud/") {
         return CredentialClass::GcpCredentials;
     }
-    if let Some(idx) = p.find("/.ssh/") {
-        let after = &p[idx + "/.ssh/".len()..];
+    if let Some(after) = after_path_fragment(&p, ".ssh/") {
         if let Some(name) = after.split('/').next() {
+            if write_intent && matches!(name, "authorized_keys" | "authorized_keys2") {
+                return CredentialClass::SshAuthorizedKeys;
+            }
             // Any file directly under `.ssh/` that isn't on the well-known
             // non-secret list and isn't a `.pub` (public-key) file is
             // treated as an SSH private key. Real users name their keys
@@ -76,24 +93,72 @@ pub fn classify(path: &str) -> CredentialClass {
             }
         }
     }
-    if p.ends_with("/.git-credentials") || p.ends_with("/.config/git/credentials") {
+    if ends_with_path(&p, ".git-credentials") || ends_with_path(&p, ".config/git/credentials") {
         return CredentialClass::GitCredentials;
     }
-    if p.ends_with("/cookies")
+    if ends_with_path(&p, ".netrc") {
+        return CredentialClass::Netrc;
+    }
+    if ends_with_path(&p, ".npmrc") {
+        return CredentialClass::NpmToken;
+    }
+    if ends_with_path(&p, ".pypirc") {
+        return CredentialClass::PypiCredentials;
+    }
+    if ends_with_path(&p, ".docker/config.json") {
+        return CredentialClass::DockerConfig;
+    }
+    if ends_with_path(&p, ".config/gh/hosts.yml")
+        || ends_with_path(&p, ".config/gh/hosts.json")
+        || contains_path(&p, "appdata/roaming/github cli/hosts.yml")
+    {
+        return CredentialClass::GithubCliToken;
+    }
+    if contains_path(&p, "microsoft/protect/") {
+        return CredentialClass::DpapiBlob;
+    }
+    if contains_path(&p, "microsoft/credentials/") || contains_path(&p, "microsoft/vault/") {
+        return CredentialClass::CredentialManager;
+    }
+    if (ends_with_path(&p, "cookies") || ends_with_path(&p, "cookies.sqlite"))
         && (p.contains("/google-chrome/")
             || p.contains("/chromium/")
             || p.contains("/bravesoftware/")
-            || p.contains("/firefox/"))
+            || p.contains("/firefox/")
+            || p.contains("/microsoft/edge/")
+            || p.contains("/opera software/"))
     {
         return CredentialClass::BrowserCookies;
     }
-    if p.ends_with("/.kube/config") {
+    if ends_with_path(&p, ".kube/config") {
         return CredentialClass::KubeConfig;
     }
-    if p.ends_with("/.env") || p.contains("/.env.") {
+    if ends_with_path(&p, ".env") || p.starts_with(".env.") || p.contains("/.env.") {
         return CredentialClass::GenericDotenv;
     }
     CredentialClass::None
+}
+
+fn ends_with_path(path: &str, suffix: &str) -> bool {
+    path == suffix
+        || path
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('/'))
+}
+
+fn contains_path(path: &str, fragment: &str) -> bool {
+    path.match_indices(fragment)
+        .any(|(idx, _)| idx == 0 || path.as_bytes().get(idx - 1) == Some(&b'/'))
+}
+
+fn after_path_fragment<'a>(path: &'a str, fragment: &str) -> Option<&'a str> {
+    path.match_indices(fragment).find_map(|(idx, _)| {
+        if idx == 0 || path.as_bytes().get(idx - 1) == Some(&b'/') {
+            Some(&path[idx + fragment.len()..])
+        } else {
+            None
+        }
+    })
 }
 
 /// True when `path` is an AI agent's *own* configuration dotenv —
@@ -158,6 +223,10 @@ mod tests {
             CredentialClass::None
         );
         assert_eq!(
+            classify_for_access("/home/anton/.ssh/authorized_keys", true),
+            CredentialClass::SshAuthorizedKeys
+        );
+        assert_eq!(
             classify("/home/anton/.ssh/known_hosts"),
             CredentialClass::None
         );
@@ -170,6 +239,8 @@ mod tests {
             classify("/home/anton/proj/.env"),
             CredentialClass::GenericDotenv
         );
+        assert_eq!(classify(".env"), CredentialClass::GenericDotenv);
+        assert_eq!(classify(".env.local"), CredentialClass::GenericDotenv);
         assert_eq!(
             classify("/home/anton/proj/.env.production"),
             CredentialClass::GenericDotenv
@@ -208,6 +279,10 @@ mod tests {
             classify("/home/anton/.config/google-chrome/default/cookies"),
             CredentialClass::BrowserCookies
         );
+        assert_eq!(
+            classify("/home/anton/.mozilla/firefox/abcd.default/cookies.sqlite"),
+            CredentialClass::BrowserCookies
+        );
     }
 
     #[test]
@@ -240,10 +315,41 @@ mod tests {
             classify(r"C:\Users\anton\.azure\accessTokens.json"),
             CredentialClass::AzureCredentials
         );
+        assert_eq!(
+            classify(r"C:\Users\anton\AppData\Roaming\gcloud\application_default_credentials.json"),
+            CredentialClass::GcpCredentials
+        );
+        assert_eq!(
+            classify(r"C:\Users\anton\AppData\Roaming\Microsoft\Credentials\abc"),
+            CredentialClass::CredentialManager
+        );
         // `.pub` discriminator still holds after normalization.
         assert_eq!(
             classify(r"C:\Users\anton\.ssh\id_rsa.pub"),
             CredentialClass::None
         );
+    }
+
+    #[test]
+    fn developer_token_stores_match() {
+        assert_eq!(classify("~/.netrc"), CredentialClass::Netrc);
+        assert_eq!(classify(".npmrc"), CredentialClass::NpmToken);
+        assert_eq!(
+            classify("/home/anton/.pypirc"),
+            CredentialClass::PypiCredentials
+        );
+        assert_eq!(
+            classify("/home/anton/.docker/config.json"),
+            CredentialClass::DockerConfig
+        );
+        assert_eq!(
+            classify("/home/anton/.config/gh/hosts.yml"),
+            CredentialClass::GithubCliToken
+        );
+        assert_eq!(
+            classify(".aws/sso/cache/abc.json"),
+            CredentialClass::AwsCredentials
+        );
+        assert_eq!(classify(".kube/config"), CredentialClass::KubeConfig);
     }
 }

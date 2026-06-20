@@ -63,6 +63,26 @@ fn pending_drop_status_event(
     }
 }
 
+fn emit_pending_drop_status_if_needed(
+    sink: &mut dyn sink::EventSink,
+    host_id: Option<String>,
+    total_dropped: u64,
+    last_status_dropped: &std::cell::Cell<u64>,
+) {
+    let prev_dropped = last_status_dropped.get();
+    if total_dropped <= prev_dropped {
+        return;
+    }
+    last_status_dropped.set(total_dropped);
+    let status = pending_drop_status_event(
+        host_id,
+        total_dropped,
+        total_dropped.saturating_sub(prev_dropped),
+    );
+    sink.emit(&status);
+    sink.flush();
+}
+
 #[cfg(target_os = "windows")]
 type ConsoleHandler = std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>;
 
@@ -101,6 +121,9 @@ pub(crate) fn resolve_daemon_inputs(
     transcript_paths.extend(cfg.transcripts.watch_dirs);
     transcript_paths.extend(cli_transcripts);
     transcript_paths.extend(cli_watch_dirs);
+    if transcript_paths.is_empty() {
+        transcript_paths = default_transcript_sources();
+    }
 
     let configured_agents = if cfg.daemon.agents.is_empty() {
         None
@@ -122,6 +145,68 @@ pub(crate) fn resolve_daemon_inputs(
         out_path,
         sink_kind,
     })
+}
+
+pub(crate) fn default_transcript_sources() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(home) = current_home_dir() {
+        push_agent_transcript_dirs(&home, &mut paths);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            push_agent_transcript_dirs(&PathBuf::from(profile), &mut paths);
+        }
+        push_user_profile_transcript_dirs(std::path::Path::new(r"C:\Users"), &mut paths);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        push_user_profile_transcript_dirs(std::path::Path::new("/home"), &mut paths);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        push_user_profile_transcript_dirs(std::path::Path::new("/Users"), &mut paths);
+    }
+
+    paths
+}
+
+fn current_home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+fn push_user_profile_transcript_dirs(root: &std::path::Path, paths: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            push_agent_transcript_dirs(&entry.path(), paths);
+        }
+    }
+}
+
+fn push_agent_transcript_dirs(home: &std::path::Path, paths: &mut Vec<PathBuf>) {
+    push_existing_unique(home.join(".claude").join("projects"), paths);
+    push_existing_unique(home.join(".codex").join("sessions"), paths);
+}
+
+fn push_existing_unique(path: PathBuf, paths: &mut Vec<PathBuf>) {
+    if path.is_dir() && !paths.contains(&path) {
+        paths.push(path);
+    }
 }
 
 /// Parse an `output.sink` / `--sink` value to a `SinkKind`. Unrecognised
@@ -576,8 +661,17 @@ pub(crate) fn run_daemon_loop_windows(
         }
         s.flush();
     }
-    engine.lock().expect("engine lock").flush_state()?;
     let dropped = pending_dropped.load(Ordering::Relaxed);
+    if dropped > last_status_dropped.get() {
+        let mut s = sink.lock().expect("sink lock");
+        emit_pending_drop_status_if_needed(
+            &mut **s,
+            host_id.clone(),
+            dropped,
+            &last_status_dropped,
+        );
+    }
+    engine.lock().expect("engine lock").flush_state()?;
     if dropped > 0 {
         eprintln!("aten: pending attribution queue dropped {dropped} event(s) total");
     }
@@ -783,17 +877,55 @@ fn read_machine_id() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Linux equivalent of `windows_user_for_transcript`. Resolves a
-/// transcript file's owner uid → `uid:NNN` so `user_id` on transcript
-/// events lines up with kernel events' `user_id`. Username resolution
-/// via `getpwuid` is a follow-up — the raw uid is enough to correlate
-/// in v0.x.
+/// Linux equivalent of `windows_user_for_transcript`. Resolves a transcript
+/// file's owner uid to a username so `user_id` on transcript events lines up
+/// with kernel events' `user_id`. Falls back to `uid:NNN` if NSS lookup fails.
 #[cfg(target_os = "linux")]
 fn linux_user_for_transcript(path: &std::path::Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path)
-        .ok()
-        .map(|m| format!("uid:{}", m.uid()))
+    let uid = std::fs::metadata(path).ok()?.uid();
+    linux_username_for_uid(uid).or_else(|| Some(format!("uid:{uid}")))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_username_for_uid(uid: u32) -> Option<String> {
+    let mut buf_len = 1024usize;
+    for _ in 0..5 {
+        let mut buf = vec![0u8; buf_len];
+        let mut passwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `passwd` and `buf` are valid writable storage for the call.
+        // On success `result` either points at `passwd` or is null for no
+        // match; `pw_name` is NUL-terminated and owned by `buf`.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid as libc::uid_t,
+                passwd.as_mut_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buf_len = buf_len.saturating_mul(2);
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        // SAFETY: getpwuid_r succeeded and initialized `passwd`; `pw_name`
+        // points into `buf`, which is still alive.
+        let passwd = unsafe { passwd.assume_init() };
+        if passwd.pw_name.is_null() {
+            return None;
+        }
+        // SAFETY: POSIX guarantees `pw_name` is NUL-terminated on success.
+        return unsafe { std::ffi::CStr::from_ptr(passwd.pw_name) }
+            .to_str()
+            .ok()
+            .map(str::to_string);
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -978,12 +1110,19 @@ fn run_daemon(
         }
         s.flush();
     }
-    engine.borrow_mut().flush_state()?;
-    if pending_dropped.get() > 0 {
-        eprintln!(
-            "aten: pending attribution queue dropped {} event(s) total",
-            pending_dropped.get()
+    let dropped = pending_dropped.get();
+    if dropped > last_status_dropped.get() {
+        let mut s = sink.lock().expect("sink lock");
+        emit_pending_drop_status_if_needed(
+            &mut **s,
+            daemon_host_id.clone(),
+            dropped,
+            &last_status_dropped,
         );
+    }
+    engine.borrow_mut().flush_state()?;
+    if dropped > 0 {
+        eprintln!("aten: pending attribution queue dropped {dropped} event(s) total");
     }
 
     eprintln!("aten daemon stopped");
@@ -1268,12 +1407,19 @@ fn run_daemon(
         }
         s.flush();
     }
-    engine.borrow_mut().flush_state()?;
-    if pending_dropped.get() > 0 {
-        eprintln!(
-            "aten: pending attribution queue dropped {} event(s) total",
-            pending_dropped.get()
+    let dropped = pending_dropped.get();
+    if dropped > last_status_dropped.get() {
+        let mut s = sink.lock().expect("sink lock");
+        emit_pending_drop_status_if_needed(
+            &mut **s,
+            daemon_host_id.clone(),
+            dropped,
+            &last_status_dropped,
         );
+    }
+    engine.borrow_mut().flush_state()?;
+    if dropped > 0 {
+        eprintln!("aten: pending attribution queue dropped {dropped} event(s) total");
     }
 
     eprintln!("aten daemon stopped");
@@ -1295,7 +1441,8 @@ fn run_transcript(transcript: PathBuf, out: Option<PathBuf>, idx: Option<PathBuf
         .with_context(|| format!("read {}", transcript.display()))?;
 
     let platform = detect_platform();
-    let dialect = aten_transcript::detect_dialect_from_path(&transcript);
+    let first_line = content.lines().map(str::trim).find(|line| !line.is_empty());
+    let dialect = aten_transcript::detect_dialect(&transcript, first_line);
     let (events, index) =
         aten_transcript::read_transcript_by_dialect(dialect, &content, platform, None)?;
 

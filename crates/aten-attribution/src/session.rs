@@ -42,11 +42,15 @@ pub struct UserPromptEntry {
 pub struct SessionState {
     pub session_id: String,
     pub cwd: Option<String>,
-    /// Chronologically ordered by `timestamp_ns`. Append-only as new tool_calls
-    /// surface on each transcript refresh.
+    /// Transcript file owner resolved by the daemon. Used to disambiguate
+    /// same-cwd sessions on multi-user hosts and to avoid reusing a cached
+    /// PID→session binding across users after PID reuse.
+    pub user_id: Option<String>,
+    /// Chronologically ordered by `timestamp_ns`. New tail records usually append
+    /// in timestamp order; rare reordered records are binary-inserted.
     pub tool_calls: Vec<ToolCallEntry>,
-    /// Chronologically ordered user prompts from this session. Same
-    /// append-only growth pattern as `tool_calls`. Looked up by
+    /// Chronologically ordered user prompts from this session. Same ordered
+    /// growth pattern as `tool_calls`. Looked up by
     /// `most_recent_user_prompt_before` for the `triggering_prompt`
     /// field on kernel events.
     pub user_prompts: Vec<UserPromptEntry>,
@@ -75,7 +79,7 @@ impl SessionState {
                     let ts_ns = parse_rfc3339_ns(&ev.timestamp).unwrap_or(i64::MAX);
                     let input_text =
                         bounded_chars(&tc.tool_input.to_string(), MAX_CACHED_INTENT_CHARS);
-                    self.tool_calls.push(ToolCallEntry {
+                    self.push_tool_call_ordered(ToolCallEntry {
                         id: tc.tool_call_id.clone(),
                         name: tc.tool_name.clone(),
                         input_text_lower: input_text.to_lowercase(),
@@ -85,7 +89,7 @@ impl SessionState {
                 }
                 EventKind::Prompt(p) if matches!(p.role, Role::User) => {
                     let ts_ns = parse_rfc3339_ns(&ev.timestamp).unwrap_or(i64::MAX);
-                    self.user_prompts.push(UserPromptEntry {
+                    self.push_user_prompt_ordered(UserPromptEntry {
                         text: bounded_chars(&p.prompt_text, MAX_CACHED_INTENT_CHARS),
                         timestamp_ns: ts_ns,
                     });
@@ -93,16 +97,39 @@ impl SessionState {
                 _ => {}
             }
         }
-        // `attribute_at` and `most_recent_user_prompt_before` binary-search
-        // these vecs with `partition_point`, which requires them ordered by
-        // `timestamp_ns`. Records normally arrive append-ordered, but a
-        // flush-reordered record or an unparseable timestamp (folded in as
-        // `i64::MAX`) would otherwise sit out of order and corrupt the search.
-        // A stable sort of the now-mostly-sorted vec is near-linear and keeps
-        // the invariant the old full-reparse `refresh()` maintained.
-        self.tool_calls.sort_by_key(|tc| tc.timestamp_ns);
-        self.user_prompts.sort_by_key(|p| p.timestamp_ns);
         self.identifier_index.ingest(events, None);
+    }
+
+    /// Keep the tool-call timeline sorted without re-sorting the entire session
+    /// on every transcript refresh. The hot path is append-ordered tailing; a
+    /// flush-reordered record or an unparseable timestamp followed by a valid
+    /// one takes the binary-insert slow path.
+    fn push_tool_call_ordered(&mut self, entry: ToolCallEntry) {
+        let ts = entry.timestamp_ns;
+        match self.tool_calls.last() {
+            Some(last) if ts < last.timestamp_ns => {
+                let idx = self
+                    .tool_calls
+                    .partition_point(|existing| existing.timestamp_ns <= ts);
+                self.tool_calls.insert(idx, entry);
+            }
+            _ => self.tool_calls.push(entry),
+        }
+    }
+
+    /// Same sorted-timeline invariant as `push_tool_call_ordered`, for prompts
+    /// used by `most_recent_user_prompt_before`.
+    fn push_user_prompt_ordered(&mut self, entry: UserPromptEntry) {
+        let ts = entry.timestamp_ns;
+        match self.user_prompts.last() {
+            Some(last) if ts < last.timestamp_ns => {
+                let idx = self
+                    .user_prompts
+                    .partition_point(|existing| existing.timestamp_ns <= ts);
+                self.user_prompts.insert(idx, entry);
+            }
+            _ => self.user_prompts.push(entry),
+        }
     }
 
     /// Most-recent user prompt with timestamp <= `event_ns`. Returns None
@@ -292,5 +319,39 @@ mod tests {
         assert_eq!(s.attribute_at(200).map(|t| t.id.as_str()), Some("t2"));
         assert_eq!(s.attribute_at(250).map(|t| t.id.as_str()), Some("t2"));
         assert_eq!(s.attribute_at(99).map(|t| t.id.as_str()), None);
+    }
+
+    #[test]
+    fn ordered_push_handles_reordered_records_without_full_resort() {
+        let mut s = SessionState::default();
+        for (id, ts) in [("t3", 300), ("t1", 100), ("t2", 200)] {
+            s.push_tool_call_ordered(ToolCallEntry {
+                id: id.into(),
+                name: "Bash".into(),
+                input_text: String::new(),
+                input_text_lower: String::new(),
+                timestamp_ns: ts,
+            });
+        }
+        assert_eq!(
+            s.tool_calls
+                .iter()
+                .map(|tc| tc.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t1", "t2", "t3"]
+        );
+        assert_eq!(s.attribute_at(250).map(|t| t.id.as_str()), Some("t2"));
+
+        for (text, ts) in [("third", 300), ("first", 100), ("second", 200)] {
+            s.push_user_prompt_ordered(UserPromptEntry {
+                text: text.into(),
+                timestamp_ns: ts,
+            });
+        }
+        assert_eq!(
+            s.most_recent_user_prompt_before(250)
+                .map(|p| p.text.as_str()),
+            Some("second")
+        );
     }
 }

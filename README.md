@@ -11,7 +11,7 @@ It collects two kinds of telemetry and links them:
 
 Each action event is tagged with the session and the specific tool call it came from. That link is the part you can't get from either source on its own. It lets you ask, for example, whether a process the agent spawned read credentials that nobody in the session — not the user, not the model, not a tool result — ever mentioned.
 
-Linux and Windows are built and verified end to end. macOS is written but not yet tested on hardware. Schema is at v0.6. ATEN only observes — it does not block or kill anything; acting on what it sees is left to your SIEM rules.
+Linux and Windows are built and verified end to end. macOS is written but not yet tested on hardware. Schema is at v0.7. ATEN only observes — it does not block or kill anything; acting on what it sees is left to your SIEM rules.
 
 ## How it works, step by step
 
@@ -27,7 +27,7 @@ Linux and Windows are built and verified end to end. macOS is written but not ye
   One JSON event per line  ──►  a file, or the Windows event log  ──►  SIEM
 ```
 
-1. **Install and configure.** You install ATEN as a service and tell it which process names to treat as agents (`claude`, `codex`), and which directories hold the agents' transcripts (`~/.claude/projects`, `~/.codex/sessions`). Intent capture only works for agents whose transcript format ATEN can parse — Claude Code and Codex today (see [Supported agents](#supported-agents)).
+1. **Install and configure.** You install ATEN as a service and tell it which process names to treat as agents (`claude`, `codex`). If you do not name transcript sources explicitly, ATEN discovers existing Claude/Codex transcript directories under standard user profile roots (`~/.claude/projects`, `~/.codex/sessions`, `/home/*`, `/Users/*`, or `C:\Users\*`). Intent capture only works for agents whose transcript format ATEN can parse — Claude Code and Codex today (see [Supported agents](#supported-agents)).
 
 2. **Enrollment.** ATEN watches every process that starts. When a process whose name matches your agent list starts, ATEN *enrolls* it. Any child it spawns is enrolled too, and so on down the tree — so `claude → bash → npm → node` is all tracked as one agent's activity. Processes that aren't an agent or a descendant of one are ignored, so unrelated host activity never enters the pipeline.
 
@@ -52,7 +52,7 @@ These have no process context — they come from the transcript file, not a runn
 ### Action events (from the kernel, for enrolled processes only)
 
 - `process_exec` — a process started: its argv and a selected slice of its environment.
-- `credential_access` — a credential file was read, written, or opened. The collector classifies the path into a typed `credential_class` so your rules never have to match paths by hand: `aws_credentials`, `azure_credentials`, `gcp_credentials`, `ssh_private_key`, `git_credentials`, `dpapi_blob`, `credential_manager`, `browser_cookies`, `kube_config`, `generic_dotenv`. Reads of ordinary files are not emitted.
+- `credential_access` — a credential file was read, written, or opened. The collector classifies the path into a typed `credential_class` so your rules never have to match paths by hand: `aws_credentials`, `azure_credentials`, `gcp_credentials`, `ssh_private_key`, `ssh_authorized_keys`, `git_credentials`, `netrc`, `npm_token`, `pypi_credentials`, `docker_config`, `github_cli_token`, `dpapi_blob`, `credential_manager`, `browser_cookies`, `kube_config`, `generic_dotenv`. Reads of ordinary files are not emitted.
 - `file_write` — a sensitive file was written. Two kinds: `agent_config` (a write into the agent's own configuration — `skills/`, `agents/`, `settings.json`, `.claude/`, `.codex/`, which is how an agent could persist changes to its own future behavior) and `executable` (a script or binary — `.sh`, `.ps1`, `.py`, `.exe`, …). Ordinary file writes are not emitted. A write *to a credential path* is reported as `credential_access` with `access_type=write` instead.
 - `dns_query` — a name was resolved: the `query_name`, the `query_type` (`a`, `aaaa`, `txt`, …), and the answers when seen. The answers also let you trace a later connection back to the name behind it when the destination IP is a shared CDN address.
 - `network_egress` — an outbound connection: destination IP and port, the hostname, and the TLS SNI when observed.
@@ -299,7 +299,7 @@ file_path = "/var/log/aten/events.jsonl"
 sink = "jsonl"                           # jsonl | eventlog | both  (eventlog/both: Windows only)
 ```
 
-How CLI flags combine with the file: `--agents`, `--out`, and `--sink` **override** the corresponding config value, while `--watch-dir` and `--transcript` are **added** to whatever the config already lists, not a replacement.
+How CLI flags combine with the file: `--agents`, `--out`, and `--sink` **override** the corresponding config value, while `--watch-dir` and `--transcript` are **added** to whatever the config already lists, not a replacement. If neither the config nor CLI names any transcript source, daemon mode falls back to auto-discovery of existing Claude/Codex transcript directories under user profiles.
 
 Output destination: the `/var/log/aten/events.jsonl` (Linux) and `%ProgramData%\aten\events.jsonl` (Windows) paths apply when ATEN runs as an installed service — they come from the config the installer writes. A foreground `aten daemon` with no `--out` and no `file_path` set writes JSONL to **stdout** instead. ATEN persists how far it has read across restarts, so restarting the service replays no old events and drops nothing in flight.
 

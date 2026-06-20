@@ -58,6 +58,7 @@
           <task name="Prompt"           symbol="TASK_PROMPT"            value="10" message="$(string.task.prompt)"/>
           <task name="ToolCall"         symbol="TASK_TOOL_CALL"         value="11" message="$(string.task.tool_call)"/>
           <task name="ToolResult"       symbol="TASK_TOOL_RESULT"       value="12" message="$(string.task.tool_result)"/>
+          <task name="CollectorStatus"  symbol="TASK_COLLECTOR_STATUS"  value="20" message="$(string.task.collector_status)"/>
         </tasks>
 
         <templates>
@@ -219,6 +220,19 @@
             <data name="RawJson"       inType="win:UnicodeString"/>
           </template>
 
+          <!-- Collector self-telemetry: emitted when ATEN drops events because
+               a bounded queue or ring buffer couldn't keep up. No process
+               context; the source/probe and RawJson identify the stage. -->
+          <template tid="t_status">
+            <data name="Timestamp"        inType="win:UnicodeString"/>
+            <data name="HostId"           inType="win:UnicodeString"/>
+            <data name="AgentId"          inType="win:UnicodeString"/>
+            <data name="DroppedTotal"     inType="win:UInt64"/>
+            <data name="DroppedSinceLast" inType="win:UInt64"/>
+            <data name="Reason"           inType="win:UnicodeString"/>
+            <data name="RawJson"          inType="win:UnicodeString"/>
+          </template>
+
           <!-- Generic fallback for event kinds not currently emitted
                (ProcessExit): envelope + Pid + RawJson. -->
           <template tid="t_generic">
@@ -240,6 +254,7 @@
           <event symbol="EVT_PROMPT"            value="10" version="0" channel="Operational" level="win:Informational" task="Prompt"           template="t_prompt"      message="$(string.evt.prompt)"/>
           <event symbol="EVT_TOOL_CALL"         value="11" version="0" channel="Operational" level="win:Informational" task="ToolCall"         template="t_tool_call"   message="$(string.evt.tool_call)"/>
           <event symbol="EVT_TOOL_RESULT"       value="12" version="0" channel="Operational" level="win:Informational" task="ToolResult"       template="t_tool_result" message="$(string.evt.tool_result)"/>
+          <event symbol="EVT_COLLECTOR_STATUS"  value="20" version="0" channel="Operational" level="win:Warning"       task="CollectorStatus" template="t_status"      message="$(string.evt.collector_status)"/>
         </events>
       </provider>
     </events>
@@ -258,6 +273,7 @@
         <string id="task.prompt"            value="Prompt"/>
         <string id="task.tool_call"         value="Tool Call"/>
         <string id="task.tool_result"       value="Tool Result"/>
+        <string id="task.collector_status"  value="Collector Status"/>
 
         <!-- General-tab messages. %-indices reference template fields in order;
              the kernel templates share fields 1-15, so %5=Pid, %7=ProcessName,
@@ -271,6 +287,7 @@
         <string id="evt.prompt"            value="AI agent prompt (%6): %7"/>
         <string id="evt.tool_call"         value="AI agent tool call: %6"/>
         <string id="evt.tool_result"       value="AI agent tool result [%7]"/>
+        <string id="evt.collector_status"  value="ATEN collector dropped %5 event(s), %4 total: %6"/>
       </stringTable>
     </resources>
   </localization>

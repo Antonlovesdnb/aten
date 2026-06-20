@@ -222,10 +222,11 @@ fn build_open_event(
 ) -> Option<Event> {
     // VERIFY: EventOpen file accessor — `file()` per es_event_open_t.file.
     let path = osstr_to_string(open.file().path());
+    let write_intent = open_flags_write_intent(open.fflag());
 
     // Classify FIRST — the vast majority of opens aren't credentials, and we
     // want to drop them before taking the lock or touching libproc.
-    let class = credentials::classify(&path);
+    let class = credentials::classify_for_access(&path, write_intent);
     if class == CredentialClass::None {
         return None;
     }
@@ -269,13 +270,22 @@ fn build_open_event(
             process,
             attribution: macos_impl::descent_attribution(!is_agent_root),
             file_path: path,
-            // ESF open carries the requested fflag; deriving RO/RW from it is a
-            // refinement. v0.x reports Open (the credential class is the signal).
-            access_type: AccessType::Open,
+            access_type: if write_intent {
+                AccessType::Write
+            } else {
+                AccessType::Open
+            },
             credential_class: class,
             bytes_read: None,
         }),
     })
+}
+
+fn open_flags_write_intent(flags: i32) -> bool {
+    let accmode = flags & libc::O_ACCMODE;
+    accmode == libc::O_WRONLY
+        || accmode == libc::O_RDWR
+        || flags & (libc::O_APPEND | libc::O_TRUNC | libc::O_CREAT) != 0
 }
 
 /// `SystemTime` → seconds since the UNIX epoch, matching

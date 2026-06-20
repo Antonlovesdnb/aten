@@ -16,8 +16,8 @@
 use std::io;
 
 use aten_schema::{
-    AccessType, CredentialClass, DnsQueryType, Event, EventKind, FileWriteClass, Protocol, Role,
-    ResultStatus,
+    AccessType, CredentialClass, DnsQueryType, Event, EventKind, FileWriteClass, Protocol,
+    ResultStatus, Role,
 };
 use windows::core::GUID;
 use windows::Win32::System::Diagnostics::Etw::{
@@ -48,10 +48,8 @@ pub fn event_id_for(kind: &EventKind) -> u16 {
         EventKind::Prompt(_) => 10,
         EventKind::ToolCall(_) => 11,
         EventKind::ToolResult(_) => 12,
-        // Daemon self-telemetry. Not yet declared in aten.man, so Event Viewer
-        // won't render a typed template, but the write still lands on the
-        // channel (RawJson carries the payload) for WEF/SIEM raw collection.
-        // Add a `t_status` template + this id to the manifest to get rendering.
+        // Daemon/collector self-telemetry. Kept in lockstep with
+        // EVT_COLLECTOR_STATUS and the `t_status` template in aten.man.
         EventKind::CollectorStatus(_) => 20,
     }
 }
@@ -126,6 +124,7 @@ impl EventLogSink {
             .map(|f| match f {
                 Field::S(v) => desc_str(v),
                 Field::I(i) => desc_i32(i),
+                Field::U(u) => desc_u64(u),
             })
             .collect();
 
@@ -152,10 +151,11 @@ impl Drop for EventLogSink {
 // EventWrite is internally synchronised by ETW.
 unsafe impl Send for EventLogSink {}
 
-/// One template field: an already-encoded UTF-16 string, or an i32.
+/// One template field: an already-encoded UTF-16 string, an i32, or a u64.
 enum Field {
     S(Vec<u16>),
     I(i32),
+    U(u64),
 }
 
 fn s(v: &str) -> Field {
@@ -170,6 +170,9 @@ fn b(v: bool) -> Field {
 fn iv(v: i32) -> Field {
     Field::I(v)
 }
+fn uv(v: u64) -> Field {
+    Field::U(v)
+}
 
 // Wire strings for the schema enums emitted as ETW template fields. Hand-mapped
 // (not via serde_json) so each emitted event avoids a serde round-trip plus two
@@ -182,7 +185,13 @@ fn cred_class_wire(v: &CredentialClass) -> &'static str {
         CredentialClass::AzureCredentials => "azure_credentials",
         CredentialClass::GcpCredentials => "gcp_credentials",
         CredentialClass::SshPrivateKey => "ssh_private_key",
+        CredentialClass::SshAuthorizedKeys => "ssh_authorized_keys",
         CredentialClass::GitCredentials => "git_credentials",
+        CredentialClass::Netrc => "netrc",
+        CredentialClass::NpmToken => "npm_token",
+        CredentialClass::PypiCredentials => "pypi_credentials",
+        CredentialClass::DockerConfig => "docker_config",
+        CredentialClass::GithubCliToken => "github_cli_token",
         CredentialClass::DpapiBlob => "dpapi_blob",
         CredentialClass::CredentialManager => "credential_manager",
         CredentialClass::BrowserCookies => "browser_cookies",
@@ -360,11 +369,22 @@ fn fields_for(ev: &Event, json: &str) -> Vec<Field> {
             f
         }
         // t_generic: Timestamp, HostId, AgentId, Pid, RawJson.
-        EventKind::ProcessExit(_) | EventKind::CollectorStatus(_) => vec![
+        EventKind::ProcessExit(_) => vec![
             s(&ev.timestamp),
             so(ev.host_id.as_deref()),
             s(&ev.agent_id),
             iv(pid_for(&ev.kind)),
+            s(json),
+        ],
+        // t_status: Timestamp, HostId, AgentId, DroppedTotal,
+        // DroppedSinceLast, Reason, RawJson.
+        EventKind::CollectorStatus(p) => vec![
+            s(&ev.timestamp),
+            so(ev.host_id.as_deref()),
+            s(&ev.agent_id),
+            uv(p.dropped_total),
+            uv(p.dropped_since_last),
+            s(&p.reason),
             s(json),
         ],
     }
@@ -391,12 +411,21 @@ fn desc_i32(v: &i32) -> EVENT_DATA_DESCRIPTOR {
     }
 }
 
+fn desc_u64(v: &u64) -> EVENT_DATA_DESCRIPTOR {
+    EVENT_DATA_DESCRIPTOR {
+        Ptr: v as *const u64 as u64,
+        Size: std::mem::size_of::<u64>() as u32,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use aten_schema::{
-        AccessType, Attribution, CredentialAccessPayload, CredentialClass, NetworkEgressPayload,
-        Process, ProcessExecPayload, PromptPayload, Protocol, Role, ToolCallPayload,
+        AccessType, Attribution, CollectorStatusPayload, CredentialAccessPayload, CredentialClass,
+        NetworkEgressPayload, Process, ProcessExecPayload, PromptPayload, Protocol, Role,
+        ToolCallPayload,
     };
 
     fn proc() -> Process {
@@ -467,6 +496,14 @@ mod tests {
         });
         assert_eq!(event_id_for(&cred), 3);
         assert_eq!(level_for(&cred), LEVEL_WARNING);
+
+        let status = EventKind::CollectorStatus(CollectorStatusPayload {
+            dropped_total: 10,
+            dropped_since_last: 2,
+            reason: "test".into(),
+        });
+        assert_eq!(event_id_for(&status), 20);
+        assert_eq!(level_for(&status), LEVEL_WARNING);
     }
 
     #[test]
@@ -515,7 +552,13 @@ mod tests {
             AzureCredentials,
             GcpCredentials,
             SshPrivateKey,
+            SshAuthorizedKeys,
             GitCredentials,
+            Netrc,
+            NpmToken,
+            PypiCredentials,
+            DockerConfig,
+            GithubCliToken,
             DpapiBlob,
             CredentialManager,
             BrowserCookies,
@@ -622,5 +665,15 @@ mod tests {
         // t_dns: 16 common + QueryName + QueryType + Answers + RawJson.
         assert_eq!(fields_for(&dns, "{}").len(), 20);
         assert_eq!(event_id_for(&dns.kind), 6);
+
+        let status = ev(EventKind::CollectorStatus(CollectorStatusPayload {
+            dropped_total: 123,
+            dropped_since_last: 4,
+            reason: "pending queue full".into(),
+        }));
+        // t_status: Timestamp + HostId + AgentId + DroppedTotal +
+        // DroppedSinceLast + Reason + RawJson.
+        assert_eq!(fields_for(&status, "{}").len(), 7);
+        assert_eq!(event_id_for(&status.kind), 20);
     }
 }

@@ -715,7 +715,7 @@ fn handle_file_event(
     // Classify before doing anything PID-related — the vast majority of
     // file-create events aren't credentials and we want to drop them with
     // the minimum possible work (no Mutex acquisition, no Win32 calls).
-    let class = credentials::classify(&file_name);
+    let class = credentials::classify_for_access(&file_name, write_intent);
     if class == CredentialClass::None {
         return Ok(());
     }

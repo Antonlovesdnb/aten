@@ -11,7 +11,7 @@
 //!   individual JSONL files or directories that are recursively scanned
 //!   for `*.jsonl`. Both Claude Code (`~/.claude/projects/`) and Codex
 //!   (`~/.codex/sessions/`) directory layouts are supported; dialect is
-//!   auto-detected per file from its path.
+//!   auto-detected per file from content when possible, then path.
 //! - `refresh()` stats known files and parses only complete bytes appended
 //!   since the prior tick. Recursive discovery runs once per second rather
 //!   than on the 100 ms tail cadence. Per-session state is keyed by the
@@ -24,13 +24,13 @@
 //!   tool_call and identifier-origin index.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
-use aten_schema::{Event, EventKind};
-use aten_transcript::{detect_dialect_from_path, TranscriptStreamParser};
+use aten_schema::{CollectorStatusPayload, Event, EventKind, Source, SCHEMA_VERSION};
+use aten_transcript::{detect_dialect, TranscriptStreamParser};
 
 pub mod session;
 
@@ -188,6 +188,7 @@ pub struct EngineStats {
     pub files_checked: u64,
     pub bytes_read: u64,
     pub records_parsed: u64,
+    pub parse_errors: u64,
     pub state_writes: u64,
 }
 
@@ -342,7 +343,8 @@ impl AttributionEngine {
         }
 
         let reset = meta.parser.is_none() || len < meta.byte_offset;
-        let dialect = detect_dialect_from_path(&file);
+        let first_line = reset.then(|| first_nonempty_line(&file)).flatten();
+        let dialect = detect_dialect(&file, first_line.as_deref());
         let mut parser = if reset {
             TranscriptStreamParser::new(dialect, host_platform())
         } else {
@@ -351,7 +353,7 @@ impl AttributionEngine {
                 .expect("initialized parser required for tail read")
         };
         let offset = if reset { 0 } else { meta.byte_offset };
-        let (events, new_offset, bytes_read, records_parsed) =
+        let (events, new_offset, bytes_read, records_parsed, parse_errors) =
             match read_appended_events(&file, offset, &mut parser) {
                 Ok(result) => result,
                 Err(_) => {
@@ -362,6 +364,7 @@ impl AttributionEngine {
             };
         self.stats.bytes_read = self.stats.bytes_read.saturating_add(bytes_read);
         self.stats.records_parsed = self.stats.records_parsed.saturating_add(records_parsed);
+        self.stats.parse_errors = self.stats.parse_errors.saturating_add(parse_errors);
 
         // Resolve and cache the file owner. State-loaded entries have
         // `user_id: None` (we don't persist user_id to disk), so we have
@@ -372,15 +375,23 @@ impl AttributionEngine {
             Some(u) => Some(u),
             None => (self.cfg.user_for_transcript)(&file),
         };
+        if parse_errors > 0 {
+            new_events.push(transcript_parse_status_event(
+                self.cfg.host_id.clone(),
+                user_id.clone(),
+                &file,
+                self.stats.parse_errors,
+                parse_errors,
+            ));
+        }
 
         let session_id = parser.session_id().unwrap_or_default().to_string();
         let cwd = parser.cwd().map(str::to_string);
         if !session_id.is_empty() {
             if reset && !first_sight && !meta.from_persisted_state {
-                self.sessions.insert(
-                    session_id.clone(),
-                    SessionState::from_events(session_id.clone(), &events, cwd.clone()),
-                );
+                let mut state = SessionState::from_events(session_id.clone(), &events, cwd.clone());
+                state.user_id = user_id.clone();
+                self.sessions.insert(session_id.clone(), state);
             } else {
                 match self.sessions.get_mut(&session_id) {
                     Some(state) => {
@@ -388,12 +399,15 @@ impl AttributionEngine {
                         if state.cwd.is_none() {
                             state.cwd = cwd.clone();
                         }
+                        if state.user_id.is_none() {
+                            state.user_id = user_id.clone();
+                        }
                     }
                     None => {
-                        self.sessions.insert(
-                            session_id.clone(),
-                            SessionState::from_events(session_id.clone(), &events, cwd.clone()),
-                        );
+                        let mut state =
+                            SessionState::from_events(session_id.clone(), &events, cwd.clone());
+                        state.user_id = user_id.clone();
+                        self.sessions.insert(session_id.clone(), state);
                     }
                 }
             }
@@ -459,7 +473,23 @@ impl AttributionEngine {
         };
 
         let Some(pid) = agent_root_pid else { return };
-        let Some(session_id) = self.resolve_session_for_pid(pid) else {
+        // If the enrolled agent root itself just execed, invalidate any old
+        // binding for this numeric PID before resolving. This closes the common
+        // PID-reuse hole where a dead agent process's PID later belongs to a
+        // different session/user.
+        if matches!(
+            &event.kind,
+            EventKind::ProcessExec(p)
+                if p.process.agent_root_pid == Some(p.process.pid) && p.process.pid == pid
+        ) {
+            self.pid_bindings.remove(&pid);
+        }
+
+        let session_id = {
+            let user_id = event_user_id(event);
+            self.resolve_session_for_pid(pid, user_id)
+        };
+        let Some(session_id) = session_id else {
             return;
         };
         event.session_id = Some(session_id.clone());
@@ -641,16 +671,27 @@ impl AttributionEngine {
     /// differences between the live cwd and the transcript cwd —
     /// `C:\Users\…` vs `c:\users\…` vs `C:/Users/…` all match.
     ///
-    /// **Tie-break when multiple sessions match the same cwd**: this is
-    /// common in practice because users open Claude Code multiple times
-    /// in the same project directory; the old transcript files stay
-    /// around on disk. The active session (the one actually generating
-    /// kernel events right now) is identified by having the most-recent
-    /// tool_call timestamp. We pick that one; sessions with no tool_calls
-    /// at all are treated as least-recent (effectively "stale").
-    fn resolve_session_for_pid(&mut self, agent_root_pid: i32) -> Option<String> {
+    /// **Tie-break when multiple sessions match the same cwd**: this is common
+    /// in practice because users open Claude Code multiple times in the same
+    /// project directory, and on shared hosts different users may work in
+    /// similarly named paths. Exact user matches win first. Within compatible
+    /// users, the active session is identified by the most-recent tool_call
+    /// timestamp. Sessions with no tool_calls at all are treated as
+    /// least-recent (effectively "stale").
+    fn resolve_session_for_pid(
+        &mut self,
+        agent_root_pid: i32,
+        event_user_id: Option<&str>,
+    ) -> Option<String> {
         if let Some(sid) = self.pid_bindings.get(&agent_root_pid) {
-            return Some(sid.clone());
+            if self
+                .sessions
+                .get(sid)
+                .is_some_and(|state| user_compatible(state.user_id.as_deref(), event_user_id))
+            {
+                return Some(sid.clone());
+            }
+            self.pid_bindings.remove(&agent_root_pid);
         }
         let proc_cwd = (self.cfg.cwd_for_pid)(agent_root_pid)?;
         let a = norm_cwd(&proc_cwd);
@@ -658,10 +699,11 @@ impl AttributionEngine {
             return None;
         }
 
-        // Collect every session whose cwd matches, paired with its
-        // latest tool_call timestamp. i64::MIN sorts sessions-with-no-
-        // tool_calls last so they only win when nothing else matches.
-        let mut candidates: Vec<(&String, i64)> = Vec::new();
+        // Collect every session whose cwd and user are compatible, paired with
+        // whether the user matched exactly and the latest tool_call timestamp.
+        // i64::MIN sorts sessions-with-no-tool_calls last so they only win
+        // when nothing else matches.
+        let mut candidates: Vec<(&String, bool, i64)> = Vec::new();
         for (sid, state) in &self.sessions {
             let Some(cwd) = state.cwd.as_deref() else {
                 continue;
@@ -670,22 +712,33 @@ impl AttributionEngine {
             if b.is_empty() {
                 continue;
             }
-            if a == b || a.starts_with(&b) || b.starts_with(&a) {
+            if !cwd_matches(&a, &b) {
+                continue;
+            }
+            let user_match = match (state.user_id.as_deref(), event_user_id) {
+                (Some(session_user), Some(event_user)) if user_eq(session_user, event_user) => true,
+                (Some(_), Some(_)) => continue,
+                _ => false,
+            };
+            {
                 let latest_tc = state
                     .tool_calls
                     .last()
                     .map(|tc| tc.timestamp_ns)
                     .unwrap_or(i64::MIN);
-                candidates.push((sid, latest_tc));
+                candidates.push((sid, user_match, latest_tc));
             }
         }
 
-        // Pick the session whose latest tool_call is most recent. Stable
-        // tie-break by session_id so behavior is deterministic if two
-        // sessions happen to have identical latest-tool_call timestamps
-        // (rare but possible — multi-record transcripts can share ns).
-        candidates.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0)));
-        let winner = candidates.first().map(|(sid, _)| (*sid).clone())?;
+        // Prefer exact user matches, then the session whose latest tool_call is
+        // most recent. Stable tie-break by session_id so behavior is
+        // deterministic if two sessions happen to share timestamps.
+        candidates.sort_by(|x, y| {
+            y.1.cmp(&x.1)
+                .then_with(|| y.2.cmp(&x.2))
+                .then_with(|| x.0.cmp(y.0))
+        });
+        let winner = candidates.first().map(|(sid, _, _)| (*sid).clone())?;
         self.pid_bindings.insert(agent_root_pid, winner.clone());
         Some(winner)
     }
@@ -702,10 +755,100 @@ impl AttributionEngine {
 }
 
 fn norm_cwd(s: &str) -> String {
-    s.to_lowercase()
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string()
+    let normalized = s.to_lowercase().replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    if trimmed.is_empty() && normalized.starts_with('/') {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn cwd_matches(a: &str, b: &str) -> bool {
+    a == b || cwd_has_prefix(a, b) || cwd_has_prefix(b, a)
+}
+
+fn cwd_has_prefix(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() || prefix == "/" {
+        return prefix == "/" && path.starts_with('/');
+    }
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn user_eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+fn user_compatible(session_user: Option<&str>, event_user: Option<&str>) -> bool {
+    match (session_user, event_user) {
+        (Some(a), Some(b)) => user_eq(a, b),
+        _ => true,
+    }
+}
+
+fn event_user_id(event: &Event) -> Option<&str> {
+    event.user_id.as_deref().or_else(|| match &event.kind {
+        EventKind::ProcessExec(p) => nonempty_user(&p.process.user),
+        EventKind::CredentialAccess(c) => nonempty_user(&c.process.user),
+        EventKind::NetworkEgress(n) => nonempty_user(&n.process.user),
+        EventKind::DnsQuery(d) => nonempty_user(&d.process.user),
+        EventKind::FileWrite(f) => nonempty_user(&f.process.user),
+        _ => None,
+    })
+}
+
+fn nonempty_user(user: &str) -> Option<&str> {
+    if user.is_empty() {
+        None
+    } else {
+        Some(user)
+    }
+}
+
+fn transcript_parse_status_event(
+    host_id: Option<String>,
+    user_id: Option<String>,
+    path: &Path,
+    dropped_total: u64,
+    dropped_since_last: u64,
+) -> Event {
+    Event {
+        schema_version: SCHEMA_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        monotonic_ns: None,
+        platform: host_platform(),
+        host_id,
+        agent_id: "aten-daemon".to_string(),
+        session_id: None,
+        user_id,
+        source: Source {
+            collector: "transcript".to_string(),
+            probe: "parser".to_string(),
+            host_pid: None,
+        },
+        kind: EventKind::CollectorStatus(CollectorStatusPayload {
+            dropped_total,
+            dropped_since_last,
+            reason: format!(
+                "malformed transcript records skipped while reading {}",
+                path.display()
+            ),
+        }),
+    }
+}
+
+fn first_nonempty_line(path: &Path) -> Option<String> {
+    const MAX_SNIFF_BYTES: usize = 64 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; MAX_SNIFF_BYTES];
+    let read = file.read(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf[..read]);
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
 }
 
 /// Discover explicit transcript files and recursively scan configured
@@ -742,7 +885,7 @@ fn read_appended_events(
     path: &Path,
     offset: u64,
     parser: &mut TranscriptStreamParser,
-) -> std::io::Result<(Vec<Event>, u64, u64, u64)> {
+) -> std::io::Result<(Vec<Event>, u64, u64, u64, u64)> {
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut reader = BufReader::new(file);
@@ -751,6 +894,7 @@ fn read_appended_events(
     let mut bytes = Vec::new();
     let mut bytes_read = 0u64;
     let mut records_parsed = 0u64;
+    let mut parse_errors = 0u64;
 
     loop {
         bytes.clear();
@@ -774,6 +918,7 @@ fn read_appended_events(
                 cursor = cursor.saturating_add(read as u64);
             }
             Err(error) if terminated => {
+                parse_errors = parse_errors.saturating_add(1);
                 eprintln!(
                     "aten: skipping malformed transcript record in {}: {error}",
                     path.display()
@@ -784,7 +929,7 @@ fn read_appended_events(
         }
     }
 
-    Ok((events, cursor, bytes_read, records_parsed))
+    Ok((events, cursor, bytes_read, records_parsed, parse_errors))
 }
 
 fn host_platform() -> aten_schema::Platform {
@@ -885,6 +1030,57 @@ mod tests {
     }
 
     #[test]
+    fn cwd_prefix_matching_requires_path_boundary() {
+        assert!(cwd_matches("/home/anton/proj/subdir", "/home/anton/proj"));
+        assert!(cwd_matches("/home/anton/proj", "/home/anton/proj/subdir"));
+        assert!(!cwd_matches("/home/anton/proj2", "/home/anton/proj"));
+    }
+
+    #[test]
+    fn pid_session_binding_prefers_user_match_and_rechecks_cache() {
+        fn cwd_for_test(pid: i32) -> Option<String> {
+            (pid == 42).then(|| "/tmp/project".to_string())
+        }
+
+        fn state_for(session_id: &str, user_id: &str, ts: i64) -> SessionState {
+            SessionState {
+                session_id: session_id.to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                user_id: Some(user_id.to_string()),
+                tool_calls: vec![session::ToolCallEntry {
+                    id: format!("tool-{session_id}"),
+                    name: "Bash".to_string(),
+                    input_text: String::new(),
+                    input_text_lower: String::new(),
+                    timestamp_ns: ts,
+                }],
+                ..Default::default()
+            }
+        }
+
+        let mut engine = AttributionEngine::new(EngineConfig {
+            cwd_for_pid: cwd_for_test,
+            ..EngineConfig::default()
+        });
+        engine.sessions.insert(
+            "alice-session".into(),
+            state_for("alice-session", "alice", 100),
+        );
+        engine
+            .sessions
+            .insert("bob-session".into(), state_for("bob-session", "bob", 10));
+
+        assert_eq!(
+            engine.resolve_session_for_pid(42, Some("bob")).as_deref(),
+            Some("bob-session")
+        );
+        assert_eq!(
+            engine.resolve_session_for_pid(42, Some("alice")).as_deref(),
+            Some("alice-session")
+        );
+    }
+
+    #[test]
     fn refresh_tails_only_appended_bytes() {
         let (dir, file) = temp_transcript("tail");
         let initial = claude_prompt("one", "first");
@@ -918,6 +1114,33 @@ mod tests {
         let tailed = engine.stats();
         assert_eq!(tailed.bytes_read, first.bytes_read + appended.len() as u64);
         assert_eq!(tailed.records_parsed, 2);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_terminated_records_emit_parser_status() {
+        let (dir, file) = temp_transcript("parse-status");
+        std::fs::write(
+            &file,
+            format!("{}not-json\n", claude_prompt("one", "first")),
+        )
+        .unwrap();
+
+        let mut engine = AttributionEngine::new(EngineConfig {
+            transcript_paths: vec![file.clone()],
+            ..EngineConfig::default()
+        });
+        let emitted = engine.refresh().unwrap();
+
+        assert_eq!(engine.stats().parse_errors, 1);
+        assert!(emitted.iter().any(|ev| matches!(
+            &ev.kind,
+            EventKind::CollectorStatus(status)
+                if status.dropped_total == 1
+                    && status.dropped_since_last == 1
+                    && status.reason.contains("malformed transcript records")
+        )));
 
         std::fs::remove_dir_all(dir).unwrap();
     }

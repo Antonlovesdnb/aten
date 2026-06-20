@@ -56,7 +56,10 @@ use serde::{Deserialize, Serialize};
 ///   downstream SIEM sees an explicit telemetry-gap marker instead of
 ///   silent loss. Additive: carries no `process`/`attribution` block and
 ///   no existing consumer is affected.
-pub const SCHEMA_VERSION: &str = "0.6";
+/// - 0.7: `CredentialClass` grows typed token-store classes for common
+///   developer credential files beyond cloud/SSH basics: netrc, npm, PyPI,
+///   Docker config, GitHub CLI, and SSH authorized_keys writes.
+pub const SCHEMA_VERSION: &str = "0.7";
 
 /// One link in a process's ancestor chain. Same order semantics as the
 /// old `Vec<String>` (root → immediate parent, excludes the event's own
@@ -272,7 +275,13 @@ pub enum CredentialClass {
     AzureCredentials,
     GcpCredentials,
     SshPrivateKey,
+    SshAuthorizedKeys,
     GitCredentials,
+    Netrc,
+    NpmToken,
+    PypiCredentials,
+    DockerConfig,
+    GithubCliToken,
     DpapiBlob,
     CredentialManager,
     BrowserCookies,
