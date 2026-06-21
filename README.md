@@ -11,7 +11,20 @@ It collects two kinds of telemetry and links them:
 
 Each action event is tagged with the session and the specific tool call it came from. That link is the part you can't get from either source on its own. It lets you ask, for example, whether a process the agent spawned read credentials that nobody in the session — not the user, not the model, not a tool result — ever mentioned.
 
-Linux and Windows are built and verified end to end. macOS is written but not yet tested on hardware. Schema is at v0.7. ATEN only observes — it does not block or kill anything; acting on what it sees is left to your SIEM rules.
+Linux and Windows are built and verified end to end. macOS has a native collector path built around EndpointSecurity plus a NetworkExtension flow producer; it is compile/typecheck verified here, but still needs entitlement/sysext activation on target hardware for runtime validation. Schema is at v0.8. ATEN only observes — it does not block or kill anything; acting on what it sees is left to your SIEM rules.
+
+### macOS security posture
+
+Do **not** disable System Integrity Protection or AMFI protections on your primary Mac just to test ATEN. The ad-hoc development path in `macos/devsetup.sh` is a lab-only shortcut for an isolated macOS VM or spare test Mac.
+
+There are two sane macOS paths:
+
+- **Production/distribution path:** sign with a real Apple Developer Program identity, request the EndpointSecurity and NetworkExtension entitlements from Apple, notarize the app, and let users approve the system extension/content filter through macOS's normal prompts.
+- **Lab path:** use a disposable macOS VM or spare Mac, then relax SIP/AMFI only inside that environment for ad-hoc ESF/system-extension experiments. Keep your daily-driver host security intact. Recent macOS releases may still require a real Apple-signed NetworkExtension system extension for activation; treat the lab path as a safe test harness, not a replacement for Apple-granted entitlements.
+
+[UTM](https://mac.getutm.app/) is the lowest-friction free VM route on Apple silicon: it can create macOS 12+ guests using Apple's Virtualization backend and can automatically download a compatible macOS restore image. In UTM, create a new VM with **Virtualization → macOS 12+** as described in its [macOS guest docs](https://docs.getutm.app/guest-support/macos/), then use the VM's [Run Recovery](https://docs.getutm.app/advanced/recovery/) action if you need to disable SIP inside the guest for lab testing.
+
+For NetworkExtension activation tests, install the built host bundle under `/Applications/AtenHost.app` and launch it with `open /Applications/AtenHost.app`. Do not run `Contents/MacOS/AtenHost` directly; system-extension activation resolves the embedded extension from the app bundle.
 
 ## How it works, step by step
 
@@ -31,7 +44,7 @@ Linux and Windows are built and verified end to end. macOS is written but not ye
 
 2. **Enrollment.** ATEN watches every process that starts. When a process whose name matches your agent list starts, ATEN *enrolls* it. Any child it spawns is enrolled too, and so on down the tree — so `claude → bash → npm → node` is all tracked as one agent's activity. Processes that aren't an agent or a descendant of one are ignored, so unrelated host activity never enters the pipeline.
 
-3. **Capture actions.** For enrolled processes only, the kernel collector reports when they exec a program, read a credential file, write a sensitive file, resolve a DNS name, or open a network connection. On Linux this uses eBPF, on Windows ETW, on macOS EndpointSecurity. The events have the same field names on every platform.
+3. **Capture actions.** For enrolled processes only, the collector reports when they exec a program, read a credential file, write a sensitive file, resolve a DNS name, or open a network connection. On Linux this uses eBPF, on Windows ETW, and on macOS EndpointSecurity plus a NetworkExtension content filter. The events have the same field names wherever the platform exposes the underlying signal.
 
 4. **Capture intent.** In parallel, the transcript reader tails the agent's session files and emits an event for each prompt, tool call, and tool result. It also builds a per-session index of every file path, host, IP, and command mentioned, recording *where each one first appeared* — in a user message, in the model's own output, or in a tool result.
 
@@ -46,16 +59,20 @@ Linux and Windows are built and verified end to end. macOS is written but not ye
 - `prompt` — a user, assistant, or system message, with its text and a short summary.
 - `tool_call` — the agent invoking a tool (`Bash`, `Read`, `WebFetch`, …), with the raw input it passed.
 - `tool_result` — the result returned to the agent, plus the kernel-side PIDs observed during the call.
+- `agent_session` — one context row per parsed session: agent kind, cwd, model/permission mode when the transcript exposes them.
+- `permission_decision` — explicit allow/deny/prompt decisions when the transcript records them.
 
 These have no process context — they come from the transcript file, not a running process.
 
 ### Action events (from the kernel, for enrolled processes only)
 
-- `process_exec` — a process started: its argv and a selected slice of its environment.
+- `process_exec` — a process started: argv, selected environment summary, and a typed `supply_chain_activity` tag when the command looks like package-manager, package-install, package-script, git, network-installer, container-build, or build-tool activity.
+- `process_exit` — a tracked process exited. Emitted on macOS today from EndpointSecurity; Linux/Windows cleanup currently happens without a public event.
 - `credential_access` — a credential file was read, written, or opened. The collector classifies the path into a typed `credential_class` so your rules never have to match paths by hand: `aws_credentials`, `azure_credentials`, `gcp_credentials`, `ssh_private_key`, `ssh_authorized_keys`, `git_credentials`, `netrc`, `npm_token`, `pypi_credentials`, `docker_config`, `github_cli_token`, `dpapi_blob`, `credential_manager`, `browser_cookies`, `kube_config`, `generic_dotenv`. Reads of ordinary files are not emitted.
-- `file_write` — a sensitive file was written. Two kinds: `agent_config` (a write into the agent's own configuration — `skills/`, `agents/`, `settings.json`, `.claude/`, `.codex/`, which is how an agent could persist changes to its own future behavior) and `executable` (a script or binary — `.sh`, `.ps1`, `.py`, `.exe`, …). Ordinary file writes are not emitted. A write *to a credential path* is reported as `credential_access` with `access_type=write` instead.
+- `file_write` — a sensitive file was written. Classes include `agent_config`, `executable`, `shell_profile`, `scheduled_task`, `git_hook`, `startup_item`, `package_manifest`, and `lockfile`. Ordinary file writes are not emitted. A write *to a credential path* is reported as `credential_access` with `access_type=write` instead.
 - `dns_query` — a name was resolved: the `query_name`, the `query_type` (`a`, `aaaa`, `txt`, …), and the answers when seen. The answers also let you trace a later connection back to the name behind it when the destination IP is a shared CDN address.
-- `network_egress` — an outbound connection: destination IP and port, the hostname, and the TLS SNI when observed.
+- `network_egress` — an outbound connection: destination IP and port, the hostname, TLS SNI when observed, and a `cloud_metadata` tag for known instance/task metadata endpoints.
+- `local_ipc_access` — an enrolled agent process connected to or opened a sensitive local broker socket/pipe such as Docker, containerd/Podman, SSH agent, GPG agent, or a secret-manager socket.
 
 Every action event also carries:
 
@@ -305,7 +322,7 @@ Output destination: the `/var/log/aten/events.jsonl` (Linux) and `%ProgramData%\
 
 Not everything is a setting. The state-file location, the timing constants (transcript poll interval, the ~2s attribution buffer, the 10s confidence gate), the credential-class path patterns, and the set of parsable transcript formats are fixed in the build, not the config.
 
-Platform coverage today: the full action set is live on Linux and Windows; macOS emits `process_exec`, `credential_access`, and `network_egress`, but not yet `file_write` or `dns_query`. `process_exit` is defined in the schema but not yet emitted.
+Platform coverage today: Linux and Windows emit the full action set except public `process_exit`. macOS emits `process_exec`, `process_exit`, `credential_access`, `file_write`, `network_egress`, and `local_ipc_access`; `dns_query` remains a Linux/Windows signal for now because the macOS path observes network flows through NetworkExtension rather than resolver events.
 
 ## Lineage
 

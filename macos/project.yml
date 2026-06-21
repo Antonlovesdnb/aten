@@ -9,7 +9,7 @@
 # Generate + build with ./build.sh (which runs `xcodegen generate` then
 # `xcodebuild`). Paths are relative to this file (the macos/ directory).
 #
-# Signing is ad-hoc ("-") for free-account dev mode; see devsetup.md. On a paid
+# Signing is ad-hoc ("-") for free-account dev mode; see devsetup.sh. On a paid
 # Developer Program account, set DEVELOPMENT_TEAM and a real CODE_SIGN_IDENTITY.
 
 name: Aten
@@ -50,7 +50,8 @@ targets:
       - path: AtenNetExt
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: ai.aten.netext
+        PRODUCT_BUNDLE_IDENTIFIER: ai.aten.host.netext
         PRODUCT_NAME: AtenNetExt
         INFOPLIST_FILE: AtenNetExt/Info.plist
         CODE_SIGN_ENTITLEMENTS: AtenNetExt/AtenNetExt.entitlements
+        OTHER_LDFLAGS: "$(inherited) -lbsm"

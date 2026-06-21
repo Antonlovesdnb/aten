@@ -1,14 +1,17 @@
 //! Userspace sockaddr parsing for the connect() probe.
 //!
-//! The kernel hands us the first 28 bytes of the user-space `struct sockaddr`
+//! The kernel hands us the first bytes of the user-space `struct sockaddr`
 //! the agent's descendant passed to `connect()`. The first 2 bytes are the
-//! address family — `AF_INET` (2) or `AF_INET6` (10) is what we care about;
-//! AF_UNIX and friends get reported as `Other` and dropped at the collector.
+//! address family — `AF_INET` (2), `AF_INET6` (10), and high-signal `AF_UNIX`
+//! socket paths are what we care about; other families are dropped.
+
+use aten_schema::CloudMetadataClass;
 
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     V4 { ip: std::net::Ipv4Addr, port: u16 },
     V6 { ip: std::net::Ipv6Addr, port: u16 },
+    Unix { path: String },
     Other,
 }
 
@@ -38,6 +41,30 @@ pub fn parse_sockaddr(bytes: &[u8]) -> Endpoint {
                 port,
             }
         }
+        // AF_UNIX. struct sockaddr_un: u16 sun_family; char sun_path[108].
+        // Abstract sockets begin with NUL and are represented as @name.
+        1 if bytes.len() > 2 => {
+            let path_bytes = &bytes[2..];
+            if path_bytes.first() == Some(&0) {
+                let end = path_bytes[1..]
+                    .iter()
+                    .position(|b| *b == 0)
+                    .map(|idx| idx + 1)
+                    .unwrap_or(path_bytes.len());
+                let name = String::from_utf8_lossy(&path_bytes[1..end]).to_string();
+                Endpoint::Unix {
+                    path: format!("@{name}"),
+                }
+            } else {
+                let end = path_bytes
+                    .iter()
+                    .position(|b| *b == 0)
+                    .unwrap_or(path_bytes.len());
+                Endpoint::Unix {
+                    path: String::from_utf8_lossy(&path_bytes[..end]).to_string(),
+                }
+            }
+        }
         _ => Endpoint::Other,
     }
 }
@@ -48,9 +75,36 @@ pub fn parse_sockaddr(bytes: &[u8]) -> Endpoint {
 /// agent's process tree showing up as "network egress."
 pub fn is_uninteresting(ep: &Endpoint) -> bool {
     match ep {
-        Endpoint::V4 { ip, .. } => ip.is_loopback() || ip.is_unspecified() || ip.is_link_local(),
+        Endpoint::V4 { ip, .. } => {
+            cloud_metadata_class(ep).is_none()
+                && (ip.is_loopback() || ip.is_unspecified() || ip.is_link_local())
+        }
         Endpoint::V6 { ip, .. } => ip.is_loopback() || ip.is_unspecified(),
+        Endpoint::Unix { .. } => false,
         Endpoint::Other => true,
+    }
+}
+
+pub fn cloud_metadata_class(ep: &Endpoint) -> Option<CloudMetadataClass> {
+    match ep {
+        Endpoint::V4 { ip, .. } if *ip == std::net::Ipv4Addr::new(169, 254, 169, 254) => {
+            Some(CloudMetadataClass::InstanceMetadata)
+        }
+        Endpoint::V4 { ip, .. } if *ip == std::net::Ipv4Addr::new(169, 254, 170, 2) => {
+            Some(CloudMetadataClass::AwsTaskCredentials)
+        }
+        Endpoint::V4 { ip, .. } if *ip == std::net::Ipv4Addr::new(100, 100, 100, 200) => {
+            Some(CloudMetadataClass::AlibabaMetadata)
+        }
+        Endpoint::V6 { ip, .. }
+            if *ip
+                == "fd00:ec2::254"
+                    .parse::<std::net::Ipv6Addr>()
+                    .expect("static IPv6 metadata literal") =>
+        {
+            Some(CloudMetadataClass::InstanceMetadata)
+        }
+        _ => None,
     }
 }
 
@@ -97,7 +151,23 @@ mod tests {
     #[test]
     fn unix_socket_is_other() {
         // AF_UNIX = 1
-        let bytes = [1u8, 0, b'/', b't', b'm', b'p', b'/', 0];
-        assert!(matches!(parse_sockaddr(&bytes), Endpoint::Other));
+        let bytes = [1u8, 0, b'/', b't', b'm', b'p', b'/', b'a', 0];
+        match parse_sockaddr(&bytes) {
+            Endpoint::Unix { path } => assert_eq!(path, "/tmp/a"),
+            other => panic!("expected unix socket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cloud_metadata_is_interesting() {
+        let ep = Endpoint::V4 {
+            ip: std::net::Ipv4Addr::new(169, 254, 169, 254),
+            port: 80,
+        };
+        assert!(!is_uninteresting(&ep));
+        assert_eq!(
+            cloud_metadata_class(&ep),
+            Some(CloudMetadataClass::InstanceMetadata)
+        );
     }
 }

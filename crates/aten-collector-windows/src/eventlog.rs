@@ -45,9 +45,12 @@ pub fn event_id_for(kind: &EventKind) -> u16 {
         EventKind::NetworkEgress(_) => 4,
         EventKind::FileWrite(_) => 5,
         EventKind::DnsQuery(_) => 6,
+        EventKind::LocalIpcAccess(_) => 7,
+        EventKind::AgentSession(_) => 13,
         EventKind::Prompt(_) => 10,
         EventKind::ToolCall(_) => 11,
         EventKind::ToolResult(_) => 12,
+        EventKind::PermissionDecision(_) => 14,
         // Daemon/collector self-telemetry. Kept in lockstep with
         // EVT_COLLECTOR_STATUS and the `t_status` template in aten.man.
         EventKind::CollectorStatus(_) => 20,
@@ -59,6 +62,8 @@ fn level_for(kind: &EventKind) -> u8 {
         EventKind::CredentialAccess(_)
         | EventKind::NetworkEgress(_)
         | EventKind::FileWrite(_)
+        | EventKind::LocalIpcAccess(_)
+        | EventKind::PermissionDecision(_)
         // A dropped-event marker is a warning: it means telemetry was lost.
         | EventKind::CollectorStatus(_) => LEVEL_WARNING,
         // A DNS query on its own is benign (agents resolve their own API
@@ -76,9 +81,12 @@ fn pid_for(kind: &EventKind) -> i32 {
         EventKind::NetworkEgress(p) => p.process.pid,
         EventKind::FileWrite(p) => p.process.pid,
         EventKind::DnsQuery(p) => p.process.pid,
-        EventKind::Prompt(_)
+        EventKind::LocalIpcAccess(p) => p.process.pid,
+        EventKind::AgentSession(_)
+        | EventKind::Prompt(_)
         | EventKind::ToolCall(_)
         | EventKind::ToolResult(_)
+        | EventKind::PermissionDecision(_)
         | EventKind::CollectorStatus(_) => 0,
     }
 }
@@ -235,6 +243,12 @@ fn write_class_wire(v: &FileWriteClass) -> &'static str {
     match v {
         FileWriteClass::AgentConfig => "agent_config",
         FileWriteClass::Executable => "executable",
+        FileWriteClass::ShellProfile => "shell_profile",
+        FileWriteClass::ScheduledTask => "scheduled_task",
+        FileWriteClass::GitHook => "git_hook",
+        FileWriteClass::StartupItem => "startup_item",
+        FileWriteClass::PackageManifest => "package_manifest",
+        FileWriteClass::Lockfile => "lockfile",
     }
 }
 
@@ -369,7 +383,10 @@ fn fields_for(ev: &Event, json: &str) -> Vec<Field> {
             f
         }
         // t_generic: Timestamp, HostId, AgentId, Pid, RawJson.
-        EventKind::ProcessExit(_) => vec![
+        EventKind::ProcessExit(_)
+        | EventKind::AgentSession(_)
+        | EventKind::PermissionDecision(_)
+        | EventKind::LocalIpcAccess(_) => vec![
             s(&ev.timestamp),
             so(ev.host_id.as_deref()),
             s(&ev.agent_id),
@@ -483,6 +500,7 @@ mod tests {
             attribution: attr(),
             exec_args: vec![],
             exec_envp_summary: String::new(),
+            supply_chain_activity: None,
         });
         assert_eq!(event_id_for(&exec), 1);
 
@@ -504,6 +522,15 @@ mod tests {
         });
         assert_eq!(event_id_for(&status), 20);
         assert_eq!(level_for(&status), LEVEL_WARNING);
+
+        let ipc = EventKind::LocalIpcAccess(aten_schema::LocalIpcAccessPayload {
+            process: proc(),
+            attribution: attr(),
+            ipc_path: r"\\.\pipe\docker_engine".into(),
+            ipc_class: aten_schema::LocalIpcClass::DockerSocket,
+        });
+        assert_eq!(event_id_for(&ipc), 7);
+        assert_eq!(level_for(&ipc), LEVEL_WARNING);
     }
 
     #[test]
@@ -577,7 +604,16 @@ mod tests {
         for v in [A, Aaaa, Cname, Txt, Mx, Ns, Ptr, Srv, Soa, Other] {
             assert_eq!(dns_type_wire(&v), serde_wire(&v), "{v:?}");
         }
-        for v in [AgentConfig, Executable] {
+        for v in [
+            AgentConfig,
+            Executable,
+            ShellProfile,
+            ScheduledTask,
+            GitHook,
+            StartupItem,
+            PackageManifest,
+            Lockfile,
+        ] {
             assert_eq!(write_class_wire(&v), serde_wire(&v), "{v:?}");
         }
         for v in [User, Assistant, System] {
@@ -611,6 +647,7 @@ mod tests {
             dest_host: None,
             protocol: Protocol::Tcp,
             tls_sni: None,
+            cloud_metadata: None,
         }));
         // t_net: 16 common + DestIp + DestPort + Protocol + DestHost + RawJson.
         assert_eq!(fields_for(&net, "{}").len(), 21);
@@ -620,6 +657,7 @@ mod tests {
             attribution: attr(),
             exec_args: vec!["a".into()],
             exec_envp_summary: String::new(),
+            supply_chain_activity: None,
         }));
         // t_proc_exec: 16 common + ExecArgs + RawJson.
         assert_eq!(fields_for(&exec, "{}").len(), 18);
@@ -675,5 +713,17 @@ mod tests {
         // DroppedSinceLast + Reason + RawJson.
         assert_eq!(fields_for(&status, "{}").len(), 7);
         assert_eq!(event_id_for(&status.kind), 20);
+
+        let ipc = ev(EventKind::LocalIpcAccess(
+            aten_schema::LocalIpcAccessPayload {
+                process: proc(),
+                attribution: attr(),
+                ipc_path: "/var/run/docker.sock".into(),
+                ipc_class: aten_schema::LocalIpcClass::DockerSocket,
+            },
+        ));
+        // t_generic: Timestamp + HostId + AgentId + Pid + RawJson.
+        assert_eq!(fields_for(&ipc, "{}").len(), 5);
+        assert_eq!(event_id_for(&ipc.kind), 7);
     }
 }

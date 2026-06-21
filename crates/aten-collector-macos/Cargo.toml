@@ -24,7 +24,7 @@ chrono = { workspace = true }
 # `cfg(target_os = "macos")`-gated, exactly like the Linux crate gates its
 # eBPF), so the workspace still builds on Windows/Linux without pulling these.
 [target.'cfg(target_os = "macos")'.dependencies]
-# HarfangLab's safe ESF bindings — NOTIFY_EXEC / NOTIFY_OPEN.
+# HarfangLab's safe ESF bindings — exec/open/exit/UIPC notifications.
 endpoint-sec = { version = "0.4", features = ["macos_10_15_4"] }
 # proc_pidpath / proc_pidinfo (BSDInfo, VnodePathInfo) — the libproc analog of
 # the Linux crate's /proc reads, used to enrich network flows (bare pid) and to

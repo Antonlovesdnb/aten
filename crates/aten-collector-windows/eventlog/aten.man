@@ -55,9 +55,12 @@
           <task name="NetworkEgress"    symbol="TASK_NETWORK_EGRESS"    value="4"  message="$(string.task.network_egress)"/>
           <task name="FileWrite"        symbol="TASK_FILE_WRITE"        value="5"  message="$(string.task.file_write)"/>
           <task name="DnsQuery"         symbol="TASK_DNS_QUERY"         value="6"  message="$(string.task.dns_query)"/>
+          <task name="LocalIpcAccess"   symbol="TASK_LOCAL_IPC_ACCESS"  value="7"  message="$(string.task.local_ipc_access)"/>
           <task name="Prompt"           symbol="TASK_PROMPT"            value="10" message="$(string.task.prompt)"/>
           <task name="ToolCall"         symbol="TASK_TOOL_CALL"         value="11" message="$(string.task.tool_call)"/>
           <task name="ToolResult"       symbol="TASK_TOOL_RESULT"       value="12" message="$(string.task.tool_result)"/>
+          <task name="AgentSession"     symbol="TASK_AGENT_SESSION"     value="13" message="$(string.task.agent_session)"/>
+          <task name="PermissionDecision" symbol="TASK_PERMISSION_DECISION" value="14" message="$(string.task.permission_decision)"/>
           <task name="CollectorStatus"  symbol="TASK_COLLECTOR_STATUS"  value="20" message="$(string.task.collector_status)"/>
         </tasks>
 
@@ -251,9 +254,12 @@
           <event symbol="EVT_NETWORK_EGRESS"    value="4"  version="0" channel="Operational" level="win:Warning"       task="NetworkEgress"    template="t_net"         message="$(string.evt.network_egress)"/>
           <event symbol="EVT_FILE_WRITE"        value="5"  version="0" channel="Operational" level="win:Warning"       task="FileWrite"        template="t_file"        message="$(string.evt.file_write)"/>
           <event symbol="EVT_DNS_QUERY"         value="6"  version="0" channel="Operational" level="win:Informational" task="DnsQuery"        template="t_dns"         message="$(string.evt.dns_query)"/>
+          <event symbol="EVT_LOCAL_IPC_ACCESS"  value="7"  version="0" channel="Operational" level="win:Warning"       task="LocalIpcAccess" template="t_generic"     message="$(string.evt.local_ipc_access)"/>
           <event symbol="EVT_PROMPT"            value="10" version="0" channel="Operational" level="win:Informational" task="Prompt"           template="t_prompt"      message="$(string.evt.prompt)"/>
           <event symbol="EVT_TOOL_CALL"         value="11" version="0" channel="Operational" level="win:Informational" task="ToolCall"         template="t_tool_call"   message="$(string.evt.tool_call)"/>
           <event symbol="EVT_TOOL_RESULT"       value="12" version="0" channel="Operational" level="win:Informational" task="ToolResult"       template="t_tool_result" message="$(string.evt.tool_result)"/>
+          <event symbol="EVT_AGENT_SESSION"     value="13" version="0" channel="Operational" level="win:Informational" task="AgentSession"     template="t_generic"     message="$(string.evt.agent_session)"/>
+          <event symbol="EVT_PERMISSION_DECISION" value="14" version="0" channel="Operational" level="win:Warning" task="PermissionDecision" template="t_generic" message="$(string.evt.permission_decision)"/>
           <event symbol="EVT_COLLECTOR_STATUS"  value="20" version="0" channel="Operational" level="win:Warning"       task="CollectorStatus" template="t_status"      message="$(string.evt.collector_status)"/>
         </events>
       </provider>
@@ -270,9 +276,12 @@
         <string id="task.network_egress"    value="Network Egress"/>
         <string id="task.file_write"        value="File Write"/>
         <string id="task.dns_query"         value="DNS Query"/>
+        <string id="task.local_ipc_access"  value="Local IPC Access"/>
         <string id="task.prompt"            value="Prompt"/>
         <string id="task.tool_call"         value="Tool Call"/>
         <string id="task.tool_result"       value="Tool Result"/>
+        <string id="task.agent_session"     value="Agent Session"/>
+        <string id="task.permission_decision" value="Permission Decision"/>
         <string id="task.collector_status"  value="Collector Status"/>
 
         <!-- General-tab messages. %-indices reference template fields in order;
@@ -284,9 +293,12 @@
         <string id="evt.network_egress"    value="AI agent network egress by %7 (pid %5) to %17:%18 (%19)"/>
         <string id="evt.file_write"        value="AI agent file write by %7 (pid %5): %17 [%18]"/>
         <string id="evt.dns_query"         value="AI agent DNS query by %7 (pid %5): %17 [%18]"/>
+        <string id="evt.local_ipc_access"  value="AI agent local IPC access (pid %4)"/>
         <string id="evt.prompt"            value="AI agent prompt (%6): %7"/>
         <string id="evt.tool_call"         value="AI agent tool call: %6"/>
         <string id="evt.tool_result"       value="AI agent tool result [%7]"/>
+        <string id="evt.agent_session"     value="AI agent session"/>
+        <string id="evt.permission_decision" value="AI agent permission decision"/>
         <string id="evt.collector_status"  value="ATEN collector dropped %5 event(s), %4 total: %6"/>
       </stringTable>
     </resources>

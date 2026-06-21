@@ -9,10 +9,13 @@
 // can complete. Re-running it is idempotent.
 //
 // Usage:
-//   open macos/build/AtenHost.app          # activate + enable filter
-//   AtenHost --deactivate                   # tear down (best effort)
+//   open /Applications/AtenHost.app                     # activate + enable filter
+//   open /Applications/AtenHost.app --args --diagnose   # print bundle layout first
+//   open /Applications/AtenHost.app --args --diagnose-only # print bundle layout and exit
+//   open /Applications/AtenHost.app --args --deactivate # tear down (best effort)
 
 import AppKit
+import Darwin
 import NetworkExtension
 import OSLog
 import SystemExtensions
@@ -20,10 +23,31 @@ import SystemExtensions
 private let log = Logger(subsystem: "ai.aten.host", category: "host")
 
 // Keep this in sync with the system extension's bundle identifier in project.yml.
-private let extensionBundleID = "ai.aten.netext"
+private let extensionBundleID = "ai.aten.host.netext"
+
+private func printBundleDiagnostics() {
+    let bundle = Bundle.main
+    let systemExtensionsURL = bundle.bundleURL
+        .appendingPathComponent("Contents", isDirectory: true)
+        .appendingPathComponent("Library", isDirectory: true)
+        .appendingPathComponent("SystemExtensions", isDirectory: true)
+    let expectedExtensionURL = systemExtensionsURL
+        .appendingPathComponent("AtenNetExt.systemextension", isDirectory: true)
+
+    print("Host bundle: \(bundle.bundlePath)")
+    print("System extensions dir: \(systemExtensionsURL.path)")
+    print("Expected extension exists: \(FileManager.default.fileExists(atPath: expectedExtensionURL.path))")
+    if let entries = try? FileManager.default.contentsOfDirectory(atPath: systemExtensionsURL.path) {
+        let embeddedExtensions = entries.sorted().joined(separator: ", ")
+        print("Embedded system extensions: \(embeddedExtensions)")
+    }
+}
 
 final class Controller: NSObject, OSSystemExtensionRequestDelegate {
+    private var deactivating = false
+
     func activate() {
+        deactivating = false
         log.info("requesting activation of \(extensionBundleID, privacy: .public)")
         let req = OSSystemExtensionRequest.activationRequest(
             forExtensionWithIdentifier: extensionBundleID,
@@ -34,6 +58,7 @@ final class Controller: NSObject, OSSystemExtensionRequestDelegate {
     }
 
     func deactivate() {
+        deactivating = true
         let req = OSSystemExtensionRequest.deactivationRequest(
             forExtensionWithIdentifier: extensionBundleID,
             queue: .main
@@ -59,7 +84,11 @@ final class Controller: NSObject, OSSystemExtensionRequestDelegate {
 
     func request(_ request: OSSystemExtensionRequest, didFinishWithResult result: OSSystemExtensionRequest.Result) {
         print("✅ system extension request finished: \(result.rawValue)")
-        enableContentFilter()
+        if deactivating {
+            disableContentFilter()
+        } else {
+            enableContentFilter()
+        }
     }
 
     func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) {
@@ -77,13 +106,11 @@ final class Controller: NSObject, OSSystemExtensionRequestDelegate {
                 NSApp.terminate(nil)
                 return
             }
-            if mgr.providerConfiguration == nil {
-                let cfg = NEFilterProviderConfiguration()
-                cfg.filterSockets = true
-                cfg.filterPackets = false
-                mgr.providerConfiguration = cfg
-                mgr.localizedDescription = "ATEN"
-            }
+            let cfg = mgr.providerConfiguration ?? NEFilterProviderConfiguration()
+            cfg.filterSockets = true
+            cfg.filterPackets = false
+            mgr.providerConfiguration = cfg
+            mgr.localizedDescription = "ATEN"
             mgr.isEnabled = true
             mgr.saveToPreferences { saveErr in
                 if let saveErr = saveErr {
@@ -96,17 +123,48 @@ final class Controller: NSObject, OSSystemExtensionRequestDelegate {
         }
     }
 
+    private func disableContentFilter() {
+        let mgr = NEFilterManager.shared()
+        mgr.loadFromPreferences { [weak self] loadErr in
+            if let loadErr = loadErr {
+                print("❌ loadFromPreferences: \(loadErr.localizedDescription)")
+                NSApp.terminate(nil)
+                return
+            }
+            mgr.isEnabled = false
+            mgr.saveToPreferences { saveErr in
+                if let saveErr = saveErr {
+                    print("❌ saveToPreferences: \(saveErr.localizedDescription)")
+                } else {
+                    print("✅ content filter disabled")
+                }
+                self?.printStatus()
+            }
+        }
+    }
+
     private func printStatus() {
         print("Filter enabled: \(NEFilterManager.shared().isEnabled)")
         print("Done. You can quit this app; the extension keeps running.")
     }
 }
 
+let arguments = CommandLine.arguments
+let diagnoseOnly = arguments.contains("--diagnose-only")
+
+if arguments.contains("--diagnose") || diagnoseOnly {
+    printBundleDiagnostics()
+}
+
+if diagnoseOnly {
+    exit(EXIT_SUCCESS)
+}
+
 let controller = Controller()
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
-if CommandLine.arguments.contains("--deactivate") {
+if arguments.contains("--deactivate") {
     controller.deactivate()
 } else {
     controller.activate()

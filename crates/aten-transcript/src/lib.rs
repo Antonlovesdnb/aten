@@ -10,11 +10,12 @@
 //! Rust is the canonical version going forward.
 
 use aten_schema::{
-    Event, EventKind, IndexEntry, Mention, Origin, Platform, PromptPayload, ResultStatus, Role,
+    AgentKind, AgentSessionPayload, Event, EventKind, IndexEntry, Mention, Origin,
+    PermissionDecision, PermissionDecisionPayload, Platform, PromptPayload, ResultStatus, Role,
     Source, ToolCallPayload, ToolResultPayload, SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub mod codex;
 pub mod identifiers;
@@ -43,6 +44,7 @@ pub struct TranscriptStreamParser {
     platform: Platform,
     session_id: Option<String>,
     cwd: Option<String>,
+    agent_session_emitted: bool,
 }
 
 impl TranscriptStreamParser {
@@ -52,6 +54,7 @@ impl TranscriptStreamParser {
             platform,
             session_id: None,
             cwd: None,
+            agent_session_emitted: false,
         }
     }
 
@@ -67,7 +70,14 @@ impl TranscriptStreamParser {
                 if let Some(cwd) = rec.cwd.as_ref() {
                     self.cwd = Some(cwd.clone());
                 }
-                Ok(parse_record(&rec, self.platform))
+                let mut events = parse_record(&rec, self.platform);
+                if !self.agent_session_emitted {
+                    if let Some(session_event) = claude_agent_session_event(&rec, self.platform) {
+                        self.agent_session_emitted = true;
+                        events.insert(0, session_event);
+                    }
+                }
+                Ok(events)
             }
             TranscriptDialect::Codex => {
                 codex::parse_codex_line(line, self.platform, &mut self.session_id, &mut self.cwd)
@@ -156,7 +166,13 @@ struct TranscriptRecord {
     #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
+    model: Option<String>,
+    #[serde(default, rename = "permissionMode")]
+    permission_mode: Option<String>,
+    #[serde(default)]
     message: Option<Message>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +192,7 @@ pub fn read_transcript(
     home: Option<&str>,
 ) -> anyhow::Result<(Vec<Event>, IdentifierIndex)> {
     let mut events = Vec::new();
+    let mut agent_sessions_seen: BTreeSet<String> = BTreeSet::new();
     for (lineno, line) in transcript_jsonl.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -188,6 +205,13 @@ pub fn read_transcript(
                 continue;
             }
         };
+        if let Some(session_id) = rec.session_id.as_ref() {
+            if agent_sessions_seen.insert(session_id.clone()) {
+                if let Some(session_event) = claude_agent_session_event(&rec, platform) {
+                    events.push(session_event);
+                }
+            }
+        }
         events.extend(parse_record(&rec, platform));
     }
     let index = build_identifier_index(&events, home);
@@ -229,6 +253,10 @@ pub(crate) fn parse_record(rec: &TranscriptRecord, platform: Platform) -> Vec<Ev
     let Some(rtype) = rec.rtype.as_deref() else {
         return out;
     };
+    if let Some(permission) = claude_permission_decision_event(rec, platform) {
+        out.push(permission);
+        return out;
+    }
     let Some(msg) = &rec.message else {
         return out;
     };
@@ -355,6 +383,102 @@ pub(crate) fn parse_record(rec: &TranscriptRecord, platform: Platform) -> Vec<Ev
     out
 }
 
+fn claude_agent_session_event(rec: &TranscriptRecord, platform: Platform) -> Option<Event> {
+    rec.session_id.as_ref()?;
+    Some(envelope(
+        rec,
+        EventKind::AgentSession(AgentSessionPayload {
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: rec.cwd.clone(),
+            model: rec.model.clone(),
+            permission_mode: rec.permission_mode.clone(),
+            transcript_path: None,
+        }),
+        platform,
+    ))
+}
+
+fn claude_permission_decision_event(rec: &TranscriptRecord, platform: Platform) -> Option<Event> {
+    let rtype = rec.rtype.as_deref().unwrap_or_default();
+    if !rtype.contains("permission")
+        && !rec
+            .extra
+            .keys()
+            .any(|k| k.to_lowercase().contains("permission"))
+    {
+        return None;
+    }
+    let decision = decision_from_values(&rec.extra)?;
+    Some(envelope(
+        rec,
+        EventKind::PermissionDecision(PermissionDecisionPayload {
+            decision,
+            target: string_field(&rec.extra, &["target", "command", "path", "pattern"]),
+            tool_name: string_field(&rec.extra, &["toolName", "tool_name", "name"]),
+            tool_call_id: string_field(
+                &rec.extra,
+                &["toolUseId", "tool_use_id", "toolCallId", "tool_call_id"],
+            ),
+            reason: string_field(&rec.extra, &["reason", "message"]),
+        }),
+        platform,
+    ))
+}
+
+pub(crate) fn decision_from_values(
+    values: &BTreeMap<String, serde_json::Value>,
+) -> Option<PermissionDecision> {
+    for key in [
+        "decision",
+        "result",
+        "status",
+        "permissionDecision",
+        "permission_decision",
+    ] {
+        if let Some(value) = values.get(key) {
+            if let Some(decision) = decision_from_value(value) {
+                return Some(decision);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn decision_from_value(value: &serde_json::Value) -> Option<PermissionDecision> {
+    match value {
+        serde_json::Value::Bool(true) => Some(PermissionDecision::Allowed),
+        serde_json::Value::Bool(false) => Some(PermissionDecision::Denied),
+        serde_json::Value::String(s) => {
+            let s = s.to_lowercase();
+            if matches!(
+                s.as_str(),
+                "allow" | "allowed" | "approve" | "approved" | "yes"
+            ) {
+                Some(PermissionDecision::Allowed)
+            } else if matches!(s.as_str(), "deny" | "denied" | "reject" | "rejected" | "no") {
+                Some(PermissionDecision::Denied)
+            } else if matches!(s.as_str(), "prompt" | "prompted" | "ask") {
+                Some(PermissionDecision::Prompted)
+            } else {
+                Some(PermissionDecision::Unknown)
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn string_field(
+    values: &BTreeMap<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        values
+            .get(*key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    })
+}
+
 /// Pull a string out of a tool_result's `content` field, which Claude Code emits
 /// as either a bare string or an array of text-block objects.
 fn extract_text(v: Option<&serde_json::Value>) -> String {
@@ -474,7 +598,10 @@ mod tests {
             uuid: Some("u1".to_string()),
             timestamp: Some("2026-05-27T19:08:02.110Z".to_string()),
             cwd: None,
+            model: None,
+            permission_mode: None,
             message: Some(Message { content }),
+            extra: BTreeMap::new(),
         }
     }
 
@@ -485,7 +612,10 @@ mod tests {
             uuid: Some("a1".to_string()),
             timestamp: Some("2026-05-27T19:08:02.940Z".to_string()),
             cwd: None,
+            model: None,
+            permission_mode: None,
             message: Some(Message { content }),
+            extra: BTreeMap::new(),
         }
     }
 
@@ -566,6 +696,59 @@ mod tests {
         for m in metas {
             let rec: TranscriptRecord = serde_json::from_value(m).unwrap();
             assert!(parse_record(&rec, Platform::Linux).is_empty());
+        }
+    }
+
+    #[test]
+    fn read_transcript_emits_agent_session_once() {
+        let input = concat!(
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-05-27T19:08:02.110Z","cwd":"/repo","model":"claude-test","permissionMode":"default","message":{"content":"hi"}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-05-27T19:08:03.110Z","cwd":"/repo","message":{"content":"again"}}"#,
+            "\n",
+        );
+        let (events, _) = read_transcript(input, Platform::Linux, None).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| matches!(ev.kind, EventKind::AgentSession(_)))
+                .count(),
+            1
+        );
+        match &events[0].kind {
+            EventKind::AgentSession(s) => {
+                assert_eq!(s.agent_kind, AgentKind::ClaudeCode);
+                assert_eq!(s.cwd.as_deref(), Some("/repo"));
+                assert_eq!(s.model.as_deref(), Some("claude-test"));
+                assert_eq!(s.permission_mode.as_deref(), Some("default"));
+            }
+            other => panic!("expected agent session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_permission_decision_record_emits_event() {
+        let rec: TranscriptRecord = serde_json::from_value(json!({
+            "type": "permission_decision",
+            "sessionId": "s1",
+            "timestamp": "2026-05-27T19:08:02.110Z",
+            "decision": "denied",
+            "toolName": "Bash",
+            "toolUseId": "toolu_1",
+            "command": "cat ~/.aws/credentials",
+            "reason": "user denied"
+        }))
+        .unwrap();
+        let events = parse_record(&rec, Platform::Linux);
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            EventKind::PermissionDecision(p) => {
+                assert_eq!(p.decision, PermissionDecision::Denied);
+                assert_eq!(p.tool_name.as_deref(), Some("Bash"));
+                assert_eq!(p.tool_call_id.as_deref(), Some("toolu_1"));
+                assert_eq!(p.target.as_deref(), Some("cat ~/.aws/credentials"));
+            }
+            other => panic!("expected permission decision, got {other:?}"),
         }
     }
 

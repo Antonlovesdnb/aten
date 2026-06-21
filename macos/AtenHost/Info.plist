@@ -24,15 +24,5 @@
     <string>11.0</string>
     <key>LSUIElement</key>
     <true/>
-    <!-- Tells the system the bundled system extension(s) this app vends, so
-         the activation request can find the embedded .systemextension. -->
-    <key>NetworkExtension</key>
-    <dict>
-        <key>NEProviderClasses</key>
-        <dict>
-            <key>com.apple.networkextension.filter-data</key>
-            <string>FilterDataProvider</string>
-        </dict>
-    </dict>
 </dict>
 </plist>

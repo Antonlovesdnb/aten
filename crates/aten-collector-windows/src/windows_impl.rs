@@ -71,8 +71,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use aten_schema::{
     AccessType, Attribution, CredentialAccessPayload, CredentialClass, DnsQueryPayload,
-    DnsQueryType, Event, EventKind, FileWriteClass, FileWritePayload, NetworkEgressPayload,
-    Platform, Process, ProcessExecPayload, Protocol, Source, SCHEMA_VERSION,
+    DnsQueryType, Event, EventKind, FileWriteClass, FileWritePayload, LocalIpcAccessPayload,
+    NetworkEgressPayload, Platform, Process, ProcessExecPayload, Protocol, Source, SCHEMA_VERSION,
 };
 use chrono::{DateTime, Utc};
 use ferrisetw::parser::Parser;
@@ -580,6 +580,10 @@ fn handle_etw_event(
         );
     }
 
+    let exec_args = argv_from_cmdline(&cmdline);
+    let supply_chain_activity =
+        aten_collector_linux::supply_chain::classify_process(&basename, &cmdline, &exec_args);
+
     let event = Event {
         schema_version: SCHEMA_VERSION.to_string(),
         event_id: uuid::Uuid::new_v4().to_string(),
@@ -628,8 +632,9 @@ fn handle_etw_event(
                 triggering_command: None,
                 triggering_prompt: None,
             },
-            exec_args: Vec::new(),
+            exec_args,
             exec_envp_summary: String::new(),
+            supply_chain_activity,
         }),
     };
 
@@ -683,6 +688,10 @@ fn handle_file_event(
     // credential path always passes this check.
     if !enrich::is_wellformed_file_path(&file_name) {
         return Ok(());
+    }
+
+    if let Some(ipc_class) = aten_collector_linux::ipc::classify(&file_name) {
+        return emit_local_ipc_access(record, &file_name, ipc_class, host_id, state, emit);
     }
 
     // The Kernel-File Create event packs the NtCreateFile *disposition* in the
@@ -935,6 +944,92 @@ fn emit_file_write(
     Ok(())
 }
 
+fn emit_local_ipc_access(
+    record: &EventRecord,
+    file_name: &str,
+    ipc_class: aten_schema::LocalIpcClass,
+    host_id: Option<&str>,
+    state: &Arc<Mutex<SharedState>>,
+    emit: &EmitSink,
+) -> Result<()> {
+    let pid: u32 = record.process_id();
+    if pid == 0 {
+        return Ok(());
+    }
+
+    let mut st = state.lock().expect("state lock");
+    let Some(rec) = resolve_enrollment_for_pid(pid, &mut st) else {
+        return Ok(());
+    };
+    let agent_root_pid = Some(rec.agent_root.pid);
+    let is_agent_root = rec.agent_root.pid == pid as i32;
+    let cached = st.proc_info.get(&(pid as i32)).cloned();
+    st.events_emitted += 1;
+    drop(st);
+
+    let (immediate_parent, parent_chain, integrity_level) =
+        resolve_proc_topology(pid, cached.as_ref());
+    let (process_name, image_path, cmdline, user, start_time_ticks) =
+        resolve_proc_identity(pid, cached);
+
+    let event = Event {
+        schema_version: SCHEMA_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: filetime_to_rfc3339(record.raw_timestamp() as u64),
+        monotonic_ns: Some(record.raw_timestamp() as u64),
+        platform: Platform::Windows,
+        host_id: host_id.map(str::to_string),
+        agent_id: if is_agent_root {
+            "agent-root".to_string()
+        } else {
+            "agent-descendant".to_string()
+        },
+        session_id: None,
+        user_id: if user.is_empty() {
+            None
+        } else {
+            Some(user.clone())
+        },
+        source: Source {
+            collector: "windows_etw".to_string(),
+            probe: "Microsoft-Windows-Kernel-File/Create".to_string(),
+            host_pid: Some(pid as i32),
+        },
+        kind: EventKind::LocalIpcAccess(LocalIpcAccessPayload {
+            process: Process {
+                pid: pid as i32,
+                ppid: immediate_parent as i32,
+                start_time: start_time_string(start_time_ticks),
+                name: process_name,
+                path: image_path,
+                cmdline,
+                cwd: String::new(),
+                user,
+                integrity_level,
+                parent_chain,
+                agent_root_pid,
+            },
+            attribution: Attribution {
+                attributed_tool_call_id: None,
+                attributed_by_descent: !is_agent_root,
+                requested_by_tool_call: false,
+                requested_in_user_message: false,
+                requested_in_assistant_message: false,
+                requested_in_tool_result: false,
+                time_window_ms: None,
+                triggering_command: None,
+                triggering_prompt: None,
+            },
+            ipc_path: enrich::normalize_nt_path(file_name),
+            ipc_class,
+        }),
+    };
+
+    let mut emit = emit.lock().expect("emit lock");
+    (emit)(event);
+    Ok(())
+}
+
 /// Handler for Microsoft-Windows-Kernel-Network events. Filters to
 /// TcpIp/Connect IPv4 (Event 12) and IPv6 (Event 28), drops loopback /
 /// link-local / unspecified via the cross-platform `is_uninteresting`
@@ -1031,8 +1126,10 @@ fn handle_network_event(
     let (dest_ip, dest_port) = match &endpoint {
         Endpoint::V4 { ip, port } => (ip.to_string(), *port),
         Endpoint::V6 { ip, port } => (ip.to_string(), *port),
+        Endpoint::Unix { .. } => unreachable!("Windows network provider does not emit AF_UNIX"),
         Endpoint::Other => unreachable!("filtered by is_uninteresting"),
     };
+    let cloud_metadata = aten_collector_linux::network::cloud_metadata_class(&endpoint);
 
     let event = Event {
         schema_version: SCHEMA_VERSION.to_string(),
@@ -1092,6 +1189,7 @@ fn handle_network_event(
             // Same parity story for TLS SNI capture (SChannel ETW on
             // Windows; SSL_write uprobe on Linux).
             tls_sni: None,
+            cloud_metadata,
         }),
     };
 
@@ -1335,6 +1433,10 @@ fn filetime_to_rfc3339(filetime_100ns: u64) -> String {
     DateTime::<Utc>::from_timestamp(secs, nsec)
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
         .unwrap_or_else(|| "1970-01-01T00:00:00.000000000Z".to_string())
+}
+
+fn argv_from_cmdline(cmdline: &str) -> Vec<String> {
+    cmdline.split_whitespace().map(str::to_string).collect()
 }
 
 #[cfg(test)]

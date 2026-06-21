@@ -228,6 +228,16 @@ fn build_network_event(
         _ => Protocol::Tcp,
     };
 
+    let endpoint = match ip {
+        std::net::IpAddr::V4(ip) => {
+            aten_collector_linux::network::Endpoint::V4 { ip, port: rec.port }
+        }
+        std::net::IpAddr::V6(ip) => {
+            aten_collector_linux::network::Endpoint::V6 { ip, port: rec.port }
+        }
+    };
+    let cloud_metadata = aten_collector_linux::network::cloud_metadata_class(&endpoint);
+
     Some(Event {
         schema_version: SCHEMA_VERSION.to_string(),
         event_id: uuid::Uuid::new_v4().to_string(),
@@ -270,6 +280,7 @@ fn build_network_event(
             dest_host: None,
             protocol,
             tls_sni: None,
+            cloud_metadata,
         }),
     })
 }

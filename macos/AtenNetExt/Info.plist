@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- System extension Info.plist for the aten NEFilterDataProvider.
-     NSExtensionPointIdentifier marks this as a content filter; the system
-     instantiates NSExtensionPrincipalClass when the filter is enabled. -->
+     NetworkExtension/NEProviderClasses marks this as a content filter; the
+     system instantiates the mapped provider class when the filter is enabled. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -23,12 +23,17 @@
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
-    <key>NSExtension</key>
+  <key>NetworkExtension</key>
+  <dict>
+    <key>NEProviderClasses</key>
     <dict>
-        <key>NSExtensionPointIdentifier</key>
-        <string>com.apple.networkextension.filter-data</string>
-        <key>NSExtensionPrincipalClass</key>
-        <string>$(PRODUCT_MODULE_NAME).FilterDataProvider</string>
+      <key>com.apple.networkextension.filter-data</key>
+      <string>$(PRODUCT_MODULE_NAME).FilterDataProvider</string>
     </dict>
+    <key>NEMachServiceName</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+  </dict>
+  <key>NSSystemExtensionUsageDescription</key>
+  <string>ATEN uses a NetworkExtension content filter system extension to observe local agent network egress for telemetry.</string>
 </dict>
 </plist>

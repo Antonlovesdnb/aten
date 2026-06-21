@@ -3,7 +3,7 @@
      `content-filter-provider` is the NetworkExtension provider type for an
      NEFilterDataProvider. On a paid Developer Program account this entitlement
      is granted directly; in free-account dev mode it is honored only with SIP
-     adjustments + `systemextensionsctl developer on` (see macos/devsetup.md). -->
+     adjustments + `systemextensionsctl developer on` (see macos/devsetup.sh). -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>

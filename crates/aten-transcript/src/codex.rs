@@ -26,11 +26,14 @@
 use serde::Deserialize;
 
 use aten_schema::{
-    Event, EventKind, Platform, PromptPayload, ResultStatus, Role, Source, ToolCallPayload,
-    ToolResultPayload, SCHEMA_VERSION,
+    AgentKind, AgentSessionPayload, Event, EventKind, PermissionDecisionPayload, Platform,
+    PromptPayload, ResultStatus, Role, Source, ToolCallPayload, ToolResultPayload, SCHEMA_VERSION,
 };
 
-use crate::{build_identifier_index, make_event_id, truncate, IdentifierIndex, COLLECTOR_NAME};
+use crate::{
+    build_identifier_index, decision_from_value, make_event_id, string_field, truncate,
+    IdentifierIndex, COLLECTOR_NAME,
+};
 
 const CODEX_AGENT_ID: &str = "codex-cli";
 const CODEX_PROBE_NAME: &str = "codex-jsonl";
@@ -105,6 +108,25 @@ fn parse_codex_record(
             if let Some(value) = payload.get("cwd").and_then(|v| v.as_str()) {
                 *cwd = Some(value.to_string());
             }
+            out.push(codex_envelope(
+                rec,
+                session_id.clone(),
+                platform,
+                EventKind::AgentSession(AgentSessionPayload {
+                    agent_kind: AgentKind::CodexCli,
+                    cwd: cwd.clone(),
+                    model: payload
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    permission_mode: payload
+                        .get("approval_policy")
+                        .or_else(|| payload.get("approvalPolicy"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    transcript_path: None,
+                }),
+            ));
         }
         "event_msg" => {
             let inner_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -127,6 +149,10 @@ fn parse_codex_record(
                         }),
                     ));
                 }
+            } else if let Some(permission) =
+                codex_permission_decision(rec, payload, platform, session_id.clone())
+            {
+                out.push(permission);
             }
         }
         "response_item" => {
@@ -198,12 +224,62 @@ fn parse_codex_record(
                         }),
                     ));
                 }
-                _ => {}
+                _ => {
+                    if let Some(permission) =
+                        codex_permission_decision(rec, payload, platform, session_id.clone())
+                    {
+                        out.push(permission);
+                    }
+                }
             }
         }
         _ => {}
     }
     out
+}
+
+fn codex_permission_decision(
+    rec: &CodexRecord,
+    payload: &serde_json::Value,
+    platform: Platform,
+    session_id: Option<String>,
+) -> Option<Event> {
+    let inner_type = payload
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !inner_type.contains("permission") && !inner_type.contains("approval") {
+        return None;
+    }
+    let decision = ["decision", "result", "status", "approved", "allowed"]
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(decision_from_value))?;
+    let object = payload.as_object()?;
+    let values = object
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    Some(codex_envelope(
+        rec,
+        session_id,
+        platform,
+        EventKind::PermissionDecision(PermissionDecisionPayload {
+            decision,
+            target: string_field(&values, &["target", "command", "path", "pattern"]),
+            tool_name: string_field(&values, &["toolName", "tool_name", "name"]),
+            tool_call_id: string_field(
+                &values,
+                &[
+                    "toolUseId",
+                    "tool_use_id",
+                    "toolCallId",
+                    "tool_call_id",
+                    "call_id",
+                ],
+            ),
+            reason: string_field(&values, &["reason", "message"]),
+        }),
+    ))
 }
 
 fn codex_envelope(
@@ -272,8 +348,8 @@ mod tests {
         let (events, idx) = read_codex_transcript(SAMPLE, Platform::Windows, None).unwrap();
         assert_eq!(
             events.len(),
-            3,
-            "expected user prompt + tool_call + tool_result"
+            4,
+            "expected agent_session + user prompt + tool_call + tool_result"
         );
 
         // All events should carry the session id from session_meta.
@@ -282,18 +358,27 @@ mod tests {
             assert_eq!(e.agent_id, CODEX_AGENT_ID);
         }
 
-        // First event: user prompt.
+        // First event: session context.
         match &events[0].kind {
+            EventKind::AgentSession(s) => {
+                assert_eq!(s.agent_kind, AgentKind::CodexCli);
+                assert_eq!(s.cwd.as_deref(), Some(r"C:\Users\anton\proj"));
+            }
+            _ => panic!("expected AgentSession event, got {:?}", events[0].kind),
+        }
+
+        // Second event: user prompt.
+        match &events[1].kind {
             EventKind::Prompt(p) => {
                 assert!(matches!(p.role, Role::User));
                 assert_eq!(p.prompt_text, "read ~/.aws/credentials");
             }
-            _ => panic!("expected Prompt event, got {:?}", events[0].kind),
+            _ => panic!("expected Prompt event, got {:?}", events[1].kind),
         }
 
-        // Second event: tool call. tool_input should be parsed from the
+        // Third event: tool call. tool_input should be parsed from the
         // JSON-encoded arguments string into an object.
-        match &events[1].kind {
+        match &events[2].kind {
             EventKind::ToolCall(tc) => {
                 assert_eq!(tc.tool_call_id, "call_xyz");
                 assert_eq!(tc.tool_name, "shell_command");
@@ -305,8 +390,8 @@ mod tests {
             _ => panic!("expected ToolCall event"),
         }
 
-        // Third event: tool result. Exit code 0 → Success.
-        match &events[2].kind {
+        // Fourth event: tool result. Exit code 0 → Success.
+        match &events[3].kind {
             EventKind::ToolResult(tr) => {
                 assert_eq!(tr.tool_call_id, "call_xyz");
                 assert!(matches!(tr.result_status, ResultStatus::Success));

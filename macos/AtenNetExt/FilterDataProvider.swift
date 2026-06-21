@@ -16,7 +16,7 @@ import Foundation
 import NetworkExtension
 import OSLog
 
-private let log = Logger(subsystem: "ai.aten.netext", category: "filter")
+private let log = Logger(subsystem: "ai.aten.host.netext", category: "filter")
 
 /// Must match `FlowRecord` in netflow_ipc.rs and the socket path the collector
 /// binds. Length-prefixed (u32 LE) JSON frames.
@@ -61,6 +61,8 @@ final class FilterDataProvider: NEFilterDataProvider {
 
     private func report(_ flow: NEFilterSocketFlow) {
         // remoteEndpoint is an NWHostEndpoint carrying host + port as strings.
+        // Deprecated on macOS 15 in favor of remoteFlowEndpoint, but this
+        // remains the stable Swift overlay shape across our macOS 11+ target.
         guard let remote = flow.remoteEndpoint as? NWHostEndpoint else { return }
         let host = remote.hostname
         guard !isLocalDestination(host) else { return }
@@ -83,11 +85,21 @@ final class FilterDataProvider: NEFilterDataProvider {
 
     private func isLocalDestination(_ host: String) -> Bool {
         let value = host.lowercased()
+        if isCloudMetadataDestination(value) {
+            return false
+        }
         return value == "localhost"
             || value == "::1"
             || value.hasPrefix("127.")
             || value.hasPrefix("169.254.")
             || value.hasPrefix("fe80:")
+    }
+
+    private func isCloudMetadataDestination(_ value: String) -> Bool {
+        return value == "169.254.169.254"
+            || value == "169.254.170.2"
+            || value == "100.100.100.200"
+            || value == "fd00:ec2::254"
     }
 
     /// Derive the source PID from the flow's audit token. `sourceAppAuditToken`
@@ -113,7 +125,7 @@ final class FlowWriter {
     private static let maxPendingFrames = 1024
     private let path: String
     private var fd: Int32 = -1
-    private let queue = DispatchQueue(label: "ai.aten.netext.writer")
+    private let queue = DispatchQueue(label: "ai.aten.host.netext.writer")
     private let slots = DispatchSemaphore(value: FlowWriter.maxPendingFrames)
     private let dropLock = NSLock()
     private var dropped: UInt64 = 0
@@ -141,7 +153,7 @@ final class FlowWriter {
             frame.append(json)
             if !self.writeAll(frame) {
                 // Connection dropped — close and let the next send reconnect.
-                self.close()
+                self.closeLocked()
             }
         }
     }
@@ -198,10 +210,16 @@ final class FlowWriter {
         }
     }
 
-    func close() {
+    private func closeLocked() {
         if fd >= 0 {
             Darwin.close(fd)
             fd = -1
+        }
+    }
+
+    func close() {
+        queue.sync {
+            self.closeLocked()
         }
     }
 }

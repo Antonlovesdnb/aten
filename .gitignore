@@ -21,6 +21,9 @@ target/
 *.so
 *.dylib
 
+# Generated macOS project/build artifacts
+macos/Aten.xcodeproj/
+
 # Editors / IDEs
 .vscode/
 .idea/

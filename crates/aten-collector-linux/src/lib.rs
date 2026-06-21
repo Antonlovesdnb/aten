@@ -25,7 +25,9 @@
 pub mod credentials;
 pub mod enroll;
 pub mod filewrite;
+pub mod ipc;
 pub mod network;
+pub mod supply_chain;
 
 #[cfg(target_os = "linux")]
 pub mod proc;

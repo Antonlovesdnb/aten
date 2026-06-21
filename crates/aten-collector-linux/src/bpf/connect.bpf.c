@@ -3,9 +3,8 @@
 // ATEN network-egress probe.
 //
 // Attaches to `sys_enter_connect` and emits a ringbuf record per connect()
-// syscall. We copy the first 28 bytes of the sockaddr — enough to cover both
-// `struct sockaddr_in` (16) and `struct sockaddr_in6` (28) — and let
-// userspace parse the family and extract address+port.
+// syscall. We copy enough sockaddr bytes to cover IPv4, IPv6, and AF_UNIX
+// socket paths; userspace parses the family and drops uninteresting sockets.
 //
 // As with the openat probe, a BPF-side PID map drops non-agent traffic before
 // ring-buffer allocation.
@@ -14,7 +13,7 @@
 #include <bpf/bpf_helpers.h>
 
 #define TASK_COMM_LEN 16
-#define MAX_SOCKADDR 28
+#define MAX_SOCKADDR 110
 
 struct connect_event {
     __u64 timestamp_ns;
@@ -91,16 +90,12 @@ int handle_connect(struct sys_enter_connect_args *ctx) {
     if (!bpf_map_lookup_elem(&enrolled_pids, &pid)) {
         return 0;
     }
-    // Drop non-IP socket families (AF_UNIX and friends) before reserving a
-    // ringbuf record. Userspace only emits AF_INET/AF_INET6 egress and maps
-    // every other family to `Other`, which it discards — so this filters
-    // exactly what would be dropped anyway, but saves the reserve + 28-byte
-    // copy + ringbuf wakeup for the local-socket chatter (D-Bus, language
-    // servers, container runtimes) that agents generate constantly. Reads
-    // just the 2-byte sa_family from the user sockaddr.
+    // Drop families we know are uninteresting before reserving a ringbuf
+    // record. Keep AF_UNIX: userspace classifies high-signal local IPC
+    // surfaces like docker.sock / SSH agent / gpg-agent and drops the rest.
     __u16 family = 0;
     bpf_probe_read_user(&family, sizeof(family), ctx->uservaddr);
-    if (family != 2 /* AF_INET */ && family != 10 /* AF_INET6 */) {
+    if (family != 1 /* AF_UNIX */ && family != 2 /* AF_INET */ && family != 10 /* AF_INET6 */) {
         return 0;
     }
     struct connect_event *e = bpf_ringbuf_reserve(&connect_events, sizeof(*e), 0);
@@ -118,7 +113,8 @@ int handle_connect(struct sys_enter_connect_args *ctx) {
         alen = MAX_SOCKADDR;
     }
     e->addrlen = alen;
-    bpf_probe_read_user(e->sockaddr, MAX_SOCKADDR, ctx->uservaddr);
+    __builtin_memset(e->sockaddr, 0, sizeof(e->sockaddr));
+    bpf_probe_read_user(e->sockaddr, alen, ctx->uservaddr);
 
     bpf_ringbuf_submit(e, 0);
     return 0;

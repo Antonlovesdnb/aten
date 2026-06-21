@@ -469,6 +469,7 @@ impl AttributionEngine {
             EventKind::NetworkEgress(n) => n.process.agent_root_pid,
             EventKind::DnsQuery(d) => d.process.agent_root_pid,
             EventKind::FileWrite(f) => f.process.agent_root_pid,
+            EventKind::LocalIpcAccess(i) => i.process.agent_root_pid,
             _ => None,
         };
 
@@ -658,6 +659,33 @@ impl AttributionEngine {
                     }
                 }
             }
+            EventKind::LocalIpcAccess(i) => {
+                let path = i.ipc_path.clone();
+                let normalized = aten_transcript::normalize(&path, None);
+                if let Some(tc) = confident_tc {
+                    i.attribution.attributed_tool_call_id = Some(tc.id.clone());
+                    i.attribution.time_window_ms = time_window_ms;
+                    i.attribution.requested_by_tool_call =
+                        tc.input_text.contains(&path) || tc.input_text_lower.contains(&normalized);
+                }
+                i.attribution.triggering_command = triggering_command;
+                i.attribution.triggering_prompt = triggering_prompt;
+                if let Some(entry) = session.identifier_index.entries.get(&normalized) {
+                    for o in &entry.origins {
+                        match o {
+                            aten_schema::Origin::UserMessage => {
+                                i.attribution.requested_in_user_message = true;
+                            }
+                            aten_schema::Origin::AssistantMessage => {
+                                i.attribution.requested_in_assistant_message = true;
+                            }
+                            aten_schema::Origin::ToolResult => {
+                                i.attribution.requested_in_tool_result = true;
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -794,6 +822,7 @@ fn event_user_id(event: &Event) -> Option<&str> {
         EventKind::NetworkEgress(n) => nonempty_user(&n.process.user),
         EventKind::DnsQuery(d) => nonempty_user(&d.process.user),
         EventKind::FileWrite(f) => nonempty_user(&f.process.user),
+        EventKind::LocalIpcAccess(i) => nonempty_user(&i.process.user),
         _ => None,
     })
 }

@@ -13,6 +13,8 @@
 //!     be a firehose and is normal behavior.
 //!   - **Executable** — writes of an executable/script by extension. Payload or
 //!     exfil-script staging.
+//!   - **Persistence / supply-chain state** — shell profiles, scheduled tasks,
+//!     git hooks, startup items, package manifests, and lockfiles.
 //!
 //! Credential-path writes are intentionally NOT classified here: the
 //! `credentials` classifier + `credential_access` event already own that path
@@ -30,7 +32,9 @@ use aten_schema::FileWriteClass;
 
 /// Best-effort classification of a written path. Returns `None` for ordinary
 /// writes the collector should drop *and* for credential paths (owned by
-/// `credential_access`). Priority is AgentConfig → Executable.
+/// `credential_access`). Priority is AgentConfig/persistence/supply-chain
+/// classes → Executable so a PowerShell profile is called persistence rather
+/// than just "a .ps1".
 ///
 /// Runs in the hot path (every write-intent open), so it normalizes in a single
 /// allocation rather than `to_lowercase().replace()` (which allocated twice).
@@ -39,6 +43,24 @@ pub fn classify(path: &str) -> Option<FileWriteClass> {
 
     if is_agent_config(&p) {
         return Some(FileWriteClass::AgentConfig);
+    }
+    if is_shell_profile(&p) {
+        return Some(FileWriteClass::ShellProfile);
+    }
+    if is_scheduled_task(&p) {
+        return Some(FileWriteClass::ScheduledTask);
+    }
+    if is_git_hook(&p) {
+        return Some(FileWriteClass::GitHook);
+    }
+    if is_startup_item(&p) {
+        return Some(FileWriteClass::StartupItem);
+    }
+    if is_package_manifest(&p) {
+        return Some(FileWriteClass::PackageManifest);
+    }
+    if is_lockfile(&p) {
+        return Some(FileWriteClass::Lockfile);
     }
     if is_executable(&p) {
         return Some(FileWriteClass::Executable);
@@ -89,6 +111,93 @@ fn is_agent_config(p: &str) -> bool {
         return true;
     }
     false
+}
+
+fn file_name(p: &str) -> &str {
+    p.rsplit('/').next().unwrap_or(p)
+}
+
+fn is_shell_profile(p: &str) -> bool {
+    let name = file_name(p);
+    matches!(
+        name,
+        ".bashrc"
+            | ".bash_profile"
+            | ".bash_login"
+            | ".profile"
+            | ".zshrc"
+            | ".zprofile"
+            | ".zlogin"
+            | ".zshenv"
+            | "config.fish"
+            | "microsoft.powershell_profile.ps1"
+            | "profile.ps1"
+    ) || p.contains("/powershell/") && name.ends_with("_profile.ps1")
+}
+
+fn is_scheduled_task(p: &str) -> bool {
+    p.contains("/.config/systemd/user/")
+        || p.contains("/systemd/user/")
+        || p.contains("/etc/systemd/system/")
+        || p.contains("/etc/cron.")
+        || p.contains("/var/spool/cron/")
+        || p.contains("/library/launchagents/")
+        || p.contains("/library/launchdaemons/")
+        || p.contains("/windows/system32/tasks/")
+}
+
+fn is_git_hook(p: &str) -> bool {
+    p.contains("/.git/hooks/")
+}
+
+fn is_startup_item(p: &str) -> bool {
+    p.contains("/startup/")
+        || p.contains("/start menu/programs/startup/")
+        || p.contains("/microsoft/windows/start menu/programs/startup/")
+}
+
+fn is_package_manifest(p: &str) -> bool {
+    matches!(
+        file_name(p),
+        "package.json"
+            | "pyproject.toml"
+            | "setup.py"
+            | "setup.cfg"
+            | "requirements.txt"
+            | "cargo.toml"
+            | "go.mod"
+            | "pom.xml"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "composer.json"
+            | "gemfile"
+            | "packages.config"
+            | "project.assets.json"
+            | "vcpkg.json"
+            | "conanfile.txt"
+            | "conanfile.py"
+            | "cpanfile"
+    )
+}
+
+fn is_lockfile(p: &str) -> bool {
+    matches!(
+        file_name(p),
+        "package-lock.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "bun.lockb"
+            | "poetry.lock"
+            | "uv.lock"
+            | "cargo.lock"
+            | "go.sum"
+            | "composer.lock"
+            | "gemfile.lock"
+            | "packages.lock.json"
+            | "vcpkg-configuration.json"
+            | "conan.lock"
+            | "cpanfile.snapshot"
+    )
 }
 
 /// Executable / script by extension. Input is already lowercased. We can't see
@@ -167,6 +276,45 @@ mod tests {
         assert_eq!(
             classify("/home/x/evil.exe"),
             Some(FileWriteClass::Executable)
+        );
+    }
+
+    #[test]
+    fn persistence_writes_match() {
+        assert_eq!(
+            classify("/home/anton/.zshrc"),
+            Some(FileWriteClass::ShellProfile)
+        );
+        assert_eq!(
+            classify("/home/anton/.config/systemd/user/agent.service"),
+            Some(FileWriteClass::ScheduledTask)
+        );
+        assert_eq!(
+            classify("/repo/.git/hooks/pre-commit"),
+            Some(FileWriteClass::GitHook)
+        );
+        assert_eq!(
+            classify(
+                r"C:\Users\anton\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\run.vbs"
+            ),
+            Some(FileWriteClass::StartupItem)
+        );
+    }
+
+    #[test]
+    fn package_state_writes_match() {
+        assert_eq!(
+            classify("/repo/package.json"),
+            Some(FileWriteClass::PackageManifest)
+        );
+        assert_eq!(classify("/repo/Cargo.lock"), Some(FileWriteClass::Lockfile));
+        assert_eq!(
+            classify(r"C:\repo\packages.config"),
+            Some(FileWriteClass::PackageManifest)
+        );
+        assert_eq!(
+            classify(r"C:\repo\packages.lock.json"),
+            Some(FileWriteClass::Lockfile)
         );
     }
 

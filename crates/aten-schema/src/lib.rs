@@ -59,7 +59,12 @@ use serde::{Deserialize, Serialize};
 /// - 0.7: `CredentialClass` grows typed token-store classes for common
 ///   developer credential files beyond cloud/SSH basics: netrc, npm, PyPI,
 ///   Docker config, GitHub CLI, and SSH authorized_keys writes.
-pub const SCHEMA_VERSION: &str = "0.7";
+/// - 0.8: Agent-context and high-signal derived telemetry. Adds transcript
+///   `agent_session` and `permission_decision` events, local sensitive IPC
+///   access events, optional supply-chain classification on `process_exec`,
+///   optional cloud-metadata classification on `network_egress`, and richer
+///   `file_write` classes for persistence / package-manifest changes.
+pub const SCHEMA_VERSION: &str = "0.8";
 
 /// One link in a process's ancestor chain. Same order semantics as the
 /// old `Vec<String>` (root → immediate parent, excludes the event's own
@@ -115,16 +120,39 @@ pub struct Source {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum EventKind {
+    AgentSession(AgentSessionPayload),
     Prompt(PromptPayload),
     ToolCall(ToolCallPayload),
     ToolResult(ToolResultPayload),
+    PermissionDecision(PermissionDecisionPayload),
     ProcessExec(ProcessExecPayload),
     ProcessExit(ProcessExitPayload),
     CredentialAccess(CredentialAccessPayload),
     NetworkEgress(NetworkEgressPayload),
     DnsQuery(DnsQueryPayload),
     FileWrite(FileWritePayload),
+    LocalIpcAccess(LocalIpcAccessPayload),
     CollectorStatus(CollectorStatusPayload),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    ClaudeCode,
+    CodexCli,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionPayload {
+    pub agent_kind: AgentKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -168,6 +196,28 @@ pub struct ToolResultPayload {
     pub result_summary: String,
     pub result_text: String,
     pub child_pids: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    Allowed,
+    Denied,
+    Prompted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionDecisionPayload {
+    pub decision: PermissionDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Process context for any event that originates from an observed process.
@@ -249,6 +299,8 @@ pub struct ProcessExecPayload {
     pub attribution: Attribution,
     pub exec_args: Vec<String>,
     pub exec_envp_summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supply_chain_activity: Option<SupplyChainActivity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +360,26 @@ pub enum Protocol {
     Udp,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SupplyChainActivity {
+    PackageManager,
+    PackageInstall,
+    PackageScript,
+    GitOperation,
+    NetworkInstaller,
+    ContainerBuild,
+    BuildTool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudMetadataClass {
+    InstanceMetadata,
+    AwsTaskCredentials,
+    AlibabaMetadata,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkEgressPayload {
     pub process: Process,
@@ -319,6 +391,8 @@ pub struct NetworkEgressPayload {
     pub protocol: Protocol,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_sni: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_metadata: Option<CloudMetadataClass>,
 }
 
 /// DNS query record type. Typed (like `CredentialClass`/`Protocol`) so
@@ -379,6 +453,22 @@ pub enum FileWriteClass {
     /// Write of an executable or script file (`.sh`, `.ps1`, `.py`, `.exe`,
     /// `.bat`, …). Payload / exfil-script staging.
     Executable,
+    /// User shell startup/profile files (`.zshrc`, `.bashrc`, PowerShell
+    /// profile). Classic user-level persistence.
+    ShellProfile,
+    /// Scheduled execution surfaces: cron, systemd units/timers, LaunchAgents,
+    /// LaunchDaemons, and similar.
+    ScheduledTask,
+    /// Git hooks under `.git/hooks/` — supply-chain/persistence inside a repo.
+    GitHook,
+    /// OS startup folders / run-key-style startup surfaces.
+    StartupItem,
+    /// Package manifests (`package.json`, `pyproject.toml`, `Cargo.toml`, …)
+    /// whose edits can redirect dependency resolution or lifecycle behavior.
+    PackageManifest,
+    /// Lockfiles (`package-lock.json`, `poetry.lock`, `Cargo.lock`, …) whose
+    /// edits pin resolved dependencies and are high-signal supply-chain state.
+    Lockfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,6 +481,24 @@ pub struct FileWritePayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
     pub write_class: FileWriteClass,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalIpcClass {
+    DockerSocket,
+    ContainerRuntimeSocket,
+    SshAgentSocket,
+    GpgAgentSocket,
+    SecretManagerSocket,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalIpcAccessPayload {
+    pub process: Process,
+    pub attribution: Attribution,
+    pub ipc_path: String,
+    pub ipc_class: LocalIpcClass,
 }
 
 /// Daemon self-telemetry, emitted when ATEN has to drop events it can't keep

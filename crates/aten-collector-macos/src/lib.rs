@@ -1,12 +1,13 @@
 //! macOS EndpointSecurity + NetworkExtension collector.
 //!
-//! Produces the same three `aten_schema::Event` kinds as the Linux (eBPF)
-//! and Windows (ETW) collectors — `ProcessExec`, `CredentialAccess`,
-//! `NetworkEgress` — from macOS-native sources:
+//! Produces macOS-native `aten_schema::Event`s for enrolled agent processes:
+//! `ProcessExec`, `ProcessExit`, `CredentialAccess`, `FileWrite`,
+//! `LocalIpcAccess`, and `NetworkEgress`.
 //!
-//! - **ProcessExec + CredentialAccess** come from the EndpointSecurity
-//!   framework (ESF) via the `endpoint-sec` crate: `NOTIFY_EXEC` and
-//!   `NOTIFY_OPEN`. In-process, like the other collectors.
+//! - **ProcessExec + ProcessExit + CredentialAccess + FileWrite +
+//!   LocalIpcAccess** come from the EndpointSecurity framework (ESF) via the
+//!   `endpoint-sec` crate: `NOTIFY_EXEC`, `NOTIFY_EXIT`, `NOTIFY_OPEN`, and
+//!   `NOTIFY_UIPC_CONNECT`. In-process, like the other collectors.
 //! - **NetworkEgress** can't come from ESF (it has no TCP/IP connect event —
 //!   only UNIX-domain `uipc_connect`). It arrives from a *separate* process: a
 //!   Swift `NEFilterDataProvider` system extension that observes socket flows

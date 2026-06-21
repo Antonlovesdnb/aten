@@ -14,7 +14,8 @@ use anyhow::{anyhow, Context, Result};
 use aten_schema::{
     AccessType, Attribution, CollectorStatusPayload, CredentialAccessPayload, CredentialClass,
     DnsQueryPayload, DnsQueryType, Event, EventKind, FileWriteClass, FileWritePayload,
-    NetworkEgressPayload, Platform, Process, ProcessExecPayload, Protocol, Source, SCHEMA_VERSION,
+    LocalIpcAccessPayload, NetworkEgressPayload, Platform, Process, ProcessExecPayload, Protocol,
+    Source, SCHEMA_VERSION,
 };
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, MapFlags, OpenObject, UprobeOpts};
@@ -93,7 +94,7 @@ struct RawConnectEvent {
     uid: u32,
     addrlen: u32,
     comm: [u8; TASK_COMM_LEN],
-    sockaddr: [u8; 28],
+    sockaddr: [u8; 110],
 }
 unsafe impl Plain for RawConnectEvent {}
 
@@ -604,6 +605,10 @@ where
     let attributed_by_descent = !is_agent_root_match;
     let agent_root_pid = Some(record.agent_root.pid);
 
+    let exec_args = argv_from_cmdline(&snap.cmdline);
+    let supply_chain_activity =
+        crate::supply_chain::classify_process(&comm, &snap.cmdline, &exec_args);
+
     let event = Event {
         schema_version: SCHEMA_VERSION.to_string(),
         event_id: uuid::Uuid::new_v4().to_string(),
@@ -648,8 +653,9 @@ where
                 triggering_command: None,
                 triggering_prompt: None,
             },
-            exec_args: argv_from_cmdline(&snap.cmdline),
+            exec_args,
             exec_envp_summary: String::new(),
+            supply_chain_activity,
         }),
     };
 
@@ -1158,6 +1164,10 @@ where
     let pid = raw.pid as i32;
     let endpoint = network::parse_sockaddr(&raw.sockaddr);
 
+    if matches!(endpoint, Endpoint::Unix { .. }) {
+        return handle_local_ipc_event(&raw, &endpoint, state, host_id, emit);
+    }
+
     if network::is_uninteresting(&endpoint) {
         return Ok(());
     }
@@ -1170,6 +1180,7 @@ where
     let (dest_ip_str, dest_port, protocol) = match &endpoint {
         Endpoint::V4 { ip, port } => (ip.to_string(), *port, Protocol::Tcp),
         Endpoint::V6 { ip, port } => (ip.to_string(), *port, Protocol::Tcp),
+        Endpoint::Unix { .. } => return Ok(()),
         Endpoint::Other => return Ok(()),
     };
 
@@ -1189,6 +1200,8 @@ where
     } else {
         raw.uid.to_string()
     };
+
+    let cloud_metadata = network::cloud_metadata_class(&endpoint);
 
     let event = Event {
         schema_version: SCHEMA_VERSION.to_string(),
@@ -1235,6 +1248,99 @@ where
             dest_host: None,
             protocol,
             tls_sni: None,
+            cloud_metadata,
+        }),
+    };
+
+    emit(event);
+    Ok(())
+}
+
+fn handle_local_ipc_event<F>(
+    raw: &RawConnectEvent,
+    endpoint: &Endpoint,
+    state: &mut SharedState,
+    host_id: Option<&str>,
+    emit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Event),
+{
+    let Endpoint::Unix { path } = endpoint else {
+        return Ok(());
+    };
+    let Some(ipc_class) = crate::ipc::classify(path) else {
+        return Ok(());
+    };
+
+    let pid = raw.pid as i32;
+    let record = match resolve_enrollment(pid, state) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let cached = process_enrichment(pid, state);
+    let snap = cached.snapshot;
+    let chain = cached.parent_chain;
+    let is_agent_root = record.agent_root.pid == pid;
+    let attributed_by_descent = !is_agent_root;
+
+    let process_name = if !snap.comm.is_empty() {
+        snap.comm
+    } else {
+        nul_str(&raw.comm).to_string()
+    };
+    let user = if !snap.user.is_empty() {
+        snap.user
+    } else {
+        raw.uid.to_string()
+    };
+
+    let event = Event {
+        schema_version: SCHEMA_VERSION.to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: rfc3339_from_boot_ns(raw.timestamp_ns),
+        monotonic_ns: Some(raw.timestamp_ns),
+        platform: Platform::Linux,
+        host_id: host_id.map(str::to_string),
+        agent_id: if is_agent_root {
+            "agent-root".to_string()
+        } else {
+            "agent-descendant".to_string()
+        },
+        session_id: None,
+        user_id: Some(user.clone()),
+        source: Source {
+            collector: "linux_ebpf".to_string(),
+            probe: "tracepoint/syscalls/sys_enter_connect".to_string(),
+            host_pid: Some(pid),
+        },
+        kind: EventKind::LocalIpcAccess(LocalIpcAccessPayload {
+            process: Process {
+                pid,
+                ppid: snap.ppid,
+                start_time: snap.start_time_ticks.to_string(),
+                name: process_name,
+                path: snap.exe_path,
+                cmdline: snap.cmdline,
+                cwd: snap.cwd,
+                user,
+                integrity_level: None,
+                parent_chain: chain,
+                agent_root_pid: Some(record.agent_root.pid),
+            },
+            attribution: Attribution {
+                attributed_tool_call_id: None,
+                attributed_by_descent,
+                requested_by_tool_call: false,
+                requested_in_user_message: false,
+                requested_in_assistant_message: false,
+                requested_in_tool_result: false,
+                time_window_ms: None,
+                triggering_command: None,
+                triggering_prompt: None,
+            },
+            ipc_path: path.clone(),
+            ipc_class,
         }),
     };
 

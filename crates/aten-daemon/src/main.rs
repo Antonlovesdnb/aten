@@ -1467,15 +1467,18 @@ fn run_transcript(transcript: PathBuf, out: Option<PathBuf>, idx: Option<PathBuf
     let mut by_type: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for ev in &events {
         let key = match &ev.kind {
+            aten_schema::EventKind::AgentSession(_) => "agent_session",
             aten_schema::EventKind::Prompt(_) => "prompt",
             aten_schema::EventKind::ToolCall(_) => "tool_call",
             aten_schema::EventKind::ToolResult(_) => "tool_result",
+            aten_schema::EventKind::PermissionDecision(_) => "permission_decision",
             aten_schema::EventKind::ProcessExec(_) => "process_exec",
             aten_schema::EventKind::ProcessExit(_) => "process_exit",
             aten_schema::EventKind::CredentialAccess(_) => "credential_access",
             aten_schema::EventKind::NetworkEgress(_) => "network_egress",
             aten_schema::EventKind::DnsQuery(_) => "dns_query",
             aten_schema::EventKind::FileWrite(_) => "file_write",
+            aten_schema::EventKind::LocalIpcAccess(_) => "local_ipc_access",
             aten_schema::EventKind::CollectorStatus(_) => "collector_status",
         };
         *by_type.entry(key).or_insert(0) += 1;
