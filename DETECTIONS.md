@@ -203,6 +203,22 @@ SELECT process.cmdline, triggering_prompt
 
 ---
 
+## Agent posture
+
+### POSTURE-1 — Agent running with permission gating disabled
+**Severity: medium.** `agent_session` carries the session's `permission_mode`. `bypassPermissions` means the agent executes tools with no per-action prompt — every other detection here is now the *only* thing standing between the agent and the host. ATEN emits an `agent_session` at session start **and** re-emits one whenever the mode changes mid-session, so this catches both a session that starts in bypass and one that *escalates* into it (de-duped: redundant re-statements of the same mode don't fire).
+
+```
+FROM agent_session
+WHERE permission_mode in (bypassPermissions, acceptEdits)
+GROUP BY session_id, user_id, host_id
+SELECT permission_mode, agent_kind, cwd, timestamp
+```
+
+**False positives:** some operators run agents in `bypassPermissions` deliberately (CI, sandboxes). Treat this as context that *raises the severity of the other rules* for that session rather than a standalone alert — e.g. join it to CRED-1 / EXFIL-1 and page only when an unrequested credential read or egress happens in a bypass session. A mid-session escalation (two `agent_session` events for one `session_id` with the mode increasing in privilege) is the higher-signal variant.
+
+---
+
 ## Collector health
 
 ### HEALTH-1 — Telemetry gap (dropped events)

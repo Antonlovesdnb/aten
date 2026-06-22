@@ -45,6 +45,7 @@ pub struct TranscriptStreamParser {
     session_id: Option<String>,
     cwd: Option<String>,
     agent_session_emitted: bool,
+    last_permission_mode: Option<String>,
 }
 
 impl TranscriptStreamParser {
@@ -55,6 +56,7 @@ impl TranscriptStreamParser {
             session_id: None,
             cwd: None,
             agent_session_emitted: false,
+            last_permission_mode: None,
         }
     }
 
@@ -74,7 +76,26 @@ impl TranscriptStreamParser {
                 if !self.agent_session_emitted {
                     if let Some(session_event) = claude_agent_session_event(&rec, self.platform) {
                         self.agent_session_emitted = true;
+                        self.last_permission_mode = rec.permission_mode.clone();
                         events.insert(0, session_event);
+                    }
+                } else if let Some(mode) = rec.permission_mode.as_deref() {
+                    // Surface a mid-session permission-mode CHANGE (notably an
+                    // escalation to `bypassPermissions`, which disables the
+                    // agent's own permission gating) as a fresh agent_session
+                    // carrying the new mode. Transcripts re-state the current
+                    // mode redundantly — a session can repeat it 10+ times — so
+                    // emit only on a real transition between two observed modes;
+                    // the initial mode is already on the agent_session above.
+                    if self.last_permission_mode.as_deref() != Some(mode) {
+                        if self.last_permission_mode.is_some() {
+                            if let Some(change_event) =
+                                claude_agent_session_event(&rec, self.platform)
+                            {
+                                events.push(change_event);
+                            }
+                        }
+                        self.last_permission_mode = Some(mode.to_string());
                     }
                 }
                 Ok(events)
@@ -214,6 +235,7 @@ pub fn read_transcript(
 ) -> anyhow::Result<(Vec<Event>, IdentifierIndex)> {
     let mut events = Vec::new();
     let mut agent_sessions_seen: BTreeSet<String> = BTreeSet::new();
+    let mut last_permission_mode: BTreeMap<String, String> = BTreeMap::new();
     for (lineno, line) in transcript_jsonl.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -230,6 +252,21 @@ pub fn read_transcript(
             if agent_sessions_seen.insert(session_id.clone()) {
                 if let Some(session_event) = claude_agent_session_event(&rec, platform) {
                     events.push(session_event);
+                }
+                if let Some(mode) = rec.permission_mode.clone() {
+                    last_permission_mode.insert(session_id.clone(), mode);
+                }
+            } else if let Some(mode) = rec.permission_mode.as_deref() {
+                // Mid-session permission-mode change (see the streaming parser):
+                // emit only on a real transition, not the redundant re-statements.
+                let prev = last_permission_mode.get(session_id).map(String::as_str);
+                if prev != Some(mode) {
+                    if prev.is_some() {
+                        if let Some(change_event) = claude_agent_session_event(&rec, platform) {
+                            events.push(change_event);
+                        }
+                    }
+                    last_permission_mode.insert(session_id.clone(), mode.to_string());
                 }
             }
         }
@@ -728,6 +765,63 @@ mod tests {
                 "{word} should map to Denied"
             );
         }
+    }
+
+    #[test]
+    fn permission_mode_escalation_emits_one_agent_session_change() {
+        // Real escalation: a session that starts `default` and switches to
+        // `bypassPermissions` mid-way. The mode is re-stated redundantly (here
+        // twice each) — we want exactly the initial session + ONE change.
+        let jsonl = concat!(
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-05-27T19:08:00Z","permissionMode":"default","message":{"content":"hi"}}"#,
+            "\n",
+            r#"{"type":"permission-mode","permissionMode":"default","sessionId":"s1"}"#,
+            "\n",
+            r#"{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"s1"}"#,
+            "\n",
+            r#"{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"s1"}"#,
+            "\n",
+        );
+        let (events, _) = read_transcript(jsonl, Platform::Linux, None).unwrap();
+        let modes: Vec<Option<String>> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::AgentSession(s) => Some(s.permission_mode.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                Some("default".to_string()),
+                Some("bypassPermissions".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_parser_captures_permission_mode_change() {
+        // Same, through the live tail parser used by the daemon.
+        let mut p = TranscriptStreamParser::new(TranscriptDialect::ClaudeCode, Platform::Linux);
+        let mut modes = Vec::new();
+        for line in [
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-05-27T19:08:00Z","permissionMode":"default","message":{"content":"hi"}}"#,
+            r#"{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"s1"}"#,
+            r#"{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"s1"}"#,
+        ] {
+            for ev in p.parse_line(line).unwrap() {
+                if let EventKind::AgentSession(s) = &ev.kind {
+                    modes.push(s.permission_mode.clone());
+                }
+            }
+        }
+        assert_eq!(
+            modes,
+            vec![
+                Some("default".to_string()),
+                Some("bypassPermissions".to_string())
+            ]
+        );
     }
 
     #[test]
