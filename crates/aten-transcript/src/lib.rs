@@ -171,8 +171,29 @@ struct TranscriptRecord {
     permission_mode: Option<String>,
     #[serde(default)]
     message: Option<Message>,
-    #[serde(flatten)]
-    extra: BTreeMap<String, serde_json::Value>,
+    // Permission-decision fields, captured explicitly rather than via a broad
+    // `#[serde(flatten)]` map. That map buffered EVERY unknown top-level field
+    // — including the top-level, megabyte-scale, attacker-influenced
+    // `toolUseResult` tool output — on every record, when only these few small
+    // permission keys are ever read. An explicit `decision` (with its camel/
+    // snake aliases) is the sole trigger: we deliberately do NOT infer a
+    // decision from generic `status`/`result` fields, which real records carry
+    // for unrelated reasons.
+    #[serde(default, alias = "permissionDecision", alias = "permission_decision")]
+    decision: Option<serde_json::Value>,
+    #[serde(default, alias = "command", alias = "path", alias = "pattern")]
+    target: Option<String>,
+    #[serde(default, alias = "toolName", alias = "name")]
+    tool_name: Option<String>,
+    #[serde(
+        default,
+        alias = "toolUseId",
+        alias = "tool_use_id",
+        alias = "toolCallId"
+    )]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,9 +274,11 @@ pub(crate) fn parse_record(rec: &TranscriptRecord, platform: Platform) -> Vec<Ev
     let Some(rtype) = rec.rtype.as_deref() else {
         return out;
     };
+    // A permission decision is additive context, not a substitute for the
+    // record's own message events. Emit it alongside (don't early-return), so a
+    // record that ever carried both a decision and a message keeps both.
     if let Some(permission) = claude_permission_decision_event(rec, platform) {
         out.push(permission);
-        return out;
     }
     let Some(msg) = &rec.message else {
         return out;
@@ -399,49 +422,26 @@ fn claude_agent_session_event(rec: &TranscriptRecord, platform: Platform) -> Opt
 }
 
 fn claude_permission_decision_event(rec: &TranscriptRecord, platform: Platform) -> Option<Event> {
-    let rtype = rec.rtype.as_deref().unwrap_or_default();
-    if !rtype.contains("permission")
-        && !rec
-            .extra
-            .keys()
-            .any(|k| k.to_lowercase().contains("permission"))
-    {
-        return None;
-    }
-    let decision = decision_from_values(&rec.extra)?;
+    // Fire only on an explicit, decodable decision field. Real Claude Code
+    // transcripts (v2.1.x) record no per-tool allow/deny: the only permission
+    // signal is the session `permissionMode` (carried on `agent_session`) and
+    // `permission-mode` change records, neither of which is a decision. So this
+    // produces nothing today by design — and crucially never misreads a
+    // `permissionMode` or a generic `status` as a decision. If a hook or a
+    // future version writes an explicit `decision`/`permissionDecision`, it is
+    // captured here.
+    let decision = rec.decision.as_ref().and_then(decision_from_value)?;
     Some(envelope(
         rec,
         EventKind::PermissionDecision(PermissionDecisionPayload {
             decision,
-            target: string_field(&rec.extra, &["target", "command", "path", "pattern"]),
-            tool_name: string_field(&rec.extra, &["toolName", "tool_name", "name"]),
-            tool_call_id: string_field(
-                &rec.extra,
-                &["toolUseId", "tool_use_id", "toolCallId", "tool_call_id"],
-            ),
-            reason: string_field(&rec.extra, &["reason", "message"]),
+            target: rec.target.clone(),
+            tool_name: rec.tool_name.clone(),
+            tool_call_id: rec.tool_call_id.clone(),
+            reason: rec.reason.clone(),
         }),
         platform,
     ))
-}
-
-pub(crate) fn decision_from_values(
-    values: &BTreeMap<String, serde_json::Value>,
-) -> Option<PermissionDecision> {
-    for key in [
-        "decision",
-        "result",
-        "status",
-        "permissionDecision",
-        "permission_decision",
-    ] {
-        if let Some(value) = values.get(key) {
-            if let Some(decision) = decision_from_value(value) {
-                return Some(decision);
-            }
-        }
-    }
-    None
 }
 
 pub(crate) fn decision_from_value(value: &serde_json::Value) -> Option<PermissionDecision> {
@@ -452,15 +452,24 @@ pub(crate) fn decision_from_value(value: &serde_json::Value) -> Option<Permissio
             let s = s.to_lowercase();
             if matches!(
                 s.as_str(),
-                "allow" | "allowed" | "approve" | "approved" | "yes"
+                "allow" | "allowed" | "approve" | "approved" | "accept" | "accepted"
+                    | "grant" | "granted" | "yes"
             ) {
                 Some(PermissionDecision::Allowed)
-            } else if matches!(s.as_str(), "deny" | "denied" | "reject" | "rejected" | "no") {
+            } else if matches!(
+                s.as_str(),
+                "deny" | "denied" | "reject" | "rejected" | "refuse" | "refused"
+                    | "decline" | "declined" | "block" | "blocked" | "no"
+            ) {
                 Some(PermissionDecision::Denied)
-            } else if matches!(s.as_str(), "prompt" | "prompted" | "ask") {
+            } else if matches!(s.as_str(), "prompt" | "prompted" | "ask" | "confirm") {
                 Some(PermissionDecision::Prompted)
             } else {
-                Some(PermissionDecision::Unknown)
+                // An explicit-but-unrecognized string is NOT a decision. Real
+                // records carry generic statuses ("completed", "pending", HTTP
+                // 200) in these fields; minting a `Unknown` decision event from
+                // them is noise that an analyst could misread as benign. Drop it.
+                None
             }
         }
         _ => None,
@@ -601,7 +610,11 @@ mod tests {
             model: None,
             permission_mode: None,
             message: Some(Message { content }),
-            extra: BTreeMap::new(),
+            decision: None,
+            target: None,
+            tool_name: None,
+            tool_call_id: None,
+            reason: None,
         }
     }
 
@@ -615,7 +628,105 @@ mod tests {
             model: None,
             permission_mode: None,
             message: Some(Message { content }),
-            extra: BTreeMap::new(),
+            decision: None,
+            target: None,
+            tool_name: None,
+            tool_call_id: None,
+            reason: None,
+        }
+    }
+
+    // --- Permission-decision format fixtures ------------------------------
+    // These pin the parser against the ACTUAL Claude Code transcript shapes
+    // observed on disk (~/.claude/projects, v2.1.x), plus the synthetic
+    // explicit-decision shape we capture if a hook/future version emits one.
+    // Real Claude Code records carry NO per-tool allow/deny decision.
+
+    fn perm_events(line: &str) -> Vec<Event> {
+        let rec: TranscriptRecord = serde_json::from_str(line).expect("record parses");
+        parse_record(&rec, Platform::Linux)
+    }
+    fn has_permission_decision(events: &[Event]) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::PermissionDecision(_)))
+    }
+    fn first_decision(events: &[Event]) -> Option<PermissionDecision> {
+        events.iter().find_map(|e| match &e.kind {
+            EventKind::PermissionDecision(p) => Some(p.decision),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn real_permission_mode_record_is_not_a_decision() {
+        // Real shape, 605× on disk. `permissionMode` is the session mode, not a
+        // per-tool decision — must NOT mint a permission_decision.
+        let line = r#"{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"s1"}"#;
+        assert!(!has_permission_decision(&perm_events(line)));
+    }
+
+    #[test]
+    fn real_command_permissions_attachment_is_not_a_decision() {
+        // Real shape: an attachment listing the tool allowlist, no decision.
+        let line = r#"{"type":"attachment","attachment":{"type":"command_permissions","allowedTools":[]},"sessionId":"s1","uuid":"u1","timestamp":"2026-06-15T18:50:34.039Z"}"#;
+        assert!(!has_permission_decision(&perm_events(line)));
+    }
+
+    #[test]
+    fn large_tooluseresult_is_not_buffered_or_misread() {
+        // toolUseResult is a TOP-LEVEL field (verified on disk) and can be huge,
+        // attacker-influenced tool output. The old `#[serde(flatten)] extra`
+        // buffered it on every record; the explicit fields ignore it. Here a
+        // 100 KB toolUseResult must parse fine and produce no permission event.
+        let big = "x".repeat(100_000);
+        let line = format!(
+            r#"{{"type":"file-history-snapshot","sessionId":"s1","toolUseResult":"{big}"}}"#
+        );
+        assert!(!has_permission_decision(&perm_events(&line)));
+    }
+
+    #[test]
+    fn generic_status_field_is_not_a_decision() {
+        // The false-positive the fix kills: a record whose only decision-ish
+        // field is a generic status ("completed", HTTP 200) is NOT a decision.
+        assert!(!has_permission_decision(&perm_events(
+            r#"{"type":"function_call_output","status":"completed","sessionId":"s1"}"#
+        )));
+        assert!(!has_permission_decision(&perm_events(
+            r#"{"type":"result","result":"ok","sessionId":"s1"}"#
+        )));
+    }
+
+    #[test]
+    fn explicit_decision_is_captured_with_metadata() {
+        // Synthetic (no real transcript writes this today): an explicit decision
+        // field IS captured, and emitted ALONGSIDE — not instead of — the record.
+        let line = r#"{"type":"permission_decision","decision":"denied","toolName":"Bash","reason":"policy","toolUseId":"toolu_1","sessionId":"s1","uuid":"u1","timestamp":"2026-05-27T19:08:02.110Z"}"#;
+        let events = perm_events(line);
+        assert_eq!(first_decision(&events), Some(PermissionDecision::Denied));
+        let pd = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::PermissionDecision(p) => Some(p),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(pd.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(pd.tool_call_id.as_deref(), Some("toolu_1"));
+    }
+
+    #[test]
+    fn denial_synonyms_map_to_denied_not_unknown() {
+        for word in ["blocked", "refused", "declined", "rejected"] {
+            let line = format!(
+                r#"{{"type":"permission_decision","permissionDecision":"{word}","sessionId":"s1","uuid":"u1","timestamp":"2026-05-27T19:08:02.110Z"}}"#
+            );
+            assert_eq!(
+                first_decision(&perm_events(&line)),
+                Some(PermissionDecision::Denied),
+                "{word} should map to Denied"
+            );
         }
     }
 

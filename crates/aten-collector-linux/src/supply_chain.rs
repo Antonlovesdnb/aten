@@ -7,10 +7,18 @@
 use aten_schema::SupplyChainActivity;
 
 pub fn classify_process(name: &str, cmdline: &str, args: &[String]) -> Option<SupplyChainActivity> {
-    let exe = basename(name)
-        .or_else(|| args.first().map(String::as_str))
+    // Prefer argv[0] (the actual program) over the kernel `comm`: `comm` is
+    // capped at 15 chars and, for scripts, reflects the interpreter (`node`,
+    // `python3`) rather than the tool (`npm`, `pip`). Classifying off `comm`
+    // alone silently misses package-manager invocations run under an
+    // interpreter — the security-relevant false-negative. Fall back to `comm`
+    // only when argv is empty.
+    let exe_raw = args
+        .first()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
         .unwrap_or(name);
-    let exe = normalize_token(exe);
+    let exe = normalize_token(exe_raw);
     let cmd = cmdline.to_lowercase();
 
     if is_network_installer(&exe, &cmd) {
