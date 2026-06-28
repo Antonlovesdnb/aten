@@ -6,11 +6,11 @@
 //!
 //! The emitted scope is "sensitive + executable drops" (see schema 0.5 notes):
 //!   - **AgentConfig** — writes to the agent's own config surface
-//!     (`settings.json`, `skills/`, `agents/`, `hooks`, `CLAUDE.md`). This is
-//!     the agent-self-modification / persistence vector and ATEN's unique
-//!     signal. Deliberately does NOT match the whole `.claude/` tree — the
-//!     transcript JSONL and todo/history churn under `.claude/projects/` would
-//!     be a firehose and is normal behavior.
+//!     (`settings.json`, `skills/`, `agents/`, `hooks`, MCP config, assistant
+//!     rules/instructions). This is the agent-self-modification / persistence
+//!     vector and ATEN's unique signal. Deliberately does NOT match whole agent
+//!     home dirs — transcript JSONL and todo/history churn would be a firehose
+//!     and is normal behavior.
 //!   - **Executable** — writes of an executable/script by extension. Payload or
 //!     exfil-script staging.
 //!   - **Persistence / supply-chain state** — shell profiles, scheduled tasks,
@@ -87,18 +87,23 @@ fn normalize(path: &str) -> String {
 /// home dir whose modification changes future-turn behavior. Input is already
 /// lowercased and forward-slashed.
 fn is_agent_config(p: &str) -> bool {
-    // Settings files under either agent's config dir.
+    let name = file_name(p);
+
+    // Claude/Codex settings and lifecycle/control-plane directories.
     if (p.contains("/.claude/") || p.contains("/.codex/"))
         && (p.ends_with("/settings.json")
             || p.ends_with("/settings.local.json")
             || p.ends_with("/config.toml")
             || p.ends_with("/config.json")
-            || p.contains("/hooks"))
+            || p.contains("/hooks/")
+            || p.contains("/plugins/")
+            || p.contains("/commands/")
+            || p.contains("/mcp/"))
     {
         return true;
     }
     // Skills and subagent definitions, in either the user config dir or a
-    // project-local `.claude/` / `.codex/` checkout.
+    // project-local `.claude/` / `.codex` checkout.
     if p.contains("/.claude/skills/")
         || p.contains("/.claude/agents/")
         || p.contains("/.codex/skills/")
@@ -106,8 +111,40 @@ fn is_agent_config(p: &str) -> bool {
     {
         return true;
     }
-    // Project memory file the agent reads as instructions every session.
-    if p.ends_with("/claude.md") || p.ends_with("/agents.md") {
+    // MCP config is a capability boundary: it can grant shell, filesystem,
+    // browser, SaaS, or network tools to the agent.
+    if matches!(name, ".mcp.json" | "mcp.json" | "mcp.yaml" | "mcp.yml") {
+        return true;
+    }
+    // Other common assistant rule/instruction surfaces. Keep this to
+    // high-signal filenames/directories rather than entire app config trees.
+    if matches!(
+        name,
+        "claude.md"
+            | "agents.md"
+            | "gemini.md"
+            | ".cursorrules"
+            | ".windsurfrules"
+            | ".clinerules"
+            | ".aider.conf.yml"
+            | ".aider.conf.yaml"
+    ) {
+        return true;
+    }
+    if p.contains("/.cursor/rules/")
+        || p.contains("/.cursor/mcp.")
+        || p.contains("/.gemini/")
+        || p.contains("/.kiro/steering/")
+        || p.contains("/.windsurf/rules/")
+        || p.contains("/.roo/rules/")
+        || p.contains("/.continue/config.")
+    {
+        return true;
+    }
+    // VS Code workspace tasks/MCP can activate commands or tools when an agent
+    // opens or follows repo setup instructions. Avoid broad settings.json
+    // matching here: ordinary repos edit it constantly.
+    if p.contains("/.vscode/") && matches!(name, "tasks.json" | "mcp.json") {
         return true;
     }
     false
@@ -241,6 +278,36 @@ mod tests {
             classify("/home/anton/proj/CLAUDE.md"),
             Some(FileWriteClass::AgentConfig)
         );
+    }
+
+    #[test]
+    fn expanded_agent_control_plane_surfaces() {
+        for path in [
+            "/home/anton/proj/.mcp.json",
+            "/home/anton/proj/.cursor/rules/project.mdc",
+            "/home/anton/proj/.cursorrules",
+            "/home/anton/proj/.gemini/settings.json",
+            "/home/anton/proj/GEMINI.md",
+            "/home/anton/proj/.kiro/steering/security.md",
+            "/home/anton/proj/.windsurf/rules/demo.md",
+            "/home/anton/proj/.roo/rules/policy.md",
+            "/home/anton/proj/.continue/config.json",
+            "/home/anton/proj/.vscode/tasks.json",
+            "/home/anton/proj/.vscode/mcp.json",
+            r"C:\Users\anton\.claude\plugins\marketplace.json",
+            r"C:\repo\.codex\commands\demo.md",
+        ] {
+            assert_eq!(
+                classify(path),
+                Some(FileWriteClass::AgentConfig),
+                "{path} should be agent_config"
+            );
+        }
+    }
+
+    #[test]
+    fn noisy_editor_settings_stay_dropped() {
+        assert_eq!(classify("/home/anton/proj/.vscode/settings.json"), None);
     }
 
     #[test]

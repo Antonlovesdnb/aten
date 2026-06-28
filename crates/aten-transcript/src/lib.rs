@@ -15,7 +15,7 @@ use aten_schema::{
     Source, ToolCallPayload, ToolResultPayload, SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 pub mod codex;
 pub mod identifiers;
@@ -44,6 +44,7 @@ pub struct TranscriptStreamParser {
     platform: Platform,
     session_id: Option<String>,
     cwd: Option<String>,
+    model: Option<String>,
     agent_session_emitted: bool,
     last_permission_mode: Option<String>,
 }
@@ -55,6 +56,7 @@ impl TranscriptStreamParser {
             platform,
             session_id: None,
             cwd: None,
+            model: None,
             agent_session_emitted: false,
             last_permission_mode: None,
         }
@@ -72,28 +74,38 @@ impl TranscriptStreamParser {
                 if let Some(cwd) = rec.cwd.as_ref() {
                     self.cwd = Some(cwd.clone());
                 }
+                if let Some(model) = rec.model.as_ref() {
+                    self.model = Some(model.clone());
+                }
                 let mut events = parse_record(&rec, self.platform);
                 if !self.agent_session_emitted {
-                    if let Some(session_event) = claude_agent_session_event(&rec, self.platform) {
+                    if let Some(session_event) = claude_agent_session_event_with_context(
+                        &rec,
+                        self.platform,
+                        self.cwd.as_deref(),
+                        self.model.as_deref(),
+                        rec.permission_mode.as_deref(),
+                    ) {
                         self.agent_session_emitted = true;
                         self.last_permission_mode = rec.permission_mode.clone();
                         events.insert(0, session_event);
                     }
                 } else if let Some(mode) = rec.permission_mode.as_deref() {
-                    // Surface a mid-session permission-mode CHANGE (notably an
-                    // escalation to `bypassPermissions`, which disables the
-                    // agent's own permission gating) as a fresh agent_session
-                    // carrying the new mode. Transcripts re-state the current
-                    // mode redundantly — a session can repeat it 10+ times — so
-                    // emit only on a real transition between two observed modes;
-                    // the initial mode is already on the agent_session above.
+                    // Surface permission-mode visibility as fresh agent_session
+                    // context. Transcripts re-state the current mode redundantly
+                    // — a session can repeat it 10+ times — so emit only on a
+                    // real transition. If the initial session record lacked a
+                    // mode, also emit when the first mode is observed so posture
+                    // rules don't miss sessions that become observable later.
                     if self.last_permission_mode.as_deref() != Some(mode) {
-                        if self.last_permission_mode.is_some() {
-                            if let Some(change_event) =
-                                claude_agent_session_event(&rec, self.platform)
-                            {
-                                events.push(change_event);
-                            }
+                        if let Some(change_event) = claude_agent_session_event_with_context(
+                            &rec,
+                            self.platform,
+                            self.cwd.as_deref(),
+                            self.model.as_deref(),
+                            Some(mode),
+                        ) {
+                            events.push(change_event);
                         }
                         self.last_permission_mode = Some(mode.to_string());
                     }
@@ -234,8 +246,7 @@ pub fn read_transcript(
     home: Option<&str>,
 ) -> anyhow::Result<(Vec<Event>, IdentifierIndex)> {
     let mut events = Vec::new();
-    let mut agent_sessions_seen: BTreeSet<String> = BTreeSet::new();
-    let mut last_permission_mode: BTreeMap<String, String> = BTreeMap::new();
+    let mut session_contexts: BTreeMap<String, ClaudeSessionContext> = BTreeMap::new();
     for (lineno, line) in transcript_jsonl.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -249,24 +260,45 @@ pub fn read_transcript(
             }
         };
         if let Some(session_id) = rec.session_id.as_ref() {
-            if agent_sessions_seen.insert(session_id.clone()) {
-                if let Some(session_event) = claude_agent_session_event(&rec, platform) {
+            let ctx = session_contexts.entry(session_id.clone()).or_default();
+            if let Some(cwd) = rec.cwd.clone() {
+                ctx.cwd = Some(cwd);
+            }
+            if let Some(model) = rec.model.clone() {
+                ctx.model = Some(model);
+            }
+
+            if !ctx.agent_session_emitted {
+                if let Some(session_event) = claude_agent_session_event_with_context(
+                    &rec,
+                    platform,
+                    ctx.cwd.as_deref(),
+                    ctx.model.as_deref(),
+                    rec.permission_mode.as_deref(),
+                ) {
                     events.push(session_event);
                 }
                 if let Some(mode) = rec.permission_mode.clone() {
-                    last_permission_mode.insert(session_id.clone(), mode);
+                    ctx.last_permission_mode = Some(mode);
                 }
+                ctx.agent_session_emitted = true;
             } else if let Some(mode) = rec.permission_mode.as_deref() {
-                // Mid-session permission-mode change (see the streaming parser):
-                // emit only on a real transition, not the redundant re-statements.
-                let prev = last_permission_mode.get(session_id).map(String::as_str);
+                // Permission-mode visibility/change (see the streaming parser):
+                // emit only on a real transition, not redundant re-statements.
+                // If the initial session event had no mode, the first observed
+                // mode is emitted too so posture rules can still match it.
+                let prev = ctx.last_permission_mode.as_deref();
                 if prev != Some(mode) {
-                    if prev.is_some() {
-                        if let Some(change_event) = claude_agent_session_event(&rec, platform) {
-                            events.push(change_event);
-                        }
+                    if let Some(change_event) = claude_agent_session_event_with_context(
+                        &rec,
+                        platform,
+                        ctx.cwd.as_deref(),
+                        ctx.model.as_deref(),
+                        Some(mode),
+                    ) {
+                        events.push(change_event);
                     }
-                    last_permission_mode.insert(session_id.clone(), mode.to_string());
+                    ctx.last_permission_mode = Some(mode.to_string());
                 }
             }
         }
@@ -274,6 +306,14 @@ pub fn read_transcript(
     }
     let index = build_identifier_index(&events, home);
     Ok((events, index))
+}
+
+#[derive(Debug, Default)]
+struct ClaudeSessionContext {
+    agent_session_emitted: bool,
+    cwd: Option<String>,
+    model: Option<String>,
+    last_permission_mode: Option<String>,
 }
 
 pub(crate) fn make_event_id() -> String {
@@ -443,15 +483,24 @@ pub(crate) fn parse_record(rec: &TranscriptRecord, platform: Platform) -> Vec<Ev
     out
 }
 
-fn claude_agent_session_event(rec: &TranscriptRecord, platform: Platform) -> Option<Event> {
+fn claude_agent_session_event_with_context(
+    rec: &TranscriptRecord,
+    platform: Platform,
+    cwd: Option<&str>,
+    model: Option<&str>,
+    permission_mode: Option<&str>,
+) -> Option<Event> {
     rec.session_id.as_ref()?;
     Some(envelope(
         rec,
         EventKind::AgentSession(AgentSessionPayload {
             agent_kind: AgentKind::ClaudeCode,
-            cwd: rec.cwd.clone(),
-            model: rec.model.clone(),
-            permission_mode: rec.permission_mode.clone(),
+            cwd: rec.cwd.clone().or_else(|| cwd.map(str::to_string)),
+            model: rec.model.clone().or_else(|| model.map(str::to_string)),
+            permission_mode: rec
+                .permission_mode
+                .clone()
+                .or_else(|| permission_mode.map(str::to_string)),
             transcript_path: None,
         }),
         platform,
@@ -489,14 +538,30 @@ pub(crate) fn decision_from_value(value: &serde_json::Value) -> Option<Permissio
             let s = s.to_lowercase();
             if matches!(
                 s.as_str(),
-                "allow" | "allowed" | "approve" | "approved" | "accept" | "accepted"
-                    | "grant" | "granted" | "yes"
+                "allow"
+                    | "allowed"
+                    | "approve"
+                    | "approved"
+                    | "accept"
+                    | "accepted"
+                    | "grant"
+                    | "granted"
+                    | "yes"
             ) {
                 Some(PermissionDecision::Allowed)
             } else if matches!(
                 s.as_str(),
-                "deny" | "denied" | "reject" | "rejected" | "refuse" | "refused"
-                    | "decline" | "declined" | "block" | "blocked" | "no"
+                "deny"
+                    | "denied"
+                    | "reject"
+                    | "rejected"
+                    | "refuse"
+                    | "refused"
+                    | "decline"
+                    | "declined"
+                    | "block"
+                    | "blocked"
+                    | "no"
             ) {
                 Some(PermissionDecision::Denied)
             } else if matches!(s.as_str(), "prompt" | "prompted" | "ask" | "confirm") {
@@ -694,12 +759,22 @@ mod tests {
             _ => None,
         })
     }
+    fn agent_sessions(events: &[Event]) -> Vec<AgentSessionPayload> {
+        events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::AgentSession(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
     fn real_permission_mode_record_is_not_a_decision() {
         // Real shape, 605× on disk. `permissionMode` is the session mode, not a
         // per-tool decision — must NOT mint a permission_decision.
-        let line = r#"{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"s1"}"#;
+        let line =
+            r#"{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"s1"}"#;
         assert!(!has_permission_decision(&perm_events(line)));
     }
 
@@ -800,6 +875,33 @@ mod tests {
     }
 
     #[test]
+    fn first_observed_permission_mode_after_session_start_is_emitted_with_context() {
+        // Some records can carry `sessionId`/cwd/model before the mode is first
+        // recorded. The first later mode must still be emitted, otherwise
+        // POSTURE-1 misses sessions that enter bypass after an unmodeled opener.
+        let jsonl = concat!(
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-05-27T19:08:00Z","cwd":"/repo","model":"claude-test","message":{"content":"hi"}}"#,
+            "\n",
+            r#"{"type":"permission-mode","sessionId":"s1","timestamp":"2026-05-27T19:08:01Z","permissionMode":"bypassPermissions"}"#,
+            "\n",
+            r#"{"type":"permission-mode","sessionId":"s1","timestamp":"2026-05-27T19:08:02Z","permissionMode":"bypassPermissions"}"#,
+            "\n",
+        );
+        let (events, _) = read_transcript(jsonl, Platform::Linux, None).unwrap();
+        let sessions = agent_sessions(&events);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].permission_mode, None);
+        assert_eq!(sessions[0].cwd.as_deref(), Some("/repo"));
+        assert_eq!(sessions[0].model.as_deref(), Some("claude-test"));
+        assert_eq!(
+            sessions[1].permission_mode.as_deref(),
+            Some("bypassPermissions")
+        );
+        assert_eq!(sessions[1].cwd.as_deref(), Some("/repo"));
+        assert_eq!(sessions[1].model.as_deref(), Some("claude-test"));
+    }
+
+    #[test]
     fn streaming_parser_captures_permission_mode_change() {
         // Same, through the live tail parser used by the daemon.
         let mut p = TranscriptStreamParser::new(TranscriptDialect::ClaudeCode, Platform::Linux);
@@ -822,6 +924,31 @@ mod tests {
                 Some("bypassPermissions".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn streaming_parser_emits_first_observed_mode_with_context() {
+        let mut p = TranscriptStreamParser::new(TranscriptDialect::ClaudeCode, Platform::Linux);
+        let mut sessions = Vec::new();
+        for line in [
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-05-27T19:08:00Z","cwd":"/repo","model":"claude-test","message":{"content":"hi"}}"#,
+            r#"{"type":"permission-mode","sessionId":"s1","timestamp":"2026-05-27T19:08:01Z","permissionMode":"bypassPermissions"}"#,
+            r#"{"type":"permission-mode","sessionId":"s1","timestamp":"2026-05-27T19:08:02Z","permissionMode":"bypassPermissions"}"#,
+        ] {
+            for ev in p.parse_line(line).unwrap() {
+                if let EventKind::AgentSession(s) = &ev.kind {
+                    sessions.push(s.clone());
+                }
+            }
+        }
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].permission_mode, None);
+        assert_eq!(
+            sessions[1].permission_mode.as_deref(),
+            Some("bypassPermissions")
+        );
+        assert_eq!(sessions[1].cwd.as_deref(), Some("/repo"));
+        assert_eq!(sessions[1].model.as_deref(), Some("claude-test"));
     }
 
     #[test]

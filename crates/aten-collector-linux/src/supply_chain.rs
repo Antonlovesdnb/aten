@@ -7,18 +7,17 @@
 use aten_schema::SupplyChainActivity;
 
 pub fn classify_process(name: &str, cmdline: &str, args: &[String]) -> Option<SupplyChainActivity> {
-    // Prefer argv[0] (the actual program) over the kernel `comm`: `comm` is
-    // capped at 15 chars and, for scripts, reflects the interpreter (`node`,
-    // `python3`) rather than the tool (`npm`, `pip`). Classifying off `comm`
-    // alone silently misses package-manager invocations run under an
-    // interpreter — the security-relevant false-negative. Fall back to `comm`
+    // Prefer argv-derived identity over the kernel `comm`: `comm` is capped at
+    // 15 chars, and package managers are often launched through interpreters
+    // (`node .../npm-cli.js`, `python -m pip`). Resolve those wrappers to the
+    // effective package-manager token when recognizable; fall back to `comm`
     // only when argv is empty.
     let exe_raw = args
         .first()
         .map(String::as_str)
         .filter(|s| !s.is_empty())
         .unwrap_or(name);
-    let exe = normalize_token(exe_raw);
+    let exe = effective_exe(exe_raw, args);
     let cmd = cmdline.to_lowercase();
 
     if is_network_installer(&exe, &cmd) {
@@ -55,6 +54,107 @@ fn normalize_token(token: &str) -> String {
         .unwrap_or(token)
         .trim_end_matches(".exe")
         .to_lowercase()
+}
+
+fn effective_exe(exe_raw: &str, args: &[String]) -> String {
+    let exe = normalize_token(exe_raw);
+    interpreter_wrapped_package_manager(&exe, args).unwrap_or(exe)
+}
+
+fn interpreter_wrapped_package_manager(exe: &str, args: &[String]) -> Option<String> {
+    if is_node_interpreter(exe) {
+        return args
+            .iter()
+            .skip(1)
+            .filter_map(|arg| node_package_manager_entrypoint(arg))
+            .next();
+    }
+
+    if is_python_interpreter(exe) {
+        for pair in args.windows(2) {
+            if pair[0] == "-m" {
+                if let Some(pm) = python_package_manager_module(&pair[1]) {
+                    return Some(pm);
+                }
+            }
+        }
+        return args
+            .iter()
+            .skip(1)
+            .filter_map(|arg| python_package_manager_script(arg))
+            .next();
+    }
+
+    if exe == "php" {
+        return args
+            .iter()
+            .skip(1)
+            .filter_map(|arg| {
+                let token = normalize_token(arg);
+                if token == "composer" || token == "composer.phar" {
+                    Some("composer".to_string())
+                } else {
+                    None
+                }
+            })
+            .next();
+    }
+
+    if exe == "ruby" {
+        return args
+            .iter()
+            .skip(1)
+            .filter_map(|arg| {
+                let token = normalize_token(arg);
+                if matches!(token.as_str(), "bundle" | "bundler") {
+                    Some(token)
+                } else {
+                    None
+                }
+            })
+            .next();
+    }
+
+    None
+}
+
+fn is_node_interpreter(exe: &str) -> bool {
+    matches!(exe, "node" | "nodejs")
+}
+
+fn node_package_manager_entrypoint(arg: &str) -> Option<String> {
+    let token = normalize_token(arg);
+    match token.as_str() {
+        "npm" | "npm-cli.js" | "npm-cli" => Some("npm".to_string()),
+        "npx" | "npx-cli.js" | "npx-cli" => Some("npx".to_string()),
+        "yarn" | "yarn.js" | "yarnpkg" => Some("yarn".to_string()),
+        "pnpm" | "pnpm.cjs" | "pnpm.js" => Some("pnpm".to_string()),
+        _ => None,
+    }
+}
+
+fn is_python_interpreter(exe: &str) -> bool {
+    exe == "python" || exe == "python3" || exe.starts_with("python3.")
+}
+
+fn python_package_manager_module(module: &str) -> Option<String> {
+    let module = module.to_lowercase();
+    match module.as_str() {
+        "pip" | "pip3" | "pip._internal" => Some("pip".to_string()),
+        "poetry" => Some("poetry".to_string()),
+        "uv" => Some("uv".to_string()),
+        _ => None,
+    }
+}
+
+fn python_package_manager_script(arg: &str) -> Option<String> {
+    let token = normalize_token(arg);
+    match token.as_str() {
+        "pip" | "pip3" => Some(token),
+        "poetry" => Some("poetry".to_string()),
+        "uv" => Some("uv".to_string()),
+        _ => None,
+    }
 }
 
 fn is_package_manager(exe: &str) -> bool {
@@ -174,6 +274,52 @@ mod tests {
         assert_eq!(
             classify_process("cargo", "cargo build", &args(&["cargo", "build"])),
             Some(SupplyChainActivity::PackageManager)
+        );
+    }
+
+    #[test]
+    fn interpreter_wrapped_package_managers_match() {
+        assert_eq!(
+            classify_process(
+                "node",
+                "node /usr/lib/node_modules/npm/bin/npm-cli.js install left-pad",
+                &args(&[
+                    "node",
+                    "/usr/lib/node_modules/npm/bin/npm-cli.js",
+                    "install",
+                    "left-pad"
+                ])
+            ),
+            Some(SupplyChainActivity::PackageInstall)
+        );
+        assert_eq!(
+            classify_process(
+                "node",
+                "node /usr/lib/node_modules/npm/bin/npm-cli.js run postinstall",
+                &args(&[
+                    "node",
+                    "/usr/lib/node_modules/npm/bin/npm-cli.js",
+                    "run",
+                    "postinstall"
+                ])
+            ),
+            Some(SupplyChainActivity::PackageScript)
+        );
+        assert_eq!(
+            classify_process(
+                "python3",
+                "python3 -m pip install requests",
+                &args(&["python3", "-m", "pip", "install", "requests"])
+            ),
+            Some(SupplyChainActivity::PackageInstall)
+        );
+        assert_eq!(
+            classify_process(
+                "php",
+                "php composer.phar install",
+                &args(&["php", "composer.phar", "install"])
+            ),
+            Some(SupplyChainActivity::PackageInstall)
         );
     }
 

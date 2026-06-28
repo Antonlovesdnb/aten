@@ -1,8 +1,9 @@
 //! Credential classifier — maps a file path to the schema's `CredentialClass`
 //! enum. Runs at the collector so detections never need to regex over
-//! `file_path`. This is the cross-platform taxonomy from `schema.md` §6;
-//! both the Linux eBPF probe and the Windows ETW probe call into this
-//! module.
+//! `file_path`. This covers credential stores plus high-signal agent state
+//! files whose contents commonly contain prompts, tool output, repo context, or
+//! copied secrets. Both the Linux eBPF probe and the Windows ETW probe call
+//! into this module.
 //!
 //! Classification is by *path fragment*, not by absolute path. `~/.aws/
 //! credentials` and `/root/.aws/credentials` and any other user's
@@ -133,6 +134,9 @@ pub fn classify_for_access(path: &str, write_intent: bool) -> CredentialClass {
     if ends_with_path(&p, ".kube/config") {
         return CredentialClass::KubeConfig;
     }
+    if !write_intent && is_agent_state(&p) {
+        return CredentialClass::AgentState;
+    }
     if ends_with_path(&p, ".env") || p.starts_with(".env.") || p.contains("/.env.") {
         return CredentialClass::GenericDotenv;
     }
@@ -159,6 +163,25 @@ fn after_path_fragment<'a>(path: &'a str, fragment: &str) -> Option<&'a str> {
             None
         }
     })
+}
+
+/// Agent transcripts/history/cache are sensitive state. They often contain
+/// prompts, tool outputs, internal repo context, copied secrets, and operational
+/// history. Treat READ/OPEN access like credential-adjacent telemetry, but do
+/// not classify write-intent opens here: normal agents write their own
+/// transcript/state continuously, and file-write control-plane surfaces are
+/// handled by `filewrite::classify`.
+fn is_agent_state(path: &str) -> bool {
+    contains_path(path, ".claude/projects/")
+        || contains_path(path, ".claude/transcripts/")
+        || contains_path(path, ".claude/todos/")
+        || contains_path(path, ".claude/logs/")
+        || contains_path(path, ".claude/cache/")
+        || ends_with_path(path, ".claude/history.jsonl")
+        || contains_path(path, ".codex/sessions/")
+        || contains_path(path, ".codex/logs/")
+        || contains_path(path, ".codex/cache/")
+        || ends_with_path(path, ".codex/history.jsonl")
 }
 
 /// True when `path` is an AI agent's *own* configuration dotenv —
@@ -351,5 +374,25 @@ mod tests {
             CredentialClass::AwsCredentials
         );
         assert_eq!(classify(".kube/config"), CredentialClass::KubeConfig);
+    }
+
+    #[test]
+    fn agent_state_reads_match_but_writes_do_not() {
+        assert_eq!(
+            classify("/home/anton/.claude/projects/-repo/session.jsonl"),
+            CredentialClass::AgentState
+        );
+        assert_eq!(
+            classify(r"C:\Users\anton\.codex\sessions\2026\06\rollout-abc.jsonl"),
+            CredentialClass::AgentState
+        );
+        assert_eq!(
+            classify("/home/anton/.claude/history.jsonl"),
+            CredentialClass::AgentState
+        );
+        assert_eq!(
+            classify_for_access("/home/anton/.claude/projects/-repo/session.jsonl", true),
+            CredentialClass::None
+        );
     }
 }

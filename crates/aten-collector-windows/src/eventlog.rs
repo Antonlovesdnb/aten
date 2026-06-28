@@ -205,6 +205,7 @@ fn cred_class_wire(v: &CredentialClass) -> &'static str {
         CredentialClass::BrowserCookies => "browser_cookies",
         CredentialClass::KubeConfig => "kube_config",
         CredentialClass::GenericDotenv => "generic_dotenv",
+        CredentialClass::AgentState => "agent_state",
         CredentialClass::None => "none",
     }
 }
@@ -591,6 +592,7 @@ mod tests {
             BrowserCookies,
             KubeConfig,
             GenericDotenv,
+            AgentState,
             CredentialClass::None,
         ] {
             assert_eq!(cred_class_wire(&v), serde_wire(&v), "{v:?}");

@@ -32,7 +32,7 @@ Each action event's primary identifier, for reference:
 |---|---|---|
 | `credential_access` | `file_path` | `credential_class`, `access_type` |
 | `file_write` | `file_path` | `write_class` |
-| `network_egress` | `dest_host` / `dest_ip` | `dest_port`, `tls_sni` |
+| `network_egress` | `dest_ip` today; `dest_host` when future enrichment populates it | `dest_port`, `cloud_metadata`, `tls_sni` |
 | `dns_query` | `query_name` | `query_type`, `answers` |
 | `process_exec` | `cmdline` | `exec_args` |
 
@@ -87,12 +87,26 @@ SELECT file_path, credential_class, process.cmdline,
 
 **False positives:** `aws configure`, `gcloud auth login`, `ssh-keygen`, credential-helper refreshes — all legitimately write credential paths. This rule is best as medium/triage; add `requested_in_user_message = false` to focus on writes the user never requested.
 
+### CRED-4 — Agent transcript or state read
+**Severity: medium.** Agent transcripts, histories, logs, and caches can contain prompts, tool output, repo context, and copied secrets. ATEN reports reads of supported Claude/Codex state surfaces as `credential_access` with `credential_class=agent_state`. This catches EAA-style transcript/state collection when it happens under an enrolled agent process tree.
+
+```
+FROM credential_access
+WHERE access_type in (read, open)
+  AND credential_class = agent_state
+  AND requested_in_user_message = false
+GROUP BY session_id, user_id, host_id
+SELECT file_path, process.cmdline, triggering_prompt
+```
+
+**False positives:** legitimate debugging, backup, search/indexing, or export workflows run by the agent. The highest-signal variant is a package manager, script, or unexpected descendant reading many transcript files and then archiving or making network connections. Normal agent writes to its own transcripts are deliberately not classified as `agent_state`.
+
 ---
 
 ## Exfiltration
 
 ### EXFIL-1 — Egress to a destination nobody asked for
-**Severity: medium.** An agent descendant opened a connection to a host that no one in the session named. The network sibling of CRED-1. MITRE T1041 (Exfiltration Over C2).
+**Severity: medium.** An agent descendant opened a connection to a destination that no one in the session named. The network sibling of CRED-1. MITRE T1041 (Exfiltration Over C2). Today the collectors reliably populate `dest_ip`; `dest_host` and `tls_sni` are schema fields for future DNS/SNI enrichment and are usually null.
 
 ```
 FROM network_egress
@@ -105,7 +119,7 @@ GROUP BY session_id, user_id, host_id
 SELECT dest_host, dest_ip, dest_port, process.cmdline, triggering_prompt
 ```
 
-**False positives:** high without tuning — package registries, telemetry endpoints, CDNs, and update checks all fire here. Maintain an allowlist of expected destinations (npm/PyPI/crates mirrors, your proxy, etc.) and exclude them. For a higher-signal variant, scope to `dest_port` outside 80/443, or to direct-to-IP connections (`dest_host is null`).
+**False positives:** high without tuning — package registries, telemetry endpoints, CDNs, and update checks all fire here. Maintain an allowlist of expected destination IPs/subnets and expected metadata endpoints, then add hostname allowlists when `dest_host` enrichment lands. For a higher-signal variant, scope to `dest_port` outside 80/443 or require `cloud_metadata is set`.
 
 ### EXFIL-2 — DNS TXT lookups to an unrequested domain
 **Severity: medium.** DNS-tunnel exfil shows up as a burst of `txt` lookups (often long, encoded labels) to a domain the user never typed. `query_type=txt` is the classic carrier.
@@ -132,7 +146,7 @@ WHERE (event_type = credential_access AND access_type in (read, open))
 GROUP BY session_id, host_id, process.pid, process.agent_root_pid
 HAVING any(event_type = credential_access) AND any(event_type = network_egress)
 SELECT creds_read  = credential_class where event_type = credential_access,
-       egress_to   = dest_host        where event_type = network_egress,
+       egress_to   = coalesce(dest_host, dest_ip) where event_type = network_egress,
        window_secs = last(timestamp) - first(timestamp)
 ```
 
@@ -143,7 +157,7 @@ SELECT creds_read  = credential_class where event_type = credential_access,
 ## Persistence and self-modification
 
 ### PERSIST-1 — Write to the agent's own config not requested by the user
-**Severity: high.** A write into the agent's configuration surface — a new skill, an edited `settings.json`, a `.claude/`/`.codex/` file — changes the agent's *future* behavior. ATEN tags these `file_write` with `write_class=agent_config`. When the user didn't ask for it, treat it as planted persistence. MITRE TA0003.
+**Severity: high.** A write into the agent's configuration surface — a new skill, an edited `settings.json`, a hook, MCP config, plugin, or assistant rule file — changes the agent's *future* behavior. ATEN tags these `file_write` with `write_class=agent_config` across common Claude/Codex/Cursor/Gemini/Kiro-style control-plane paths. When the user didn't ask for it, treat it as planted persistence. MITRE TA0003.
 
 ```
 FROM file_write
@@ -206,7 +220,7 @@ SELECT process.cmdline, triggering_prompt
 ## Agent posture
 
 ### POSTURE-1 — Agent running with permission gating disabled
-**Severity: medium.** `agent_session` carries the session's `permission_mode`. `bypassPermissions` means the agent executes tools with no per-action prompt — every other detection here is now the *only* thing standing between the agent and the host. ATEN emits an `agent_session` at session start **and** re-emits one whenever the mode changes mid-session, so this catches both a session that starts in bypass and one that *escalates* into it (de-duped: redundant re-statements of the same mode don't fire).
+**Severity: medium.** `agent_session` carries the session's `permission_mode`. `bypassPermissions` means the agent executes tools with no per-action prompt — every other detection here is now the *only* thing standing between the agent and the host. ATEN emits an `agent_session` at session start, when a permission mode first becomes observable after session start, and whenever the mode changes mid-session, so this catches both a session that starts in bypass and one that *escalates* into it (de-duped: redundant re-statements of the same mode don't fire).
 
 ```
 FROM agent_session
@@ -237,7 +251,7 @@ HAVING total_dropped > 0
 
 ## Tuning notes
 
-- **Baseline first.** Run ATEN in an environment for a week and look at what CRED-1 and EXFIL-1 surface *normally*. The legitimate `(process.name, credential_class)` and `(process.name, dest_host)` pairs become your allowlists.
+- **Baseline first.** Run ATEN in an environment for a week and look at what CRED-1 and EXFIL-1 surface *normally*. The legitimate `(process.name, credential_class)` and `(process.name, dest_ip)` pairs become your allowlists; add host allowlists when `dest_host` enrichment exists.
 - **Use `time_window_ms`.** When attribution confidence matters, add `time_window_ms < 5000` to require the tool-call binding to be recent. Bindings null out past 10s by design, but tightening further reduces stale matches.
 - **Read intent off the row.** `triggering_prompt` and `triggering_command` are denormalized onto every action event so an analyst can see what the user asked and what the agent ran without a separate join. Put them in every alert's output.
 - **Join on the right keys.** `session_id` scopes to one agent session; `process.agent_root_pid` scopes to one agent instance; `(process.pid, process.start_time)` identifies one process across PID reuse. Use `host_id` + `user_id` to group by operator.
@@ -251,8 +265,8 @@ Not every event type is emitted on every platform yet, so some rules are platfor
 | CRED-1/2/3 | `credential_access` | yes | yes | yes |
 | EXFIL-1 | `network_egress` | yes | yes | yes |
 | EXFIL-2 | `dns_query` | yes | yes | — |
-| EXFIL-3 | both above | yes | yes | partial |
-| PERSIST-1/2 | `file_write` | yes | yes | — |
+| EXFIL-3 | `credential_access` + `network_egress` | yes | yes | yes |
+| PERSIST-1/2 | `file_write` | yes | yes | yes |
 | EXEC-1/2 | `process_exec` | yes | yes | yes |
 
-macOS does not yet emit `dns_query` or `file_write`, so EXFIL-2 and the PERSIST rules don't apply there until those collectors land.
+macOS entries reflect the collector code path once EndpointSecurity/NetworkExtension activation is in place. macOS does not yet emit `dns_query`, so EXFIL-2 doesn't apply there until a resolver/DNS signal lands. macOS `file_write` is emitted from EndpointSecurity open events for sensitive write-intent paths, with `bytes_written` usually null because the probe sees the open rather than the completed write.

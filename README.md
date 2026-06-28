@@ -46,7 +46,7 @@ For NetworkExtension activation tests, install the built host bundle under `/App
 
 3. **Capture actions.** For enrolled processes only, the collector reports when they exec a program, read a credential file, write a sensitive file, resolve a DNS name, or open a network connection. On Linux this uses eBPF, on Windows ETW, and on macOS EndpointSecurity plus a NetworkExtension content filter. The events have the same field names wherever the platform exposes the underlying signal.
 
-4. **Capture intent.** In parallel, the transcript reader tails the agent's session files and emits an event for each prompt, tool call, and tool result. It also builds a per-session index of every file path, host, IP, and command mentioned, recording *where each one first appeared* — in a user message, in the model's own output, or in a tool result.
+4. **Capture intent.** In parallel, the transcript reader tails the agent's session files and emits events for prompts, tool calls, tool results, session context, and explicit permission decisions when the transcript exposes them. It also builds a per-session index of every file path, host, IP, and command mentioned, recording *where each one first appeared* — in a user message, in the model's own output, or in a tool result.
 
 5. **Attribute.** When an action event arrives, the engine finds the session it belongs to (by matching the agent process's working directory to a transcript), and the tool call it descends from (by timing). It then checks the action's main identifier — the file path, host, or command — against the session index, and records whether the user, the model, or a tool result ever named it.
 
@@ -58,20 +58,20 @@ For NetworkExtension activation tests, install the built host bundle under `/App
 
 - `prompt` — a user, assistant, or system message, with its text and a short summary.
 - `tool_call` — the agent invoking a tool (`Bash`, `Read`, `WebFetch`, …), with the raw input it passed.
-- `tool_result` — the result returned to the agent, plus the kernel-side PIDs observed during the call.
-- `agent_session` — one context row per parsed session: agent kind, cwd, model/permission mode when the transcript exposes them.
+- `tool_result` — the result returned to the agent, with status and result text. The schema has a `child_pids` field, but the current transcript parsers leave it empty; action-to-tool attribution comes from process ancestry plus timing.
+- `agent_session` — session posture/context: agent kind, cwd, model, and permission mode when the transcript exposes them. ATEN emits this at session start, when a permission mode first becomes observable after session start, and when the mode changes mid-session.
 - `permission_decision` — explicit allow/deny/prompt decisions when the transcript records them.
 
 These have no process context — they come from the transcript file, not a running process.
 
 ### Action events (from the kernel, for enrolled processes only)
 
-- `process_exec` — a process started: argv, selected environment summary, and a typed `supply_chain_activity` tag when the command looks like package-manager, package-install, package-script, git, network-installer, container-build, or build-tool activity.
+- `process_exec` — a process started: argv, process metadata, and a typed `supply_chain_activity` tag when the command looks like package-manager, package-install, package-script, git, network-installer, container-build, or build-tool activity. The classifier also recognizes common interpreter-wrapped package managers such as `node .../npm-cli.js install` and `python -m pip install`.
 - `process_exit` — a tracked process exited. Emitted on macOS today from EndpointSecurity; Linux/Windows cleanup currently happens without a public event.
-- `credential_access` — a credential file was read, written, or opened. The collector classifies the path into a typed `credential_class` so your rules never have to match paths by hand: `aws_credentials`, `azure_credentials`, `gcp_credentials`, `ssh_private_key`, `ssh_authorized_keys`, `git_credentials`, `netrc`, `npm_token`, `pypi_credentials`, `docker_config`, `github_cli_token`, `dpapi_blob`, `credential_manager`, `browser_cookies`, `kube_config`, `generic_dotenv`. Reads of ordinary files are not emitted.
-- `file_write` — a sensitive file was written. Classes include `agent_config`, `executable`, `shell_profile`, `scheduled_task`, `git_hook`, `startup_item`, `package_manifest`, and `lockfile`. Ordinary file writes are not emitted. A write *to a credential path* is reported as `credential_access` with `access_type=write` instead.
+- `credential_access` — a credential or credential-adjacent state file was read, written, or opened. The collector classifies the path into a typed `credential_class` so your rules never have to match paths by hand: `aws_credentials`, `azure_credentials`, `gcp_credentials`, `ssh_private_key`, `ssh_authorized_keys`, `git_credentials`, `netrc`, `npm_token`, `pypi_credentials`, `docker_config`, `github_cli_token`, `dpapi_blob`, `credential_manager`, `browser_cookies`, `kube_config`, `generic_dotenv`, `agent_state`. Reads of ordinary files are not emitted.
+- `file_write` — a sensitive file was written. Classes include `agent_config`, `executable`, `shell_profile`, `scheduled_task`, `git_hook`, `startup_item`, `package_manifest`, and `lockfile`. `agent_config` covers high-signal agent control-plane surfaces such as settings, hooks, skills, agents/subagents, MCP config, plugins, and assistant rule/instruction files across common agent ecosystems. Ordinary file writes are not emitted. A write *to a credential path* is reported as `credential_access` with `access_type=write` instead.
 - `dns_query` — a name was resolved: the `query_name`, the `query_type` (`a`, `aaaa`, `txt`, …), and the answers when seen. The answers also let you trace a later connection back to the name behind it when the destination IP is a shared CDN address.
-- `network_egress` — an outbound connection: destination IP and port, the hostname, TLS SNI when observed, and a `cloud_metadata` tag for known instance/task metadata endpoints.
+- `network_egress` — an outbound TCP connection: destination IP and port, plus a `cloud_metadata` tag for known instance/task metadata endpoints. The schema has `dest_host` and `tls_sni` fields, but the current collectors generally leave them null; hostname/SNI enrichment is backlog work.
 - `local_ipc_access` — an enrolled agent process connected to or opened a sensitive local broker socket/pipe such as Docker, containerd/Podman, SSH agent, GPG agent, or a secret-manager socket.
 
 Every action event also carries:
@@ -103,7 +103,7 @@ The reason origin is split four ways instead of a single "was this requested" fl
 ```
                                        descent  tool args  user  model  tool result
 malicious descendant (npm postinstall)    yes      no       no    no       no
-prompt injection (from fetched content)   yes      yes      no    yes      yes
+prompt injection (from fetched content)   yes      yes      no    maybe    yes
 ordinary, user-requested action           yes      yes      yes   yes      no
 ```
 
@@ -166,7 +166,7 @@ GROUP BY session_id, user_id, host_id
 SELECT file_path, credential_class, process.path, triggering_prompt
 ```
 
-A moment later the same process beacons out, and the `network_egress` event carries the identical attribution corner — so the sibling rule (swap `event_type=network_egress`, report `dest_host` instead of `file_path`) catches the exfiltration leg of the same attack.
+A moment later the same process beacons out, and the `network_egress` event carries the identical attribution corner — so the sibling rule (swap `event_type=network_egress`, report `dest_ip` / `dest_port` instead of `file_path`) catches the exfiltration leg of the same attack.
 
 ### 2. Prompt injection: fetched content tells the agent to read secrets
 
@@ -193,7 +193,7 @@ The agent followed the injected instruction. The resulting `credential_access` a
     "attributed_by_descent": true,
     "requested_by_tool_call": true,
     "requested_in_user_message": false,
-    "requested_in_assistant_message": true,
+    "requested_in_assistant_message": false,
     "requested_in_tool_result": true,
     "triggering_command": "cat /home/anton/.aws/credentials",
     "triggering_prompt": "summarize https://docs.example.com/setup"
@@ -214,7 +214,7 @@ SELECT file_path, triggering_command, triggering_prompt, tool_call_id
 
 ### 3. DNS exfiltration
 
-Data leaves over DNS TXT lookups to a domain the user never typed — it first appeared in fetched content (a `tool_result`). The `answers` field also lets you pivot a later `network_egress` back to the name behind a CDN IP.
+Data leaves over DNS TXT lookups to a domain the user never typed — it first appeared in fetched content (a `tool_result`). When the collector observes DNS answers, the `answers` field also lets you pivot a later `network_egress` back to the name behind a CDN IP. Linux's current libc `getaddrinfo` probe records query names but not answer sets or precise TXT/A/AAAA type.
 
 ```json
 {
@@ -259,7 +259,7 @@ A write into the agent's own configuration surface — a new skill, an edited `s
     "attributed_by_descent": true,
     "requested_by_tool_call": true,
     "requested_in_user_message": false,
-    "requested_in_assistant_message": true,
+    "requested_in_assistant_message": false,
     "requested_in_tool_result": true,
     "triggering_prompt": "summarize https://docs.example.com/setup"
   }
@@ -290,6 +290,45 @@ The intent layer reads each agent's session transcript, so an agent is fully sup
 ## Running it
 
 ATEN is a single `aten` binary. The collectors need privilege: root or `CAP_BPF`+`CAP_PERFMON` on Linux, Administrator on Windows, root plus the EndpointSecurity entitlement on macOS.
+
+### Quick install
+
+The easiest Linux/Windows path is to use the wrapper scripts in `install/`.
+They download or copy the binary, seed a default config if one does not already
+exist, delegate service registration to `aten install`, then print the status
+and useful log commands.
+
+Linux:
+
+```sh
+# Latest release, one line:
+curl -fsSL https://raw.githubusercontent.com/Antonlovesdnb/aten/main/install/install-linux.sh \
+  | sudo bash
+
+# From a checked-out repo, using a local build:
+cargo build --release -p aten-daemon
+sudo install/install-linux.sh --local-binary target/release/aten
+```
+
+Windows, from an elevated PowerShell:
+
+```powershell
+# Latest release, one line:
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Antonlovesdnb/aten/main/install/install-windows.ps1 | iex"
+
+# From a checked-out repo, using a local build:
+cargo build --release -p aten-daemon
+powershell -ExecutionPolicy Bypass -File .\install\install-windows.ps1 `
+  -LocalBinary .\target\release\aten.exe
+```
+
+Release installs default to the latest GitHub release and expect assets named
+`aten-linux-x86_64.tar.gz` and `aten-windows-x86_64.zip`. To pin a release, add
+`--version v0.1.0` on Linux or `-Version v0.1.0` on Windows. Override asset names
+with `--asset` / `-Asset` or direct downloads with `--url` / `-Url`. To customize
+enrolled process names or transcript paths, use `--agents` / `-Agents` and
+`--watch-dirs` / `-WatchDir`; existing configs are preserved unless
+`--force-config` / `-ForceConfig` is set.
 
 ```sh
 # install as a service (survives reboots, writes a default config if none exists)
@@ -322,7 +361,7 @@ Output destination: the `/var/log/aten/events.jsonl` (Linux) and `%ProgramData%\
 
 Not everything is a setting. The state-file location, the timing constants (transcript poll interval, the ~2s attribution buffer, the 10s confidence gate), the credential-class path patterns, and the set of parsable transcript formats are fixed in the build, not the config.
 
-Platform coverage today: Linux and Windows emit the full action set except public `process_exit`. macOS emits `process_exec`, `process_exit`, `credential_access`, `file_write`, `network_egress`, and `local_ipc_access`; `dns_query` remains a Linux/Windows signal for now because the macOS path observes network flows through NetworkExtension rather than resolver events.
+Platform coverage today: Linux and Windows emit the full action set except public `process_exit`. The macOS collector path emits `process_exec`, `process_exit`, `credential_access`, `file_write`, `network_egress`, and `local_ipc_access` once EndpointSecurity/NetworkExtension activation is in place; `dns_query` remains a Linux/Windows signal for now because the macOS path observes network flows through NetworkExtension rather than resolver events.
 
 ## Lineage
 

@@ -339,6 +339,7 @@ pub enum CredentialClass {
     BrowserCookies,
     KubeConfig,
     GenericDotenv,
+    AgentState,
     None,
 }
 
