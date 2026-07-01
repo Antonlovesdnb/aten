@@ -109,6 +109,7 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           ls -lh release-assets
