@@ -166,9 +166,13 @@ pub struct AttributionEngine {
     /// ticks only stat and tail these paths; they do not walk directory trees.
     known_files: HashSet<PathBuf>,
     last_discovery: Option<Instant>,
-    /// Resolved agent_root_pid → session_id binding. Populated lazily on
-    /// the first kernel event whose process cwd matches a session's cwd.
-    pid_bindings: HashMap<i32, String>,
+    /// Cache of agent_root_pid → its resolved (normalized) cwd. Only the
+    /// expensive cwd lookup (`/proc/<pid>/cwd` read on Linux, PEB walk on
+    /// Windows) is cached here; the session an event is attributed to is
+    /// re-ranked on every event in `resolve_session_for_pid`, so the binding
+    /// follows the currently-active session when multiple transcripts share a
+    /// cwd. Invalidated on agent-root PID reuse (see `refresh`).
+    pid_cwds: HashMap<i32, String>,
     /// Dirty flag — true if emission cursors have advanced since the
     /// last `save_state()`. The daemon calls `save_state()` whenever
     /// refresh() returns events; this flag avoids writing the state
@@ -200,7 +204,7 @@ impl AttributionEngine {
             file_meta: HashMap::new(),
             known_files: HashSet::new(),
             last_discovery: None,
-            pid_bindings: HashMap::new(),
+            pid_cwds: HashMap::new(),
             state_dirty: false,
             last_state_save: None,
             stats: EngineStats::default(),
@@ -474,16 +478,16 @@ impl AttributionEngine {
         };
 
         let Some(pid) = agent_root_pid else { return };
-        // If the enrolled agent root itself just execed, invalidate any old
-        // binding for this numeric PID before resolving. This closes the common
+        // If the enrolled agent root itself just execed, invalidate the cached
+        // cwd for this numeric PID before resolving. This closes the common
         // PID-reuse hole where a dead agent process's PID later belongs to a
-        // different session/user.
+        // different process with a different cwd/session/user.
         if matches!(
             &event.kind,
             EventKind::ProcessExec(p)
                 if p.process.agent_root_pid == Some(p.process.pid) && p.process.pid == pid
         ) {
-            self.pid_bindings.remove(&pid);
+            self.pid_cwds.remove(&pid);
         }
 
         let session_id = {
@@ -692,8 +696,10 @@ impl AttributionEngine {
 
     /// Resolve which session an agent_root_pid belongs to by matching the
     /// process's cwd (queried via the platform-specific resolver) against
-    /// each loaded session's recorded cwd. Caches the answer on success
-    /// so subsequent events from the same pid take the fast path.
+    /// each loaded session's recorded cwd. Only the resolved cwd is cached
+    /// per pid (the syscall is the expensive part); the session is re-ranked
+    /// on every call so the binding tracks whichever matching session is
+    /// currently active rather than freezing the first guess.
     ///
     /// Normalization (lowercase + forward-slash) absorbs case / separator
     /// differences between the live cwd and the transcript cwd —
@@ -705,27 +711,34 @@ impl AttributionEngine {
     /// similarly named paths. Exact user matches win first. Within compatible
     /// users, the active session is identified by the most-recent tool_call
     /// timestamp. Sessions with no tool_calls at all are treated as
-    /// least-recent (effectively "stale").
+    /// least-recent (effectively "stale"). Because this runs per event, a
+    /// stale binding self-corrects as soon as the newly-active session in the
+    /// same cwd records a tool_call.
     fn resolve_session_for_pid(
         &mut self,
         agent_root_pid: i32,
         event_user_id: Option<&str>,
     ) -> Option<String> {
-        if let Some(sid) = self.pid_bindings.get(&agent_root_pid) {
-            if self
-                .sessions
-                .get(sid)
-                .is_some_and(|state| user_compatible(state.user_id.as_deref(), event_user_id))
-            {
-                return Some(sid.clone());
+        // Resolve (and cache) the agent root's cwd. Only the cwd is cached —
+        // it is what the expensive platform syscall produces and it is stable
+        // for a process's lifetime. The session *choice* below is deliberately
+        // recomputed every call: caching the winning session permanently would
+        // freeze an early, possibly-stale guess, so a kernel event could keep
+        // being stamped with a session the agent has since moved on from (e.g.
+        // when the user has Claude Code open in the same project dir more than
+        // once). Re-ranking makes the binding track the active session.
+        let a = match self.pid_cwds.get(&agent_root_pid) {
+            Some(cwd) => cwd.clone(),
+            None => {
+                let proc_cwd = (self.cfg.cwd_for_pid)(agent_root_pid)?;
+                let a = norm_cwd(&proc_cwd);
+                if a.is_empty() {
+                    return None;
+                }
+                self.pid_cwds.insert(agent_root_pid, a.clone());
+                a
             }
-            self.pid_bindings.remove(&agent_root_pid);
-        }
-        let proc_cwd = (self.cfg.cwd_for_pid)(agent_root_pid)?;
-        let a = norm_cwd(&proc_cwd);
-        if a.is_empty() {
-            return None;
-        }
+        };
 
         // Collect every session whose cwd and user are compatible, paired with
         // whether the user matched exactly and the latest tool_call timestamp.
@@ -766,9 +779,7 @@ impl AttributionEngine {
                 .then_with(|| y.2.cmp(&x.2))
                 .then_with(|| x.0.cmp(y.0))
         });
-        let winner = candidates.first().map(|(sid, _, _)| (*sid).clone())?;
-        self.pid_bindings.insert(agent_root_pid, winner.clone());
-        Some(winner)
+        candidates.first().map(|(sid, _, _)| (*sid).clone())
     }
 
     /// How many transcript sessions are currently loaded. Useful for
@@ -806,13 +817,6 @@ fn cwd_has_prefix(path: &str, prefix: &str) -> bool {
 
 fn user_eq(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
-}
-
-fn user_compatible(session_user: Option<&str>, event_user: Option<&str>) -> bool {
-    match (session_user, event_user) {
-        (Some(a), Some(b)) => user_eq(a, b),
-        _ => true,
-    }
 }
 
 fn event_user_id(event: &Event) -> Option<&str> {
@@ -1107,6 +1111,62 @@ mod tests {
             engine.resolve_session_for_pid(42, Some("alice")).as_deref(),
             Some("alice-session")
         );
+    }
+
+    #[test]
+    fn pid_session_binding_follows_newly_active_session() {
+        // Regression: two transcripts share one cwd (user opened Claude Code
+        // in the same project dir twice). The pid→session binding must track
+        // whichever session is currently active, not freeze the first guess —
+        // otherwise kernel events keep getting stamped with a stale session
+        // while transcript-side prompt events carry the live one.
+        fn cwd_for_test(pid: i32) -> Option<String> {
+            (pid == 42).then(|| "/tmp/project".to_string())
+        }
+        fn tc(id: &str, ts: i64) -> session::ToolCallEntry {
+            session::ToolCallEntry {
+                id: id.to_string(),
+                name: "Bash".to_string(),
+                input_text: String::new(),
+                input_text_lower: String::new(),
+                timestamp_ns: ts,
+            }
+        }
+        fn state_with(session_id: &str, tcs: Vec<session::ToolCallEntry>) -> SessionState {
+            SessionState {
+                session_id: session_id.to_string(),
+                cwd: Some("/tmp/project".to_string()),
+                user_id: None,
+                tool_calls: tcs,
+                ..Default::default()
+            }
+        }
+
+        let mut engine = AttributionEngine::new(EngineConfig {
+            cwd_for_pid: cwd_for_test,
+            ..EngineConfig::default()
+        });
+        engine
+            .sessions
+            .insert("old".into(), state_with("old", vec![tc("t-old", 100)]));
+        engine
+            .sessions
+            .insert("new".into(), state_with("new", vec![tc("t-new", 50)]));
+
+        // "old" is the most-recently-active session, so it wins first.
+        assert_eq!(engine.resolve_session_for_pid(42, None).as_deref(), Some("old"));
+
+        // "new" becomes active (records a newer tool_call).
+        engine
+            .sessions
+            .get_mut("new")
+            .unwrap()
+            .tool_calls
+            .push(tc("t-new-2", 200));
+
+        // The binding self-corrects to the now-active session instead of
+        // returning the first (previously cached) answer.
+        assert_eq!(engine.resolve_session_for_pid(42, None).as_deref(), Some("new"));
     }
 
     #[test]
