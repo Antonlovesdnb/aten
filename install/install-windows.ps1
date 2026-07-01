@@ -147,7 +147,27 @@ try {
             $ArchivePath = Join-Path $TempRoot (Get-DownloadName)
             Write-Step "downloading $DownloadUrl"
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $DownloadUrl -OutFile $ArchivePath
+            try {
+                Invoke-WebRequest -Uri $DownloadUrl -OutFile $ArchivePath
+            } catch {
+                if ([string]::IsNullOrWhiteSpace($Url)) {
+                    throw @"
+Could not download ATEN release asset:
+  $DownloadUrl
+
+This usually means the repository does not have a latest release yet, or the
+release is missing the expected asset named:
+  $Asset
+
+Fix by publishing a release with that asset, pinning an existing tag with
+-Version, overriding the asset with -Asset/-Url, or installing a local build:
+  powershell -ExecutionPolicy Bypass -File .\install\install-windows.ps1 -LocalBinary .\target\release\aten.exe
+
+Original error: $($_.Exception.Message)
+"@
+                }
+                throw
+            }
         }
         if (-not (Test-Path -LiteralPath $ArchivePath)) {
             throw "archive not found: $ArchivePath"

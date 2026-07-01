@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libelf-dev zlib1g-dev pkg-config make gcc
+
+      - name: Build release binary
+        run: cargo build --release -p aten-daemon
+
+      - name: Package release asset
+        run: |
+          mkdir -p dist/aten-linux-x86_64
+          cp target/release/aten dist/aten-linux-x86_64/
+          cp README.md DETECTIONS.md dist/aten-linux-x86_64/
+          tar -C dist/aten-linux-x86_64 -czf dist/aten-linux-x86_64.tar.gz \
+            aten README.md DETECTIONS.md
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/aten-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build Event Log resource DLL
+        shell: pwsh
+        run: .\crates\aten-collector-windows\eventlog\build-manifest.ps1
+
+      - name: Build release binary
+        shell: pwsh
+        run: cargo build --release -p aten-daemon
+
+      - name: Package release asset
+        shell: pwsh
+        run: |
+          $dist = "dist\aten-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item target\release\aten.exe $dist\
+          Copy-Item crates\aten-collector-windows\eventlog\aten_events.dll $dist\
+          Copy-Item README.md $dist\
+          Copy-Item DETECTIONS.md $dist\
+          Compress-Archive -Path "$dist\*" -DestinationPath "dist\aten-windows-x86_64.zip" -Force
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/aten-windows-x86_64.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - build-linux
+      - build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          ls -lh release-assets
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" release-assets/* --clobber
+          else
+            gh release create "${TAG}" release-assets/* \
+              --target "${GITHUB_SHA}" \
+              --title "ATEN ${TAG}" \
+              --notes "Automated ATEN release for ${TAG}."
+          fi

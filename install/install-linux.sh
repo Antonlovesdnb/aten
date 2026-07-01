@@ -247,7 +247,21 @@ else
   download_name="$(download_name_for_url)"
   archive="$tmp/$download_name"
   info "downloading $source_url"
-  download "$source_url" "$archive"
+  if ! download "$source_url" "$archive"; then
+    cat >&2 <<EOF
+error: could not download ATEN release asset:
+  $source_url
+
+This usually means the repository does not have a latest release yet, or the
+release is missing the expected asset named:
+  $ASSET
+
+Fix by publishing a release with that asset, pinning an existing tag with
+--version, overriding the asset with --asset/--url, or installing a local build:
+  sudo install/install-linux.sh --local-binary target/release/aten
+EOF
+    exit 1
+  fi
   case "$archive" in
     *.tar.gz|*.tgz)
       need_cmd tar
