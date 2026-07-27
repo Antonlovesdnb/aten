@@ -1435,8 +1435,52 @@ fn filetime_to_rfc3339(filetime_100ns: u64) -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00.000000000Z".to_string())
 }
 
+/// Split a Windows command line into argv, honoring double quotes.
+///
+/// A naive `split_whitespace` breaks on the most common Windows layout there
+/// is: any binary under `C:\Program Files\...`. The command line
+/// `"C:\Program Files\nodejs\node.exe" ".../npm-cli.js" install` would tokenize
+/// to `["\"C:\\Program", "Files\\nodejs\\node.exe\"", ...]`, so argv[0]
+/// normalizes to `program` instead of `node`. Everything downstream that keys
+/// off argv identity then silently misses — notably the supply-chain
+/// classifier's interpreter unwrapping (`node .../npm-cli.js` -> npm), which
+/// left `supply_chain_activity` null for every npm/pip/yarn invocation whose
+/// interpreter lived in a path with a space.
+///
+/// Quote handling is deliberately simple: a `"` toggles quoting and is not
+/// itself retained. Windows' full backslash-escaping rules (`\"`, `\\"`)
+/// are not modeled — argv here feeds classification and identity checks, not
+/// re-execution, and real package-manager command lines don't rely on them.
 fn argv_from_cmdline(cmdline: &str) -> Vec<String> {
-    cmdline.split_whitespace().map(str::to_string).collect()
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut started = false;
+
+    for ch in cmdline.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                // A quote starts a token even when the quoted body is empty,
+                // so `""` yields one empty arg rather than vanishing.
+                started = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if started {
+                    args.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        args.push(current);
+    }
+    args
 }
 
 #[cfg(test)]
@@ -1486,5 +1530,62 @@ mod tests {
         // Empty / whitespace-only → no answers.
         assert!(parse_dns_results("").is_empty());
         assert!(parse_dns_results(";  ;").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod argv_cmdline_tests {
+    use super::*;
+    use aten_schema::SupplyChainActivity;
+
+    #[test]
+    fn quoted_paths_with_spaces_tokenize_correctly() {
+        let cmd = r#""C:\Program Files\nodejs\node.exe" "C:\Program Files\nodejs/node_modules/npm/bin/npm-cli.js" install"#;
+        assert_eq!(
+            argv_from_cmdline(cmd),
+            vec![
+                r"C:\Program Files\nodejs\node.exe",
+                r"C:\Program Files\nodejs/node_modules/npm/bin/npm-cli.js",
+                "install",
+            ]
+        );
+    }
+
+    #[test]
+    fn unquoted_and_mixed_forms_still_work() {
+        assert_eq!(
+            argv_from_cmdline("node  postinstall.js"),
+            vec!["node", "postinstall.js"]
+        );
+        assert_eq!(argv_from_cmdline(""), Vec::<String>::new());
+        assert_eq!(
+            argv_from_cmdline(r#"git -c "core.hooksPath=/dev/null" remote get-url origin"#),
+            vec!["git", "-c", "core.hooksPath=/dev/null", "remote", "get-url", "origin"]
+        );
+    }
+
+    /// Regression: the real npm invocation observed on Windows must classify as
+    /// a package install. Before quote-aware tokenization this returned None,
+    /// so a supply-chain rule keyed on `supply_chain_activity` saw nothing.
+    #[test]
+    fn windows_npm_install_classifies_as_package_install() {
+        let cmd = r#""C:\Program Files\nodejs\node.exe" "C:\Program Files\nodejs/node_modules/npm/bin/npm-cli.js" install"#;
+        let args = argv_from_cmdline(cmd);
+        assert_eq!(
+            aten_collector_linux::supply_chain::classify_process("node.exe", cmd, &args),
+            Some(SupplyChainActivity::PackageInstall)
+        );
+    }
+
+    /// `npm run <script>` is a lifecycle-script execution, not an install —
+    /// the distinction a supply-chain rule cares about.
+    #[test]
+    fn windows_npm_run_script_classifies_as_package_script() {
+        let cmd = r#""C:\Program Files\nodejs\node.exe" "C:\Program Files\nodejs/node_modules/npm/bin/npm-cli.js" run build"#;
+        let args = argv_from_cmdline(cmd);
+        assert_eq!(
+            aten_collector_linux::supply_chain::classify_process("node.exe", cmd, &args),
+            Some(SupplyChainActivity::PackageScript)
+        );
     }
 }
