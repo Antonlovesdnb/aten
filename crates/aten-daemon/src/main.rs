@@ -742,9 +742,69 @@ fn windows_cwd_for_pid(pid: i32) -> Option<String> {
 /// stamp `user_id` on transcript-derived events. Cached per-file in the
 /// engine, so the Win32 cost is paid once per transcript regardless of
 /// how many events that transcript ultimately produces.
+///
+/// The raw ACL owner is not always the human who ran the agent. When a
+/// process runs elevated, Windows assigns `BUILTIN\Administrators` as the
+/// owner of files it creates, so an elevated Claude Code session writes a
+/// transcript owned by Administrators rather than by the user. The
+/// attribution engine treats a session whose `user_id` disagrees with the
+/// kernel event's user as belonging to a *different* user and drops it
+/// from candidacy entirely — which silently zeroes out attribution for
+/// every elevated agent session. Since the demo/test guides all say to run
+/// from an elevated shell, that is the common case, not the edge case.
+///
+/// So: when the ACL owner is a well-known group/system principal rather
+/// than a real user account, fall back to the owning user implied by the
+/// transcript's own location under a user profile
+/// (`C:\Users\<name>\.claude\...` → `<COMPUTERNAME>\<name>`). That keeps
+/// per-user isolation meaningful (the path is still user-scoped) without
+/// discarding the session.
 #[cfg(target_os = "windows")]
 fn windows_user_for_transcript(path: &std::path::Path) -> Option<String> {
-    aten_collector_windows::file_owner(path)
+    match aten_collector_windows::file_owner(path) {
+        Some(owner) if !is_well_known_non_user(&owner) => Some(owner),
+        // Well-known principal (or unreadable descriptor): prefer the
+        // profile-derived user, and only fall back to the raw owner if the
+        // path tells us nothing.
+        other => user_from_profile_path(path).or(other),
+    }
+}
+
+/// True for owner names that identify a group or machine principal rather
+/// than the interactive user — the values Windows substitutes when a file
+/// is created by an elevated or service process.
+#[cfg(target_os = "windows")]
+fn is_well_known_non_user(owner: &str) -> bool {
+    let lower = owner.to_ascii_lowercase();
+    let account = lower.rsplit('\\').next().unwrap_or(&lower);
+    matches!(
+        account,
+        "administrators" | "system" | "trustedinstaller" | "localsystem"
+    )
+}
+
+/// Derive `<COMPUTERNAME>\<user>` from a transcript path that lives under a
+/// Windows user profile. Returns None for paths outside `\Users\<name>\`.
+#[cfg(target_os = "windows")]
+fn user_from_profile_path(path: &std::path::Path) -> Option<String> {
+    use std::path::Component;
+    let mut comps = path.components().peekable();
+    while let Some(c) = comps.next() {
+        if let Component::Normal(seg) = c {
+            if seg.to_string_lossy().eq_ignore_ascii_case("users") {
+                let name = match comps.next() {
+                    Some(Component::Normal(n)) => n.to_string_lossy().into_owned(),
+                    _ => return None,
+                };
+                if name.is_empty() {
+                    return None;
+                }
+                let host = std::env::var("COMPUTERNAME").ok()?;
+                return Some(format!("{host}\\{name}"));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(target_os = "windows")]
@@ -1494,4 +1554,47 @@ fn run_transcript(transcript: PathBuf, out: Option<PathBuf>, idx: Option<PathBuf
         idx_path.display()
     );
     Ok(())
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod user_for_transcript_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn elevated_owner_falls_back_to_profile_user() {
+        // BUILTIN\Administrators is what Windows stamps on files created by
+        // an elevated process — not a real user, so it must not be used as
+        // the session's user_id.
+        assert!(is_well_known_non_user(r"BUILTIN\Administrators"));
+        assert!(is_well_known_non_user(r"NT AUTHORITY\SYSTEM"));
+        assert!(!is_well_known_non_user(r"DESKTOP-PBTTA20\aovru"));
+        // A user literally named "administrator" (singular) is a real
+        // account and must not be swallowed by the group check.
+        assert!(!is_well_known_non_user(r"DESKTOP-PBTTA20\administrator"));
+    }
+
+    #[test]
+    fn profile_path_yields_host_qualified_user() {
+        std::env::set_var("COMPUTERNAME", "TESTHOST");
+        let p = Path::new(r"C:\Users\aovru\.claude\projects\proj\session.jsonl");
+        assert_eq!(
+            user_from_profile_path(p),
+            Some(r"TESTHOST\aovru".to_string())
+        );
+    }
+
+    #[test]
+    fn non_profile_path_yields_none() {
+        std::env::set_var("COMPUTERNAME", "TESTHOST");
+        assert_eq!(
+            user_from_profile_path(Path::new(r"D:\shared\logs\session.jsonl")),
+            None
+        );
+        // "Users" as the final component has no username after it.
+        assert_eq!(
+            user_from_profile_path(Path::new(r"C:\Users")),
+            None
+        );
+    }
 }
