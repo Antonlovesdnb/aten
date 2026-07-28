@@ -61,9 +61,15 @@ struct sched_fork_args {
 
 SEC("tracepoint/sched/sched_process_fork")
 int track_fork(struct sched_fork_args *ctx) {
-    __u8 *enrolled = bpf_map_lookup_elem(&enrolled_pids, &ctx->parent_pid);
+    // Copy the tracepoint fields to the stack before using them as map keys.
+    // Newer kernels' verifiers (observed on 6.17) reject a ctx-typed pointer
+    // passed straight to bpf_map_lookup_elem/update_elem: the key arg must be
+    // a stack/map/mem pointer, not `&ctx->field`.
+    __u32 parent_pid = ctx->parent_pid;
+    __u32 child_pid = ctx->child_pid;
+    __u8 *enrolled = bpf_map_lookup_elem(&enrolled_pids, &parent_pid);
     if (enrolled)
-        bpf_map_update_elem(&enrolled_pids, &ctx->child_pid, enrolled, BPF_ANY);
+        bpf_map_update_elem(&enrolled_pids, &child_pid, enrolled, BPF_ANY);
     return 0;
 }
 

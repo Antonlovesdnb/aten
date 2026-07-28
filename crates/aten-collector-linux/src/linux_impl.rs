@@ -18,7 +18,7 @@ use aten_schema::{
     Source, SCHEMA_VERSION,
 };
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{MapCore, MapFlags, OpenObject, UprobeOpts};
+use libbpf_rs::{Link, MapCore, MapFlags, OpenObject, UprobeOpts};
 use plain::Plain;
 use serde::Deserialize;
 
@@ -205,17 +205,78 @@ where
     let mut exec_skel = exec_skel.load().context("load execve BPF")?;
     exec_skel.attach().context("attach execve BPF")?;
 
+    // credacc and connect are attached program-by-program instead of via the
+    // all-or-nothing skeleton `.attach()`. `track_fork` (in-kernel enrollment
+    // propagation across a fork-before-exec) is a best-effort optimization:
+    // on some kernels (observed on 6.17) attaching to sched_process_fork
+    // returns EACCES even as root, while the same skeleton's openat/connect
+    // tracepoints attach fine. That must NOT take down credential and network
+    // capture — the openat probes are what actually record credential_access.
+    // Without fork propagation we fall back to user-space exec-time enrollment,
+    // which covers everything except a child that reads a credential in the
+    // sub-millisecond window between fork and the exec that enrolls it. Links
+    // are collected here and kept alive for the whole run; dropping them
+    // detaches the probes.
+    let mut bpf_links: Vec<Link> = Vec::new();
+
     let cred_skel = CredaccSkelBuilder::default()
         .open(&mut cred_obj)
         .context("open credacc skeleton")?;
-    let mut cred_skel = cred_skel.load().context("load credacc BPF")?;
-    cred_skel.attach().context("attach credacc BPF")?;
+    let cred_skel = cred_skel.load().context("load credacc BPF")?;
+    match cred_skel.progs.track_fork.attach() {
+        Ok(l) => bpf_links.push(l),
+        Err(e) => eprintln!(
+            "aten-ebpf: credacc track_fork attach failed ({e}); fork-time \
+             enrollment propagation disabled, using exec-time enrollment"
+        ),
+    }
+    bpf_links.push(
+        cred_skel
+            .progs
+            .forget_exit
+            .attach()
+            .context("attach credacc forget_exit")?,
+    );
+    bpf_links.push(
+        cred_skel
+            .progs
+            .handle_openat
+            .attach()
+            .context("attach credacc openat")?,
+    );
+    bpf_links.push(
+        cred_skel
+            .progs
+            .handle_openat2
+            .attach()
+            .context("attach credacc openat2")?,
+    );
 
     let conn_skel = ConnectSkelBuilder::default()
         .open(&mut conn_obj)
         .context("open connect skeleton")?;
-    let mut conn_skel = conn_skel.load().context("load connect BPF")?;
-    conn_skel.attach().context("attach connect BPF")?;
+    let conn_skel = conn_skel.load().context("load connect BPF")?;
+    match conn_skel.progs.track_fork.attach() {
+        Ok(l) => bpf_links.push(l),
+        Err(e) => eprintln!(
+            "aten-ebpf: connect track_fork attach failed ({e}); fork-time \
+             enrollment propagation disabled, using exec-time enrollment"
+        ),
+    }
+    bpf_links.push(
+        conn_skel
+            .progs
+            .forget_exit
+            .attach()
+            .context("attach connect forget_exit")?,
+    );
+    bpf_links.push(
+        conn_skel
+            .progs
+            .handle_connect
+            .attach()
+            .context("attach connect connect")?,
+    );
 
     // The DNS probe is a sleepable uprobe on libc's getaddrinfo. Its whole
     // setup is BEST-EFFORT: a kernel without sleepable uprobes / the
