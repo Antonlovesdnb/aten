@@ -3,6 +3,7 @@
 *.md
 !README.md
 !DETECTIONS.md
+!SCHEMA.md
 
 # Python
 __pycache__/

@@ -11,9 +11,9 @@ It collects two kinds of telemetry and links them:
 
 Each action event is tagged with the session and the specific tool call it came from. That link is the part you can't get from either source on its own. It lets you ask, for example, whether a process the agent spawned read credentials that nobody in the session — not the user, not the model, not a tool result — ever mentioned.
 
-Linux and Windows are built and verified end to end. macOS has a native collector path built around EndpointSecurity plus a NetworkExtension flow producer; it is compile/typecheck verified here, but still needs entitlement/sysext activation on target hardware for runtime validation. Schema is at v0.8. ATEN only observes — it does not block or kill anything; acting on what it sees is left to your SIEM rules.
+Linux and Windows are built and verified end to end. **macOS support is a work in progress.** The native collector path — EndpointSecurity plus a NetworkExtension flow producer — is written and compile/typecheck verified, and the plumbing is in place, but it is **not yet runtime-verified on hardware.** That last step needs a code-signing identity and Apple-granted EndpointSecurity/NetworkExtension entitlements, which require a paid Apple Developer Program account this project does not currently have. Treat macOS as unverified until that activation happens; Linux and Windows are the supported platforms today. Schema is at v0.8. ATEN only observes — it does not block or kill anything; acting on what it sees is left to your SIEM rules.
 
-### macOS security posture
+### macOS security posture (work in progress)
 
 Do **not** disable System Integrity Protection or AMFI protections on your primary Mac just to test ATEN. The ad-hoc development path in `macos/devsetup.sh` is a lab-only shortcut for an isolated macOS VM or spare test Mac.
 
@@ -108,6 +108,36 @@ ordinary, user-requested action           yes      yes      yes   yes      no
 ```
 
 A note on accuracy: kernel events can arrive before the agent has finished writing the matching tool call to disk, so ATEN holds each action event about two seconds before attributing it — long enough to bind to the right tool call. If the nearest tool call is still more than ten seconds away, ATEN leaves `attributed_tool_call_id` and `triggering_command` null rather than guess. The `requested_*` fields and `triggering_prompt` don't depend on that timing and are always filled in when the data exists.
+
+The full field-level reference — every event type, every field, every enum value, with a log example per type — is in [`SCHEMA.md`](./SCHEMA.md).
+
+## Coverage: the endpoint AI agent abuse matrix
+
+The techniques ATEN is built to surface are catalogued by the **Endpoint AI Agent Abuse (EAA)** framework by Adel Karimi (**[0x4D31/endpoint-ai-agent-abuse](https://github.com/0x4D31/endpoint-ai-agent-abuse)**) — a MITRE-ATT&CK-style matrix for abuse of local AI agents. All EAA IDs, titles, and definitions below are that project's; full credit and detail live there. This table maps each technique to the ATEN signal that catches it.
+
+ATEN is **endpoint telemetry, not prevention** — it records the observable on-host effect of a technique. Server-side surfaces (an MCP server's tool metadata, a provider gateway's internals) aren't visible to any endpoint sensor; for those, ATEN catches the **downstream action**, tagged `requested_in_tool_result=true` when the instruction arrived through fetched content.
+
+| EAA | Technique | | ATEN signal |
+|---|---|---|---|
+| [EAA-001](https://github.com/0x4D31/endpoint-ai-agent-abuse/blob/main/techniques/index.md) | Agent CLI invocation by adversary-controlled initiator | ✅ | `process_exec` on the agent binary with a `parent_chain` showing the non-agent initiator (installer, package script, repo automation) |
+| EAA-002 | Permissive or unattended agent execution | ✅ | `process_exec.cmdline` exposes approval-bypass / non-interactive flags; `agent_session.permission_mode` records a risky mode |
+| EAA-003 | Lifecycle hook planting | ✅ | `file_write` `write_class=agent_config` (hook configuration) |
+| EAA-004 | Persistent instruction or memory poisoning | ✅ | `file_write` `write_class=agent_config` (rules, instructions, auto-memory) |
+| EAA-005 | Transcript and agent-state collection | ✅ | `credential_access` `credential_class=agent_state` (reads of transcripts, histories, profiles) |
+| EAA-006 | MCP or tool configuration abuse | ✅ | `file_write` `agent_config` (MCP config) + the resulting `network_egress` to the attacker-selected server |
+| EAA-007 | Hostile model / API gateway routing | ◑ | `network_egress` to the gateway is captured; the routing change is visible only when it lands as a config `file_write` (pure env-var routing isn't — see limits) |
+| EAA-008 | Shadow agent profile or config directory | ◑ | `process_exec.cmdline` shows the alternate-profile flag; writes into that profile surface as `file_write agent_config` |
+| EAA-009 | Remote plugin sideload or marketplace install | ✅ | `file_write agent_config` (plugin lands on disk) + `network_egress` (the download) |
+| EAA-010 | MCP tool poisoning or definition drift | ◑ | server-side metadata isn't endpoint-visible, but resulting actions carry `requested_in_tool_result=true` — the injected-instruction fingerprint |
+| EAA-011 | Environment-variable manipulation of MCP activation | ◑ | `process_exec` is captured, but ATEN records argv and an env *summary*, not the full environment — env-var-only manipulation is partially visible |
+| EAA-012 | Telemetry redirection or sensitive logging | ✅ | `file_write agent_config` (telemetry settings) + `network_egress` to the unapproved collector |
+| EAA-013 | Cloud-hosted skill poisoning and sync | ✅ | the sync landing on disk is a `file_write agent_config` (skills) |
+| EAA-014 | Cross-agent control-plane fan-out planting | ✅ | `file_write agent_config` — the class spans multiple agent ecosystems, so one process writing hooks/rules for several is directly visible |
+| EAA-015 | Inherited authority abuse | ✅ | core ATEN: `process_exec`, `credential_access`, `network_egress`, `local_ipc_access`, all attributed to the agent session |
+| EAA-016 | Agent environment discovery | ◑ | discovery execs (`process_exec`) and reads of agent config (`credential_access agent_state`) are captured; plain directory listing is visible as exec but not classified |
+| EAA-017 | Agent-native evidence tampering | ◑ | writes/truncation to transcripts land as `file_write`; and because ATEN forwards events off-host in real time, telemetry already shipped survives local tampering. Pure file *deletion* is not a distinct event today |
+
+✅ covered · ◑ partial (see [`SCHEMA.md` → Coverage limits](./SCHEMA.md#coverage-limits))
 
 ## Examples
 
@@ -329,6 +359,24 @@ with `--asset` / `-Asset` or direct downloads with `--url` / `-Url`. To customiz
 enrolled process names or transcript paths, use `--agents` / `-Agents` and
 `--watch-dirs` / `-WatchDir`; existing configs are preserved unless
 `--force-config` / `-ForceConfig` is set.
+
+### Building from source
+
+You need a Rust toolchain (`rustup` installs the pinned version automatically
+from `rust-toolchain.toml`). The Linux eBPF collector additionally needs a BPF
+build toolchain; the Windows build needs only Rust + the MSVC toolchain.
+
+```sh
+# Linux build prerequisites (Debian/Ubuntu names)
+sudo apt-get install -y clang libbpf-dev libelf-dev zlib1g-dev pkg-config make
+# bpftool ships in linux-tools-<uname-r> or linux-tools-common
+
+cargo build --release -p aten-daemon
+```
+
+The kernel needs BTF (`/sys/kernel/btf/vmlinux`, present on essentially all
+modern distro kernels) — the probes read process/argv data and don't require a
+generated `vmlinux.h`. The eBPF collector is verified on kernels through 6.17.
 
 ```sh
 # install as a service (survives reboots, writes a default config if none exists)
